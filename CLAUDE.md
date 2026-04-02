@@ -1,10 +1,10 @@
 # PowerWave Analyst — Claude Code Master Context
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
-Phase:     [UPDATE THIS] e.g. Phase 1
-Milestone: [UPDATE THIS] e.g. Milestone 1A — Data Models
-Module:    [UPDATE THIS] e.g. src/models/disturbance_record.py
-Status:    [UPDATE THIS] e.g. IN PROGRESS / COMPLETE
+Phase:     Phase 1
+Milestone: Milestone 1A — Data Models
+Module:    src/models/disturbance_record.py
+Status:    COMPLETE
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 Name:      PowerWave Analyst
@@ -374,8 +374,8 @@ All vendor quirks fall into a finite set of categories already handled:
 
 For anything else: channel mapping dialog + profile save/recall.
 No vendor should ever cause a crash — only a mapping dialog at worst.
-[Update this section as milestones are completed]
-# ✓ Milestone X — Description (commit: xxxxxxx)
+# ✓ Milestone 1A — AnalogueChannel + DigitalChannel dataclasses, SignalRole/RoleConfidence constants, COLOUR_MAP, 45 unit tests (all pass)
+# ✓ Milestone 1A — DisturbanceRecord dataclass, SourceFormat constants, __post_init__ validation, 46 unit tests added (91 total, all pass)
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 [Add decisions and issues here as discovered during development]
