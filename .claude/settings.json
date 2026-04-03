@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_parsers/test_models.py -q)",
+      "Bash(python3 -m pytest tests/test_parsers/test_models.py -q)",
+      "Bash(python3.11 -m pytest tests/test_parsers/test_models.py -q)",
+      "Read(//Users/myijat/**)",
+      "Read(//Volumes/externalDrive/code-gym/**)",
+      "Bash(.venv/bin/pytest tests/test_parsers/test_models.py -q)",
+      "Bash(.venv/bin/pytest tests/test_parsers/test_comtrade_parser.py -v)",
+      "Bash(.venv/bin/pytest -q)"
+    ]
+  }
+}
