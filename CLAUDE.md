@@ -1,10 +1,11 @@
 # PowerWave Analyst — Claude Code Master Context
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
-Phase:     Phase 1
+
+Phase: Phase 1
 Milestone: Milestone 1B — COMTRADE Parser
-Module:    src/parsers/comtrade_parser.py
-Status:    IN PROGRESS — Step 1 (CFG) complete, Step 2 (DAT) next
+Module: src/parsers/comtrade_parser.py
+Status: IN PROGRESS — Step 1 (CFG) complete, Step 2 (DAT) next
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -393,12 +394,17 @@ Encoding: UTF-8, Latin-1, ASCII all handled
 For anything else: channel mapping dialog + profile save/recall.
 No vendor should ever cause a crash — only a mapping dialog at worst.
 
-# ✓ Milestone 1A — Data Models complete: AnalogueChannel, DigitalChannel, 
-#   DisturbanceRecord, SignalRole constants, 91 tests passing
-# ✓ Milestone 1B Step 1 — CFG parsing complete: ComtradeParser._parse_cfg(),
-#   build_time_array(), extract_bay_from_analogue_name(), 185 tests passing
-#   (5 real files: BEN32 fast/slow, NARI multi-rate, variable-rate IED,
-#   MM/DD/YY date quirk all handled)
+# ✓ Milestone 1A — Data Models complete: AnalogueChannel, DigitalChannel,
+
+# DisturbanceRecord, SignalRole constants, 91 tests passing
+
+# ✓ Milestone 1B Step 1 — CFG parsing complete: ComtradeParser.\_parse_cfg(),
+
+# build_time_array(), extract_bay_from_analogue_name(), 185 tests passing
+
+# (5 real files: BEN32 fast/slow, NARI multi-rate, variable-rate IED,
+
+# MM/DD/YY date quirk all handled)
 
 # After all tests pass, show me the exact lines I need to update in CLAUDE.md for the completed milestone section and the next milestone current session block. Do not edit CLAUDE.md directly — just show me what to paste.
 
