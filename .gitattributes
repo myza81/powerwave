@@ -1,0 +1,16 @@
+# Auto-detect text files and normalise line endings
+*           text=auto
+
+# Force LF for code and data files
+*.py        text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.csv       text eol=lf
+*.json      text eol=lf
+*.cfg       text eol=lf
+*.dat       binary
+*.xlsx      binary
+*.xls       binary
+*.docx      binary
+*.exe       binary
+*.dll       binary

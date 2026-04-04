@@ -3,8 +3,8 @@
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
 Phase: Phase 1
-Milestone: Milestone 1C — CSV and Excel Parsers
-Module: src/parsers/csv_parser.py, src/parsers/excel_parser.py
+Milestone: Milestone 1D — Basic Waveform Display
+Module: src/ui/main_window.py, src/ui/channel_canvas.py
 Status: IN PROGRESS
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
@@ -396,71 +396,13 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 
 ## ── COMPLETED MILESTONES ───────────────────────────────────────────────────
 
-# ✓ Milestone 1A — Data Models: AnalogueChannel, DigitalChannel, DisturbanceRecord,
+# ✓ 1A — Data models (AnalogueChannel, DigitalChannel, DisturbanceRecord) | 91 tests
 
-# SignalRole constants, 91 tests passing
+# ✓ 1B — COMTRADE parser (CFG+DAT all formats, signal roles, integration) | 490 tests
 
-# ✓ Milestone 1B Step 1 — CFG parsing: ComtradeParser.\_parse_cfg(),
+# Real files: BEN32 fast/slow, NARI multi-rate, variable-rate IED
 
-# build_time_array(), extract_bay_from_analogue_name(), 185 tests passing
-
-# (5 real files: BEN32 fast/slow, NARI multi-rate, variable-rate IED, MM/DD/YY quirk)
-
-# ✓ Milestone 1B Step 2 — DAT reading: \_read_dat_ascii(), \_read_dat_binary(),
-
-# \_read_dat_binary32(), \_read_dat_float32(). Variable-rate nrates=0 resolved from
-
-# DAT timestamps. Windows \x1a EOF handled. 104 new tests, all formats passing.
-
-# ✓ Milestone 1B Step 3 — Signal role auto-detection: detect_signal_roles(),
-
-# detect_analogue_role() (8 priority rules), detect_digital_role() (alarm exception
-
-# + 6 role categories), detect_complementary_cb_pairs(). Wired into ComtradeParser.load().
-
-# 101 new tests, 384 total passing. Bugs found during testing:
-
-# '\_REC' dropped from \_INTERTRIP_KW on write (caught by test);
-
-# 'REACTIVE POWER UNIT' matched P_MW before Q_MVAR (reordered priority 3);
-
-# 'BU_21Z' ≠ '21ZBU' — added 'BU_21Z'/'21Z' variants to \_TRIP_KW.
-
-# ✓ Milestone 1B Step 3 — Signal role detector: signal_role_detector.py,
-
-# 8-priority analogue detection, alarm-exception-first digital detection,
-
-# complementary CB pair wiring. Integrated into comtrade_parser.load().
-
-# 101 new tests, 384 total passing. Bugs caught: \_REC keyword drop,
-
-# Q_MVAR/P_MW priority order, BU_21Z variant.
-
-# ✓ Milestone 1B Step 4 — Integration tests: test_comtrade_integration.py,
-
-# 106 new tests across 4 real files (JMHE_500kV fast, PMJY_275 slow,
-
-# Relay multi-rate NARI, NARI_relay variable-rate). Engineering assertions:
-
-# 500 kV pre-fault RMS, offset-corrected FREQ values, non-uniform time array,
-
-# MM/DD/YY date parsing, alarm-exception digital overrides, is_derived flags.
-
-# 490 total passing. Milestone 1B COMPLETE.
-
-# ✓ Milestone 1B COMPLETE — COMTRADE Parser: CFG parsing, DAT reading
-
-# (ASCII/BINARY/BINARY32/FLOAT32), signal role detection, end-to-end
-
-# integration. 490 tests passing. Real file validation:
-
-# - BEN32 fast (JMHE_500kV): 294kV pre-fault RMS confirmed
-
-# - BEN32 slow (PMJY_275): TREND mode, FREQ offset, MW is_derived
-
-# - NARI multi-rate (4 sections, 1200/600Hz alternating)
-
-# - NARI variable-rate (sample_rate derived from DAT timestamps)
+# ✓ 1C — CSV + Excel parsers (auto-detect separator/time/units, exceptions) | 503 tests
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
