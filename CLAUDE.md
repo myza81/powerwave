@@ -2,10 +2,10 @@
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
-Phase:     Phase 1
-Milestone: Milestone 1B — COMTRADE Parser
-Module:    src/parsers/comtrade_parser.py
-Status:    IN PROGRESS — Steps 1-3 complete, Step 4 (integration test) next
+Phase: Phase 1
+Milestone: Milestone 1C — CSV and Excel Parsers
+Module: src/parsers/csv_parser.py, src/parsers/excel_parser.py
+Status: IN PROGRESS
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -420,17 +420,47 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 
 # 101 new tests, 384 total passing. Bugs found during testing:
 
-#   '_REC' dropped from _INTERTRIP_KW on write (caught by test);
+# '\_REC' dropped from \_INTERTRIP_KW on write (caught by test);
 
-#   'REACTIVE POWER UNIT' matched P_MW before Q_MVAR (reordered priority 3);
+# 'REACTIVE POWER UNIT' matched P_MW before Q_MVAR (reordered priority 3);
 
-#   'BU_21Z' ≠ '21ZBU' — added 'BU_21Z'/'21Z' variants to _TRIP_KW.
+# 'BU_21Z' ≠ '21ZBU' — added 'BU_21Z'/'21Z' variants to \_TRIP_KW.
 
 # ✓ Milestone 1B Step 3 — Signal role detector: signal_role_detector.py,
-#   8-priority analogue detection, alarm-exception-first digital detection,
-#   complementary CB pair wiring. Integrated into comtrade_parser.load().
-#   101 new tests, 384 total passing. Bugs caught: _REC keyword drop,
-#   Q_MVAR/P_MW priority order, BU_21Z variant.
+
+# 8-priority analogue detection, alarm-exception-first digital detection,
+
+# complementary CB pair wiring. Integrated into comtrade_parser.load().
+
+# 101 new tests, 384 total passing. Bugs caught: \_REC keyword drop,
+
+# Q_MVAR/P_MW priority order, BU_21Z variant.
+
+# ✓ Milestone 1B Step 4 — Integration tests: test_comtrade_integration.py,
+
+# 106 new tests across 4 real files (JMHE_500kV fast, PMJY_275 slow,
+
+# Relay multi-rate NARI, NARI_relay variable-rate). Engineering assertions:
+
+# 500 kV pre-fault RMS, offset-corrected FREQ values, non-uniform time array,
+
+# MM/DD/YY date parsing, alarm-exception digital overrides, is_derived flags.
+
+# 490 total passing. Milestone 1B COMPLETE.
+
+# ✓ Milestone 1B COMPLETE — COMTRADE Parser: CFG parsing, DAT reading
+
+# (ASCII/BINARY/BINARY32/FLOAT32), signal role detection, end-to-end
+
+# integration. 490 tests passing. Real file validation:
+
+# - BEN32 fast (JMHE_500kV): 294kV pre-fault RMS confirmed
+
+# - BEN32 slow (PMJY_275): TREND mode, FREQ offset, MW is_derived
+
+# - NARI multi-rate (4 sections, 1200/600Hz alternating)
+
+# - NARI variable-rate (sample_rate derived from DAT timestamps)
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 

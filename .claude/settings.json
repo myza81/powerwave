@@ -15,7 +15,10 @@
       "Bash(.venv/bin/pip list:*)",
       "Bash(pyenv versions:*)",
       "Bash(.venv/bin/pytest tests/test_parsers/test_signal_role_detector.py -v)",
-      "Bash(.venv/bin/pytest tests/ -v --tb=short)"
+      "Bash(.venv/bin/pytest tests/ -v --tb=short)",
+      "Bash(.venv/bin/python -c ':*)",
+      "Bash(.venv/bin/pytest tests/test_parsers/test_comtrade_integration.py -v)",
+      "Bash(.venv/bin/pytest tests/ -q)"
     ]
   }
 }
