@@ -45,6 +45,11 @@ SEMICOLON_CSV  = TEST_DATA / 'synthetic_semicolon.csv'
 NO_TIME_CSV    = TEST_DATA / 'synthetic_no_time_header.csv'
 AMBIGUOUS_CSV  = TEST_DATA / 'synthetic_ambiguous.csv'
 
+# Real PMU CSV files (three-phase / positive-sequence recorder exports)
+PLTG_WAV81_CSV = TEST_DATA / '230PLTG_WAV81.csv'
+BAHS_KAWA1_CSV = TEST_DATA / '275BAHS_KAWA1.csv'
+JMJG_U5_CSV    = TEST_DATA / '500JMJG_U5.csv'
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -470,3 +475,146 @@ class TestDisturbanceRecordContract:
         for ch in record.analogue_channels:
             assert ch.colour.startswith('#')
             assert len(ch.colour) == 7
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestRealPmuCsv_230PLTG — 230PLTG_WAV81.csv
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRealPmuCsv_230PLTG:
+    """Real PMU CSV from 230 kV PLTG station (recorder ID 813).
+
+    CsvParser limitation with this file:
+      The first line is a PMU metadata row
+      ("ID: 813, Station Name: 230PLTG-WAV81,,,,,...") which pandas
+      reads as column headers.  The actual data header row ("Date,
+      Time(Asia),status,...") becomes the first data row.  Because the
+      first column ('ID: 813') contains date strings ("10/15/25") that
+      are non-numeric, the time array is empty and sample_rate falls
+      back to the 50 Hz default.  CsvParser must NOT crash; it produces
+      a degenerate but structurally valid DisturbanceRecord.
+      Proper parsing of this file requires pmu_csv_parser.py.
+
+    Expected channel layout after CsvParser:
+      Unnamed:2..14 → 13 numeric data columns
+      (status/freq/df/dt/V1-mag/ang/VA/VB/VC-mag/ang/I1-mag/ang).
+    """
+
+    def setup_method(self):
+        self.record = _load(PLTG_WAV81_CSV)
+
+    def test_loads_without_exception(self):
+        assert isinstance(self.record, DisturbanceRecord)
+
+    def test_source_format_csv(self):
+        assert self.record.source_format == SourceFormat.CSV
+
+    def test_sample_rate_positive(self):
+        # True sample rate (50 fps) cannot be determined from the broken time
+        # column; CsvParser defaults to 50 Hz.  Assert only that it is > 0.
+        assert self.record.sample_rate > 0.0
+
+    def test_display_mode_trend(self):
+        # Default 50 Hz < 200 Hz threshold → TREND (LAW 9)
+        assert self.record.display_mode == 'TREND'
+
+    def test_channel_count(self):
+        # 13 unnamed numeric columns survive _build_analogue_channels
+        assert self.record.n_analogue == 13
+
+    def test_at_least_one_non_analogue_role(self):
+        """signal_role_detector assigns V_PHASE/I_PHASE from data values."""
+        roles = {ch.signal_role for ch in self.record.analogue_channels}
+        assert roles != {SignalRole.ANALOGUE}
+
+    def test_time_array_dtype_float64(self):
+        assert self.record.time_array.dtype == np.float64
+
+    def test_time_array_monotonically_non_decreasing(self):
+        ta = self.record.time_array
+        if len(ta) > 1:
+            assert np.all(np.diff(ta) >= 0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestRealPmuCsv_275BAHS — 275BAHS_KAWA1.csv
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRealPmuCsv_275BAHS:
+    """Real PMU CSV from 275 kV BAHS/KAWA1 station (recorder ID 571).
+
+    CsvParser limitation with this file:
+      The metadata row has exactly two comma-separated fields
+      ("ID: 571, Station Name: 275BAHS-KAWA1"), so pandas creates a
+      two-column DataFrame, silently truncating all data rows to their
+      last two fields.  No column name contains a time keyword so the
+      first column ('ID: 571') is used as time (treated as seconds).
+      After the actual header row ('KAWA1_I1 Magnitude') is discarded as
+      non-numeric, only one data column remains and all channels are
+      ANALOGUE → NeedsMappingDialog is raised.  This is the correct
+      graceful-degradation path for an unresolvable CSV file.
+    """
+
+    def test_raises_needs_mapping_dialog(self):
+        """CsvParser raises NeedsMappingDialog — correct fallback for this file."""
+        with pytest.raises(NeedsMappingDialog) as exc_info:
+            _load(BAHS_KAWA1_CSV)
+        assert isinstance(exc_info.value.columns, list)
+        assert len(exc_info.value.columns) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestRealPmuCsv_500JMJG — 500JMJG_U5.csv
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRealPmuCsv_500JMJG:
+    """Real PMU CSV from 500 kV JMJG station unit 5 (recorder ID 241).
+
+    CsvParser limitation with this file:
+      Same metadata-row problem as 230PLTG: the first line
+      ("ID: 241, Station Name: 500JMJG-U5,,,,,,") becomes column
+      headers.  All timestamps are the broken "12:00.0" format (known
+      PMU 241 GPS issue per CLAUDE.md), stored only in the date column
+      which is non-numeric → empty time array and default 50 Hz.
+      CsvParser must NOT crash.  Proper parsing requires pmu_csv_parser.py.
+
+    Expected channel layout after CsvParser:
+      Status column ('Unnamed: 2') is "00 00" → non-numeric → skipped.
+      Unnamed:3..8 → 6 numeric channels
+      (freq/df/dt/V1-mag/ang/I1-mag/ang).
+    """
+
+    def setup_method(self):
+        self.record = _load(JMJG_U5_CSV)
+
+    def test_loads_without_exception(self):
+        assert isinstance(self.record, DisturbanceRecord)
+
+    def test_source_format_csv(self):
+        assert self.record.source_format == SourceFormat.CSV
+
+    def test_sample_rate_positive(self):
+        # True sample rate (50 fps) cannot be determined from the broken time
+        # column; CsvParser defaults to 50 Hz.  Assert only that it is > 0.
+        assert self.record.sample_rate > 0.0
+
+    def test_display_mode_trend(self):
+        # Default 50 Hz < 200 Hz threshold → TREND (LAW 9)
+        assert self.record.display_mode == 'TREND'
+
+    def test_channel_count(self):
+        # 6 unnamed numeric columns survive _build_analogue_channels
+        assert self.record.n_analogue == 6
+
+    def test_at_least_one_non_analogue_role(self):
+        """signal_role_detector assigns V_PHASE/I_PHASE from data values."""
+        roles = {ch.signal_role for ch in self.record.analogue_channels}
+        assert roles != {SignalRole.ANALOGUE}
+
+    def test_time_array_dtype_float64(self):
+        assert self.record.time_array.dtype == np.float64
+
+    def test_time_array_monotonically_non_decreasing(self):
+        ta = self.record.time_array
+        if len(ta) > 1:
+            assert np.all(np.diff(ta) >= 0.0)
