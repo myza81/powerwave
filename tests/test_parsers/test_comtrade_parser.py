@@ -267,12 +267,12 @@ class TestJmhe500kV:
         # 5000 Hz, 17087 end_sample
         assert len(record.time_array) == 17087
 
-    def test_analogue_raw_data_empty(self, record):
-        # Step 1 — DAT not read yet
-        assert len(record.analogue_channels[0].raw_data) == 0
+    def test_analogue_data_populated(self, record):
+        # Step 2 — DAT read: all 17087 samples present on every analogue channel
+        assert len(record.analogue_channels[0].raw_data) == 17087
 
-    def test_digital_raw_data_empty(self, record):
-        assert len(record.digital_channels[0].data) == 0
+    def test_digital_data_populated(self, record):
+        assert len(record.digital_channels[0].data) == 17087
 
 
 class TestNariRelayCfg:
@@ -318,15 +318,17 @@ class TestNariRelayCfg:
         assert ch.name == 'Idiff Trip Z1'
         assert ch.normal_state == 0
 
-    def test_variable_rate_placeholder(self, record):
-        # nrates=0 → sample_rate defaults to DEFAULT_VARIABLE_RATE (50 Hz)
-        # and display_mode is TREND
-        assert record.sample_rate == pytest.approx(50.0)
-        assert record.display_mode == 'TREND'
+    def test_variable_rate_resolved_from_dat(self, record):
+        # nrates=0: after DAT reading, sample_rate is derived from timestamp deltas.
+        # DAT timestamps are 0, 833, 1666 µs → dt=833µs → ~1200 Hz (WAVEFORM)
+        assert record.sample_rate == pytest.approx(1200.0, abs=50.0)
+        assert record.display_mode == 'WAVEFORM'
 
-    def test_time_array_empty_for_variable_rate(self, record):
-        # build_time_array returns [] when rate == 0
-        assert len(record.time_array) == 0
+    def test_time_array_populated_from_dat_timestamps(self, record):
+        # Variable-rate: time_array built from actual DAT timestamps, not CFG sections
+        assert len(record.time_array) == 6024
+        assert record.time_array[0] == pytest.approx(0.0)
+        assert record.time_array[-1] == pytest.approx(5.012, abs=0.01)
 
 
 class TestPmjy275:
@@ -507,3 +509,76 @@ class TestRelayCfg:
         # Op_* channels should be present
         op_channels = [c for c in record.digital_channels if c.name.startswith('Op_')]
         assert len(op_channels) > 0
+
+    def test_analogue_data_populated(self, record):
+        assert len(record.analogue_channels[0].raw_data) == 2800
+
+    def test_digital_data_populated(self, record):
+        assert len(record.digital_channels[0].data) == 2800
+
+
+# ── Step 2 DAT reading integration tests ─────────────────────────────────────
+
+class TestDatReadingIntegration:
+    """Verify DAT-reading correctness: physical values, offset application,
+    variable-rate resolution, and complete load for all real test files."""
+
+    def test_ptai275_first_analogue_plausible_for_275kv(self):
+        """PTAI_275 is a 275 kV BEN32 station.
+
+        First channel 'KULN1 VR' (phase-to-earth voltage):
+          multiplier=0.0118743504, offset=0.0
+          Nominal peak phase voltage ≈ 275 kV / √3 × √2 ≈ 225 kV.
+          Assert max absolute value is within 100–500 kV.
+        """
+        record = ComtradeParser().load(TEST_DATA / 'PTAI_275.cfg')
+        ch = record.analogue_channels[0]
+        assert ch.name == 'KULN1 VR'
+        max_abs = float(np.max(np.abs(ch.raw_data)))
+        assert 100.0 < max_abs < 500.0
+
+    def test_pmjy275_freq_offset_applied(self):
+        """PMJY_275 is a BEN32 slow record (20 Hz) with FREQ channels.
+
+        FREQ channels have offset=50.0 Hz in the CFG.  Without offset the
+        raw values produce ~0.46 Hz (nonsense).  With offset applied the
+        physical values must be in the plausible system frequency band 48–52 Hz.
+        """
+        record = ComtradeParser().load(TEST_DATA / 'PMJY_275.cfg')
+        freq_ch = next(c for c in record.analogue_channels if 'FREQ' in c.name)
+        assert freq_ch.offset == pytest.approx(50.0)
+        mean_freq = float(np.mean(freq_ch.raw_data))
+        assert 48.0 < mean_freq < 52.0, (
+            f"FREQ mean={mean_freq:.3f} Hz — offset not applied correctly"
+        )
+
+    def test_nari_relay_variable_rate_resolved(self):
+        """NARI_relay.CFG has nrates=0 (variable rate).
+
+        After DAT reading, sample_rate must be derived from timestamp deltas
+        (~833 µs → ~1200 Hz) and time_array populated from actual timestamps.
+        display_mode must flip from TREND (50 Hz placeholder) to WAVEFORM.
+        """
+        record = ComtradeParser().load(TEST_DATA / 'NARI_relay.CFG')
+        assert record.sample_rate == pytest.approx(1200.0, abs=50.0), (
+            f"Expected ~1200 Hz from DAT timestamps, got {record.sample_rate:.1f}"
+        )
+        assert record.display_mode == 'WAVEFORM'
+        assert len(record.time_array) == 6024
+        assert record.time_array[0] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize('cfg_name', [
+        'JMHE_500kV.cfg',
+        'NARI_relay.CFG',
+        'PMJY_275.cfg',
+        'PTAI_275.cfg',
+        'Relay.cfg',
+    ])
+    def test_all_real_files_load_without_error(self, cfg_name):
+        """Every real test file must load completely without raising an exception."""
+        record = ComtradeParser().load(TEST_DATA / cfg_name)
+        assert record is not None
+        assert record.n_analogue > 0
+        assert record.n_digital >= 0
+        # At least one channel must have sample data populated
+        assert len(record.analogue_channels[0].raw_data) > 0

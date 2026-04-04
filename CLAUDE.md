@@ -5,7 +5,7 @@
 Phase: Phase 1
 Milestone: Milestone 1B — COMTRADE Parser
 Module: src/parsers/comtrade_parser.py
-Status: IN PROGRESS — Step 1 (CFG) complete, Step 2 (DAT) next
+Status: IN PROGRESS — Step 2 (DAT) complete, Step 3 (signal_role_detector) next
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -394,19 +394,23 @@ Encoding: UTF-8, Latin-1, ASCII all handled
 For anything else: channel mapping dialog + profile save/recall.
 No vendor should ever cause a crash — only a mapping dialog at worst.
 
-# ✓ Milestone 1A — Data Models complete: AnalogueChannel, DigitalChannel,
+## ── COMPLETED MILESTONES ───────────────────────────────────────────────────
 
-# DisturbanceRecord, SignalRole constants, 91 tests passing
+# ✓ Milestone 1A — Data Models: AnalogueChannel, DigitalChannel, DisturbanceRecord,
 
-# ✓ Milestone 1B Step 1 — CFG parsing complete: ComtradeParser.\_parse_cfg(),
+# SignalRole constants, 91 tests passing
+
+# ✓ Milestone 1B Step 1 — CFG parsing: ComtradeParser.\_parse_cfg(),
 
 # build_time_array(), extract_bay_from_analogue_name(), 185 tests passing
 
-# (5 real files: BEN32 fast/slow, NARI multi-rate, variable-rate IED,
+# (5 real files: BEN32 fast/slow, NARI multi-rate, variable-rate IED, MM/DD/YY quirk)
 
-# MM/DD/YY date quirk all handled)
+# ✓ Milestone 1B Step 2 — DAT reading: \_read_dat_ascii(), \_read_dat_binary(),
 
-# After all tests pass, show me the exact lines I need to update in CLAUDE.md for the completed milestone section and the next milestone current session block. Do not edit CLAUDE.md directly — just show me what to paste.
+# \_read_dat_binary32(), \_read_dat_float32(). Variable-rate nrates=0 resolved from
+
+# DAT timestamps. Windows \x1a EOF handled. 104 new tests, all formats passing.
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
@@ -415,6 +419,30 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 # DECISION: reason
 
 # ISSUE: description and workaround
+
+## ── DEVELOPMENT ENVIRONMENT ────────────────────────────────────────────────
+
+OS: macOS
+Python: 3.11.9 via pyenv (set by .python-version file in project root)
+Venv: .venv/ — MUST be active before running any command
+
+ACTIVATION (run once per VS Code session):
+source .venv/bin/activate
+Prompt must show (.venv) prefix before proceeding.
+
+ALWAYS use venv-prefixed commands — never bare python/pip/pytest:
+Python: .venv/bin/python
+Pip: .venv/bin/pip
+Pytest: .venv/bin/pytest
+App: .venv/bin/python src/main.py
+
+VERIFY correct interpreter:
+.venv/bin/python -c "import sys; print(sys.executable)"
+Expected: /Volumes/externalDrive/code-gym/powerwave/.venv/bin/python
+
+PACKAGE MANAGEMENT:
+Install missing package: .venv/bin/pip install <package>
+Never install to system Python or pyenv global.
 
 ## ── PLANNING DOCUMENTS ─────────────────────────────────────────────────────
 

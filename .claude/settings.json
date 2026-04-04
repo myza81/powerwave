@@ -8,7 +8,12 @@
       "Read(//Volumes/externalDrive/code-gym/**)",
       "Bash(.venv/bin/pytest tests/test_parsers/test_models.py -q)",
       "Bash(.venv/bin/pytest tests/test_parsers/test_comtrade_parser.py -v)",
-      "Bash(.venv/bin/pytest -q)"
+      "Bash(.venv/bin/pytest -q)",
+      "Bash(python -m pytest tests/test_parsers/test_comtrade_parser.py -v)",
+      "Bash(python3 -m pytest tests/test_parsers/test_comtrade_parser.py -v)",
+      "Bash(.venv/bin/pytest tests/test_parsers/test_comtrade_parser.py -v --tb=short)",
+      "Bash(.venv/bin/pip list:*)",
+      "Bash(pyenv versions:*)"
     ]
   }
 }

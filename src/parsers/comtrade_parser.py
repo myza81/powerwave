@@ -8,8 +8,9 @@ Supports:
   Revision years : 1991, 1999, 2013 (non-standard calendar year → '1999')
   Analogue lines : 10-field (NARI short) and 13-field (BEN32 / ABB / Siemens)
   Digital lines  : 3-field (NARI short) and 5-field (BEN32 / ABB / Siemens)
-  DAT formats    : ASCII (Step 1 complete), BINARY / BINARY32 / FLOAT32 (Step 2)
+  DAT formats    : ASCII, BINARY (int16), BINARY32 (int32), FLOAT32
   Multi-rate     : one or more rate sections; NON-UNIFORM time array built from CFG
+  Variable-rate  : nrates=0 → sample_rate derived from DAT timestamps
   Encoding       : UTF-8 with Latin-1 fallback
   Line endings   : LF and CRLF
 
@@ -19,6 +20,7 @@ Architecture: Data layer (parsers/) — imports models/ only.
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -226,14 +228,18 @@ class ComtradeParser:
         """Load a COMTRADE record from ``filepath``.
 
         ``filepath`` may point to the .cfg, .CFG, .dat, or .DAT file —
-        the sibling CFG file is located automatically.
+        the sibling CFG/DAT files are located automatically.
 
         Returns:
-            DisturbanceRecord with all metadata populated.  Channel
-            ``raw_data`` / ``data`` arrays are empty (Step 1 — CFG only).
-            They will be populated in Step 2 when DAT reading is added.
+            DisturbanceRecord with all metadata and sample data populated.
+            ``analogue_channels[i].raw_data`` holds float32 physical values
+            (multiplier + offset applied per LAW 10).
+            ``digital_channels[i].data`` holds uint8 (0/1) values.
+            For variable-rate files (nrates=0), ``sample_rate`` and
+            ``time_array`` are derived from the actual DAT timestamps.
         """
         cfg_path = self._find_cfg(filepath)
+        dat_path = self._find_dat(filepath)
         cfg = self._parse_cfg(cfg_path)
 
         analogue_channels = self._build_analogue_channels(cfg)
@@ -252,16 +258,41 @@ class ComtradeParser:
         for ch in digital_channels:
             ch.bay_name = extract_bay_from_digital_name(ch.name, known_bays)
 
-        # ── Sample rate: use first section; default when rate == 0 ────────────
+        # ── Read DAT samples ──────────────────────────────────────────────────
+        _dat_readers = {
+            'ASCII':    self._read_dat_ascii,
+            'BINARY':   self._read_dat_binary,
+            'BINARY32': self._read_dat_binary32,
+            'FLOAT32':  self._read_dat_float32,
+        }
+        reader = _dat_readers.get(cfg['dat_format'], self._read_dat_ascii)
+        analogue_raw, digital_data, timestamps_us = reader(dat_path, cfg)
+
+        # ── Populate channel sample arrays ────────────────────────────────────
+        if analogue_raw.shape[0] > 0:
+            for i, ch in enumerate(analogue_channels):
+                ch.raw_data = analogue_raw[:, i]
+        if digital_data.shape[0] > 0:
+            for i, ch in enumerate(digital_channels):
+                ch.data = digital_data[:, i]
+
+        # ── Sample rate and time array ─────────────────────────────────────────
         rate_sections: list[dict] = cfg['rate_sections']
         primary_rate = rate_sections[0]['rate'] if rate_sections else DEFAULT_VARIABLE_RATE
+
         if primary_rate == 0.0:
-            primary_rate = DEFAULT_VARIABLE_RATE
+            # Variable-rate file: derive sample_rate from actual DAT timestamps
+            if len(timestamps_us) > 1:
+                diffs = np.diff(timestamps_us.astype(np.float64))
+                median_dt_us = float(np.median(diffs[diffs > 0])) if np.any(diffs > 0) else 0.0
+                primary_rate = (1e6 / median_dt_us) if median_dt_us > 0 else DEFAULT_VARIABLE_RATE
+            else:
+                primary_rate = DEFAULT_VARIABLE_RATE
+            time_array = timestamps_us.astype(np.float64) / 1e6
+        else:
+            time_array = build_time_array(rate_sections)
 
-        # ── Time array from CFG (empty for variable-rate files) ───────────────
-        time_array = build_time_array(rate_sections)
-
-        # ── trigger_sample: derived from timestamps where rate is known ───────
+        # ── trigger_sample: derived from timestamps ───────────────────────────
         start_time: datetime = cfg['start_time']
         trigger_time: datetime = cfg['trigger_time']
         delta = (trigger_time - start_time).total_seconds()
@@ -518,3 +549,213 @@ class ComtradeParser:
             )
             channels.append(ch)
         return channels
+
+    # ── DAT readers ───────────────────────────────────────────────────────────
+
+    def _apply_analogue_scaling(
+        self,
+        raw: np.ndarray,
+        cfg: dict,
+    ) -> np.ndarray:
+        """Apply physical scaling to a raw analogue array (LAW 10).
+
+        Args:
+            raw:  float64 array of shape (n_samples, n_analogue) — raw integers.
+            cfg:  parsed CFG dict containing ``analogue_defs``.
+
+        Returns:
+            float32 array of same shape with physical = raw * multiplier + offset.
+        """
+        defs = cfg['analogue_defs']
+        multipliers = np.array([d['multiplier'] for d in defs], dtype=np.float64)
+        offsets = np.array([d['offset'] for d in defs], dtype=np.float64)
+        return (raw * multipliers + offsets).astype(np.float32)
+
+    def _read_dat_ascii(
+        self,
+        dat_path: Path,
+        cfg: dict,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Parse an ASCII-format COMTRADE DAT file.
+
+        Row format: sample_num, timestamp_µs, a0, ..., aN-1, d0, ..., dM-1
+
+        Digital channels in ASCII DAT are individual 0/1 values — no bit-packing.
+
+        Returns:
+            analogue_scaled : float32 (n_samples, n_analogue) — physical values
+            digital_data    : uint8  (n_samples, n_digital)
+            timestamps_us   : int64  (n_samples,) — microseconds from record start
+        """
+        lines = self._read_lines(dat_path)
+        # Filter blank lines AND lines that contain no digit (e.g. the Windows
+        # \x1a EOF marker that some BEN32 recorders append after the last row).
+        lines = [l for l in lines if l.strip() and any(c.isdigit() for c in l)]
+
+        n_analogue = cfg['n_analogue']
+        n_digital = cfg['n_digital']
+        n_samples = len(lines)
+
+        if n_samples == 0:
+            return (
+                np.zeros((0, n_analogue), dtype=np.float32),
+                np.zeros((0, n_digital), dtype=np.uint8),
+                np.array([], dtype=np.int64),
+            )
+
+        # Join all lines into one flat comma-separated string and parse in one
+        # numpy call — significantly faster than row-by-row Python iteration.
+        # Recompute n_samples from flat size as a safety net for any remaining
+        # partial rows (e.g. truncated final line).
+        total_cols = 2 + n_analogue + n_digital
+        flat = np.fromstring(','.join(lines), sep=',', dtype=np.float64)
+        n_samples = len(flat) // total_cols
+        arr = flat[:n_samples * total_cols].reshape(n_samples, total_cols)
+
+        timestamps_us = arr[:, 1].astype(np.int64)
+        raw_analogue = arr[:, 2:2 + n_analogue]
+        digital_data = arr[:, 2 + n_analogue:2 + n_analogue + n_digital].astype(np.uint8)
+
+        analogue_scaled = self._apply_analogue_scaling(raw_analogue, cfg)
+        return analogue_scaled, digital_data, timestamps_us
+
+    def _read_dat_binary(
+        self,
+        dat_path: Path,
+        cfg: dict,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Parse a BINARY-format COMTRADE DAT file.
+
+        Binary record structure per sample::
+
+            uint32  sample_number
+            uint32  timestamp_µs
+            int16 × n_analogue
+            uint16 × ceil(n_digital / 16)   ← packed digital bits
+
+        Digital bit extraction: word_idx = ch_idx // 16, bit_idx = ch_idx % 16.
+
+        Returns:
+            analogue_scaled : float32 (n_samples, n_analogue) — physical values
+            digital_data    : uint8  (n_samples, n_digital)
+            timestamps_us   : int64  (n_samples,)
+        """
+        n_analogue = cfg['n_analogue']
+        n_digital = cfg['n_digital']
+        n_digital_words = math.ceil(n_digital / 16) if n_digital > 0 else 0
+
+        dtype = np.dtype([
+            ('sample_num', '<u4'),
+            ('timestamp',  '<u4'),
+            ('analogue',   f'<{n_analogue}i2'),
+            ('digital',    f'<{n_digital_words}u2'),
+        ])
+        record_size = dtype.itemsize
+        raw_bytes = dat_path.read_bytes()
+        n_samples = len(raw_bytes) // record_size
+
+        records = np.frombuffer(raw_bytes[:n_samples * record_size], dtype=dtype)
+
+        timestamps_us = records['timestamp'].astype(np.int64)
+        raw_analogue = records['analogue'].astype(np.float64)
+        analogue_scaled = self._apply_analogue_scaling(raw_analogue, cfg)
+
+        digital_data = np.zeros((n_samples, n_digital), dtype=np.uint8)
+        if n_digital > 0:
+            packed = records['digital']               # (n_samples, n_digital_words)
+            for d_idx in range(n_digital):
+                word_idx = d_idx // 16
+                bit_idx = d_idx % 16
+                digital_data[:, d_idx] = (packed[:, word_idx] >> bit_idx) & 1
+
+        return analogue_scaled, digital_data, timestamps_us
+
+    def _read_dat_binary32(
+        self,
+        dat_path: Path,
+        cfg: dict,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Parse a BINARY32-format COMTRADE DAT file.
+
+        Identical structure to BINARY but analogue samples are int32 (not int16),
+        giving higher dynamic range on 32-bit IED outputs.
+
+        Returns:
+            analogue_scaled : float32 (n_samples, n_analogue) — physical values
+            digital_data    : uint8  (n_samples, n_digital)
+            timestamps_us   : int64  (n_samples,)
+        """
+        n_analogue = cfg['n_analogue']
+        n_digital = cfg['n_digital']
+        n_digital_words = math.ceil(n_digital / 16) if n_digital > 0 else 0
+
+        dtype = np.dtype([
+            ('sample_num', '<u4'),
+            ('timestamp',  '<u4'),
+            ('analogue',   f'<{n_analogue}i4'),
+            ('digital',    f'<{n_digital_words}u2'),
+        ])
+        record_size = dtype.itemsize
+        raw_bytes = dat_path.read_bytes()
+        n_samples = len(raw_bytes) // record_size
+
+        records = np.frombuffer(raw_bytes[:n_samples * record_size], dtype=dtype)
+
+        timestamps_us = records['timestamp'].astype(np.int64)
+        raw_analogue = records['analogue'].astype(np.float64)
+        analogue_scaled = self._apply_analogue_scaling(raw_analogue, cfg)
+
+        digital_data = np.zeros((n_samples, n_digital), dtype=np.uint8)
+        if n_digital > 0:
+            packed = records['digital']
+            for d_idx in range(n_digital):
+                word_idx = d_idx // 16
+                bit_idx = d_idx % 16
+                digital_data[:, d_idx] = (packed[:, word_idx] >> bit_idx) & 1
+
+        return analogue_scaled, digital_data, timestamps_us
+
+    def _read_dat_float32(
+        self,
+        dat_path: Path,
+        cfg: dict,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Parse a FLOAT32-format COMTRADE DAT file.
+
+        Identical structure to BINARY but analogue samples are IEEE float32.
+        Physical scaling (multiplier + offset) is still applied per LAW 10.
+
+        Returns:
+            analogue_scaled : float32 (n_samples, n_analogue) — physical values
+            digital_data    : uint8  (n_samples, n_digital)
+            timestamps_us   : int64  (n_samples,)
+        """
+        n_analogue = cfg['n_analogue']
+        n_digital = cfg['n_digital']
+        n_digital_words = math.ceil(n_digital / 16) if n_digital > 0 else 0
+
+        dtype = np.dtype([
+            ('sample_num', '<u4'),
+            ('timestamp',  '<u4'),
+            ('analogue',   f'<{n_analogue}f4'),
+            ('digital',    f'<{n_digital_words}u2'),
+        ])
+        record_size = dtype.itemsize
+        raw_bytes = dat_path.read_bytes()
+        n_samples = len(raw_bytes) // record_size
+
+        records = np.frombuffer(raw_bytes[:n_samples * record_size], dtype=dtype)
+
+        timestamps_us = records['timestamp'].astype(np.int64)
+        raw_analogue = records['analogue'].astype(np.float64)
+        analogue_scaled = self._apply_analogue_scaling(raw_analogue, cfg)
+
+        digital_data = np.zeros((n_samples, n_digital), dtype=np.uint8)
+        if n_digital > 0:
+            packed = records['digital']
+            for d_idx in range(n_digital):
+                word_idx = d_idx // 16
+                bit_idx = d_idx % 16
+                digital_data[:, d_idx] = (packed[:, word_idx] >> bit_idx) & 1
+
+        return analogue_scaled, digital_data, timestamps_us
