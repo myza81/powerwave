@@ -13,7 +13,9 @@
       "Bash(python3 -m pytest tests/test_parsers/test_comtrade_parser.py -v)",
       "Bash(.venv/bin/pytest tests/test_parsers/test_comtrade_parser.py -v --tb=short)",
       "Bash(.venv/bin/pip list:*)",
-      "Bash(pyenv versions:*)"
+      "Bash(pyenv versions:*)",
+      "Bash(.venv/bin/pytest tests/test_parsers/test_signal_role_detector.py -v)",
+      "Bash(.venv/bin/pytest tests/ -v --tb=short)"
     ]
   }
 }

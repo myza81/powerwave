@@ -2,10 +2,10 @@
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
-Phase: Phase 1
+Phase:     Phase 1
 Milestone: Milestone 1B — COMTRADE Parser
-Module: src/parsers/comtrade_parser.py
-Status: IN PROGRESS — Step 2 (DAT) complete, Step 3 (signal_role_detector) next
+Module:    src/parsers/comtrade_parser.py
+Status:    IN PROGRESS — Steps 1-3 complete, Step 4 (integration test) next
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -411,6 +411,26 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 # \_read_dat_binary32(), \_read_dat_float32(). Variable-rate nrates=0 resolved from
 
 # DAT timestamps. Windows \x1a EOF handled. 104 new tests, all formats passing.
+
+# ✓ Milestone 1B Step 3 — Signal role auto-detection: detect_signal_roles(),
+
+# detect_analogue_role() (8 priority rules), detect_digital_role() (alarm exception
+
+# + 6 role categories), detect_complementary_cb_pairs(). Wired into ComtradeParser.load().
+
+# 101 new tests, 384 total passing. Bugs found during testing:
+
+#   '_REC' dropped from _INTERTRIP_KW on write (caught by test);
+
+#   'REACTIVE POWER UNIT' matched P_MW before Q_MVAR (reordered priority 3);
+
+#   'BU_21Z' ≠ '21ZBU' — added 'BU_21Z'/'21Z' variants to _TRIP_KW.
+
+# ✓ Milestone 1B Step 3 — Signal role detector: signal_role_detector.py,
+#   8-priority analogue detection, alarm-exception-first digital detection,
+#   complementary CB pair wiring. Integrated into comtrade_parser.load().
+#   101 new tests, 384 total passing. Bugs caught: _REC keyword drop,
+#   Q_MVAR/P_MW priority order, BU_21Z variant.
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 

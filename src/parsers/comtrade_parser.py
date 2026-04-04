@@ -29,6 +29,7 @@ import numpy as np
 
 from src.models.channel import AnalogueChannel, DigitalChannel
 from src.models.disturbance_record import DisturbanceRecord
+from src.parsers.signal_role_detector import detect_signal_roles
 
 # ── Module-level constants ────────────────────────────────────────────────────
 
@@ -291,6 +292,11 @@ class ComtradeParser:
             time_array = timestamps_us.astype(np.float64) / 1e6
         else:
             time_array = build_time_array(rate_sections)
+
+        # ── Auto-detect signal roles (Step 3) ────────────────────────────────
+        detect_signal_roles(
+            list(analogue_channels) + list(digital_channels)  # type: ignore[arg-type]
+        )
 
         # ── trigger_sample: derived from timestamps ───────────────────────────
         start_time: datetime = cfg['start_time']
