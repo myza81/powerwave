@@ -18,7 +18,7 @@ from typing import Optional
 
 import numpy as np
 
-from src.models.channel import AnalogueChannel, DigitalChannel
+from models.channel import AnalogueChannel, DigitalChannel
 
 # ── Module-level constants ────────────────────────────────────────────────────
 

@@ -27,9 +27,9 @@ from pathlib import Path
 
 import numpy as np
 
-from src.models.channel import AnalogueChannel, DigitalChannel
-from src.models.disturbance_record import DisturbanceRecord
-from src.parsers.signal_role_detector import detect_signal_roles
+from models.channel import AnalogueChannel, DigitalChannel
+from models.disturbance_record import DisturbanceRecord
+from parsers.signal_role_detector import detect_signal_roles
 
 # ── Module-level constants ────────────────────────────────────────────────────
 

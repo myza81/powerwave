@@ -26,10 +26,10 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.models.channel import AnalogueChannel, RoleConfidence, SignalRole
-from src.models.disturbance_record import DisturbanceRecord, SourceFormat
-from src.parsers.parser_exceptions import NeedsMappingDialog
-from src.parsers.signal_role_detector import detect_signal_roles
+from models.channel import AnalogueChannel, RoleConfidence, SignalRole
+from models.disturbance_record import DisturbanceRecord, SourceFormat
+from parsers.parser_exceptions import NeedsMappingDialog
+from parsers.signal_role_detector import detect_signal_roles
 
 # ── Module-level constants ────────────────────────────────────────────────────
 

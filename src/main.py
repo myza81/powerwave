@@ -1,0 +1,352 @@
+"""
+src/main.py
+
+PowerWave Analyst — application entry point.
+
+MainWindow layout (BEN32-style):
+  Central widget: QScrollArea containing a horizontal container:
+    Left  : LabelPanel (fixed 160px) — channel name / unit strip
+    Right : ChannelCanvas            — waveform / trend / digital rows
+
+  Both LabelPanel and ChannelCanvas sit inside the same QScrollArea so
+  vertical scrolling keeps them perfectly synchronised.
+
+  Menu: File > Open (Ctrl+O), File > Exit
+  Status bar: loaded filename + channel count
+
+File open flow (LAW 2 — never block the UI thread):
+  1. QFileDialog picks .cfg / .csv / .xlsx / .xls files
+  2. File type detected by extension → correct parser selected
+  3. Parser runs in QThreadPool via run_in_thread()
+  4. On success: app_state.record_loaded emitted; panels refresh
+  5. On error:   QMessageBox shows the error message
+
+Architecture: Presentation layer — may import core/, ui/, parsers/.
+              Uses only upward-permitted imports (LAW 1).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QMainWindow,
+    QMessageBox,
+    QScrollArea,
+    QWidget,
+)
+from PyQt6.QtGui import QAction
+from PyQt6.QtCore import Qt
+
+from core.app_state import app_state
+from core.thread_manager import run_in_thread
+from models.disturbance_record import DisturbanceRecord
+from parsers.comtrade_parser import ComtradeParser
+from parsers.csv_parser import CsvParser
+from parsers.excel_parser import ExcelParser
+from parsers.parser_exceptions import NeedsMappingDialog, NeedsSheetSelection
+from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
+from ui.channel_canvas import ChannelCanvas
+from ui.waveform_panel import LabelPanel
+
+# ── Module constants ──────────────────────────────────────────────────────────
+
+WINDOW_TITLE: str   = "PowerWave Analyst"
+MIN_WIDTH:    int   = 1280
+MIN_HEIGHT:   int   = 800
+
+FILE_FILTER: str = (
+    "Disturbance Records (*.cfg *.CFG *.csv *.CSV *.xlsx *.xls);;"
+    "COMTRADE (*.cfg *.CFG);;"
+    "CSV Files (*.csv *.CSV);;"
+    "Excel Files (*.xlsx *.xls);;"
+    "All Files (*)"
+)
+
+_COMTRADE_EXT: frozenset[str] = frozenset({'.cfg', '.dat'})
+_CSV_EXT:      frozenset[str] = frozenset({'.csv'})
+_EXCEL_EXT:    frozenset[str] = frozenset({'.xlsx', '.xls', '.xlsm'})
+
+
+class MainWindow(QMainWindow):
+    """Top-level application window for PowerWave Analyst.
+
+    Holds the combined LabelPanel + ChannelCanvas scroll view, menu bar,
+    and status bar.  File loading is dispatched to a background thread;
+    results arrive via app_state signals.
+    """
+
+    def __init__(self) -> None:
+        """Initialise the window layout, menus, and signal connections."""
+        super().__init__()
+        self.setWindowTitle(WINDOW_TITLE)
+        self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
+
+        self._setup_central_widget()
+        self._setup_menu()
+        self._connect_signals()
+
+        self.statusBar().showMessage("Ready — open a disturbance record to begin.")
+
+    # ── Layout setup ──────────────────────────────────────────────────────────
+
+    def _setup_central_widget(self) -> None:
+        """Create the combined LabelPanel + ChannelCanvas scroll view.
+
+        Both widgets sit side-by-side inside a single QScrollArea so
+        vertical scrolling keeps them perfectly synchronised.
+        """
+        self._label_panel = LabelPanel()
+        self._canvas = ChannelCanvas()
+
+        # Horizontal container — no margins, no spacing
+        container = QWidget()
+        h_layout = QHBoxLayout(container)
+        h_layout.setContentsMargins(0, 0, 0, 0)
+        h_layout.setSpacing(0)
+        h_layout.addWidget(self._label_panel)
+        h_layout.addWidget(self._canvas, stretch=1)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(container)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.setCentralWidget(scroll_area)
+
+    def _setup_menu(self) -> None:
+        """Build the File menu with Open and Exit actions."""
+        menu_bar = self.menuBar()
+
+        file_menu = menu_bar.addMenu("&File")
+
+        open_action = QAction("&Open…", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.setStatusTip("Open a disturbance record file")
+        open_action.triggered.connect(self._open_file_dialog)
+        file_menu.addAction(open_action)
+
+        file_menu.addSeparator()
+
+        exit_action = QAction("E&xit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.setStatusTip("Exit PowerWave Analyst")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+    def _connect_signals(self) -> None:
+        """Wire app_state signals to panel/canvas slots."""
+        app_state.record_loaded.connect(self._label_panel.load_record)
+        app_state.record_loaded.connect(self._canvas.load_record)
+        app_state.record_loaded.connect(self._on_record_loaded_status)
+        app_state.channel_toggled.connect(self._canvas.update_channel_visibility)
+
+    # ── File open flow ─────────────────────────────────────────────────────────
+
+    def _open_file_dialog(self) -> None:
+        """Show the file-open dialog and dispatch parsing to a background thread."""
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Disturbance Record",
+            "",
+            FILE_FILTER,
+        )
+        if not path_str:
+            return
+
+        path = Path(path_str)
+        self.statusBar().showMessage(f"Loading {path.name}…")
+        self._dispatch_load(path)
+
+    def _dispatch_load(self, path: Path) -> None:
+        """Select the correct parser and run it off the UI thread.
+
+        Args:
+            path: Path to the file selected by the user.
+        """
+        ext = path.suffix.lower()
+
+        if ext in _COMTRADE_EXT:
+            fn = self._load_comtrade
+        elif ext in _CSV_EXT:
+            fn = self._load_csv
+        elif ext in _EXCEL_EXT:
+            fn = self._load_excel
+        else:
+            self._show_error(
+                "Unsupported file type",
+                f"Cannot open '{path.name}'.\n"
+                "Supported formats: COMTRADE (.cfg), CSV (.csv), "
+                "Excel (.xlsx / .xls).",
+            )
+            return
+
+        run_in_thread(
+            fn,
+            path,
+            on_done=self._on_parse_done,
+            on_error=self._on_parse_error,
+        )
+
+    # ── Parser shims (run off the UI thread) ──────────────────────────────────
+
+    def _load_comtrade(self, path: Path) -> DisturbanceRecord:
+        """Load a COMTRADE .cfg / .dat file pair.
+
+        Args:
+            path: Path to the .cfg (or .dat) file.
+
+        Returns:
+            Parsed DisturbanceRecord.
+        """
+        return ComtradeParser().load(path)
+
+    def _load_csv(self, path: Path) -> DisturbanceRecord:
+        """Load a CSV file, routing PMU CSV files to PmuCsvParser.
+
+        PMU CSV files (first line starts with "ID: NNN, Station Name: ...")
+        are handled by PmuCsvParser.  All other CSV files go through
+        CsvParser with auto-detection.
+
+        Args:
+            path: Path to the CSV file.
+
+        Returns:
+            Parsed DisturbanceRecord.
+
+        Raises:
+            RuntimeError: When the file requires manual channel mapping.
+        """
+        if is_pmu_csv(path):
+            return PmuCsvParser().load(path)
+
+        try:
+            return CsvParser().load(path)
+        except NeedsMappingDialog as exc:
+            n = len(exc.columns)
+            raise RuntimeError(
+                f"'{path.name}' requires manual channel mapping ({n} columns "
+                f"could not be auto-detected).\n\n"
+                "The Channel Mapping Dialog will be available in a future "
+                "milestone.  For now, please load a COMTRADE (.cfg) file."
+            ) from exc
+
+    def _load_excel(self, path: Path) -> DisturbanceRecord:
+        """Load an Excel file, auto-selecting the first sheet when multiple.
+
+        Args:
+            path: Path to the Excel workbook.
+
+        Returns:
+            Parsed DisturbanceRecord.
+
+        Raises:
+            RuntimeError: When the file requires manual channel mapping.
+        """
+        parser = ExcelParser()
+        try:
+            return parser.load(path)
+        except NeedsSheetSelection as exc:
+            first_sheet = exc.sheet_names[0]
+            self._auto_selected_sheet = first_sheet
+            try:
+                return parser.load(path, sheet_name=first_sheet)
+            except NeedsMappingDialog as exc2:
+                n = len(exc2.columns)
+                raise RuntimeError(
+                    f"'{path.name}' (sheet: '{first_sheet}') requires manual "
+                    f"channel mapping ({n} columns could not be auto-detected).\n\n"
+                    "The Channel Mapping Dialog will be available in a future "
+                    "milestone.  For now, please load a COMTRADE (.cfg) file."
+                ) from exc2
+        except NeedsMappingDialog as exc:
+            n = len(exc.columns)
+            raise RuntimeError(
+                f"'{path.name}' requires manual channel mapping ({n} columns "
+                f"could not be auto-detected).\n\n"
+                "The Channel Mapping Dialog will be available in a future "
+                "milestone.  For now, please load a COMTRADE (.cfg) file."
+            ) from exc
+
+    # ── Callbacks (run on UI thread via Qt signal dispatch) ───────────────────
+
+    def _on_parse_done(self, record: DisturbanceRecord) -> None:
+        """Emit app_state.record_loaded after a successful parse.
+
+        Args:
+            record: Successfully parsed DisturbanceRecord.
+        """
+        sheet_note = ""
+        if hasattr(self, '_auto_selected_sheet'):
+            sheet_note = f" [sheet: {self._auto_selected_sheet}]"
+            del self._auto_selected_sheet
+
+        app_state.record_loaded.emit(record)
+
+        if sheet_note:
+            current = self.statusBar().currentMessage()
+            self.statusBar().showMessage(current + sheet_note)
+
+    def _on_parse_error(self, error_msg: str) -> None:
+        """Show a QMessageBox for parse failures.
+
+        Args:
+            error_msg: Human-readable error string from the worker.
+        """
+        self.statusBar().showMessage("Load failed.")
+        self._show_error("Failed to load file", error_msg)
+
+    def _on_record_loaded_status(self, record: DisturbanceRecord) -> None:
+        """Update the status bar after a record is loaded.
+
+        Args:
+            record: The freshly loaded DisturbanceRecord.
+        """
+        n_a = record.n_analogue
+        n_d = record.n_digital
+        mode = record.display_mode
+        self.statusBar().showMessage(
+            f"{record.file_path.name}  —  "
+            f"{n_a} analogue / {n_d} digital  [{mode}  {record.sample_rate:.0f} Hz]"
+        )
+
+    # ── Utility ───────────────────────────────────────────────────────────────
+
+    def _show_error(self, title: str, message: str) -> None:
+        """Show a modal error dialog.
+
+        Args:
+            title:   Dialog window title.
+            message: Human-readable description of the error.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.exec()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """Launch the PowerWave Analyst application."""
+    app = QApplication(sys.argv)
+    app.setApplicationName(WINDOW_TITLE)
+    app.setOrganizationName("PowerWave")
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

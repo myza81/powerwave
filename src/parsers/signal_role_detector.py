@@ -34,7 +34,7 @@ from typing import Union
 
 import numpy as np
 
-from src.models.channel import (
+from models.channel import (
     AnalogueChannel,
     DigitalChannel,
     RoleConfidence,

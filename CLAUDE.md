@@ -2,10 +2,10 @@
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
-Phase: Phase 1
-Milestone: Milestone 1D — Basic Waveform Display
-Module: src/ui/main_window.py, src/ui/channel_canvas.py
-Status: IN PROGRESS
+Phase:     Phase 1
+Milestone: Milestone 1E — Decimation + Zoom Performance
+Module:    src/engine/decimator.py, src/ui/channel_canvas.py
+Status:    PENDING
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -402,19 +402,25 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 
 # Real files: BEN32 fast/slow, NARI multi-rate, variable-rate IED
 
-# ✓ 1C  — CSV + Excel parsers (auto-detect separator/time/units, exceptions) | 503 tests
-#          Real PMU files tested: graceful degradation confirmed, pmu_csv_parser handles properly later
+# ✓ 1C — CSV + Excel parsers (auto-detect separator/time/units, exceptions) | 503 tests
+
+# Real PMU files tested: graceful degradation confirmed, pmu_csv_parser handles properly later
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
 # DECISION: Generic CsvParser intentionally degrades gracefully on PMU CSV files
-#   (empty time_array, fallback 50Hz) rather than crashing. PMU files with
-#   metadata header rows are handled by pmu_csv_parser.py in Phase 6.
-#   Tests lock down this degradation behaviour as expected output.
 
-# DECISION: reason
+# (empty time_array, fallback 50Hz) rather than crashing. PMU files with
 
-# ISSUE: description and workaround
+# metadata header rows are handled by pmu_csv_parser.py in Phase 6.
+
+# Tests lock down this degradation behaviour as expected output.
+
+# DECISION: PyQt6 macOS — QOpenGLWidget is in PyQt6.QtOpenGLWidgets not
+
+# PyQt6.QtOpenGL. Use 'from PyQt6.QtOpenGLWidgets import QOpenGLWidget'
+
+# everywhere in the codebase. Never import from QtOpenGL directly.
 
 ## ── DEVELOPMENT ENVIRONMENT ────────────────────────────────────────────────
 

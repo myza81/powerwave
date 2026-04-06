@@ -18,7 +18,10 @@
       "Bash(.venv/bin/pytest tests/ -v --tb=short)",
       "Bash(.venv/bin/python -c ':*)",
       "Bash(.venv/bin/pytest tests/test_parsers/test_comtrade_integration.py -v)",
-      "Bash(.venv/bin/pytest tests/ -q)"
+      "Bash(.venv/bin/pytest tests/ -q)",
+      "Bash(.venv/bin/python -c \"import sys; sys.path.insert\\(0, 'src'\\); import main; print\\('Import OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import sys; sys.path.insert\\(0,'src'\\); from ui.channel_canvas import ChannelCanvas; print\\('OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import sys; sys.path.insert\\(0,'src'\\); import main; print\\('OK'\\)\")"
     ]
   }
 }

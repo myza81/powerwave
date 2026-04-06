@@ -28,9 +28,9 @@ from typing import Optional
 
 import pandas as pd
 
-from src.models.disturbance_record import DisturbanceRecord, SourceFormat
-from src.parsers.csv_parser import CsvParser
-from src.parsers.parser_exceptions import NeedsSheetSelection
+from models.disturbance_record import DisturbanceRecord, SourceFormat
+from parsers.csv_parser import CsvParser
+from parsers.parser_exceptions import NeedsSheetSelection
 
 # ── Module-level constants ────────────────────────────────────────────────────
 
