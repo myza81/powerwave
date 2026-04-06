@@ -2,10 +2,10 @@
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
-Phase:     Phase 1
-Milestone: Milestone 1E — Decimation + Zoom Performance
-Module:    src/engine/decimator.py, src/ui/channel_canvas.py
-Status:    PENDING
+Phase: Phase 1
+Milestone: Milestone 1E — Decimation & Zoom Performance
+Module: src/engine/decimator.py, src/ui/channel_canvas.py
+Status: IN PROGRESS
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -405,6 +405,10 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 # ✓ 1C — CSV + Excel parsers (auto-detect separator/time/units, exceptions) | 503 tests
 
 # Real PMU files tested: graceful degradation confirmed, pmu_csv_parser handles properly later
+
+# ✓ 1D — Basic waveform display: analogue+digital rendering, BEN32-style
+
+# label panel, bay grouping, shared row ordering, PMU CSV display | UI working
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
