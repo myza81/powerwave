@@ -2,10 +2,10 @@
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
-Phase:     Phase 1
-Milestone: Milestone 1F — Zoom, Pan & Navigation Controls
-Module:    src/ui/channel_canvas.py, src/ui/main_window.py
-Status:    IN PROGRESS
+Phase: Phase 2
+Milestone: Milestone 2A — Measurement Cursors
+Module: src/ui/channel_canvas.py, src/ui/measurement_panel.py
+Status: IN PROGRESS
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -410,8 +410,13 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 
 # label panel, bay grouping, shared row ordering, PMU CSV display | UI working
 
-# ✓ 1E  — Decimation & performance: vectorised minmax/uniform/digital,
-#          background thread prep, star-topology xlink. 40x speedup. | 90 tests
+# ✓ 1E — Decimation & performance: vectorised minmax/uniform/digital,
+
+# background thread prep, star-topology xlink. 40x speedup. | 90 tests
+
+# ✓ 1F — Zoom/pan/navigation: viewport decimation, debounced redraws,
+
+# toolbar controls, Ctrl+Wheel zoom, Y auto-scale | 28 tests
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 

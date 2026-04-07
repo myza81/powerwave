@@ -36,8 +36,14 @@ Decimation:
   channel_canvas.py reads ch._display_t / ch._display_d and calls
   setData() only — zero computation on the UI thread (LAW 2, LAW 3).
 
-Architecture: Presentation layer (ui/) — imports core/, models/, pyqtgraph.
-              Never import from engine/ or parsers/ (LAW 1).
+Viewport-aware re-decimation:
+  On zoom or pan, _update_viewport() re-decimates the visible time slice
+  at full resolution.  A 16ms QTimer debounce prevents re-decimation on
+  every pixel of a smooth drag (keeping pan at 60fps).  The mask uses
+  record._t_display (display units) — NOT record.time_array (raw seconds).
+
+Architecture: Presentation layer (ui/) — imports core/, models/, pyqtgraph,
+              and engine/ (service layer, permitted by LAW 1 upward-only rule).
 """
 
 from __future__ import annotations
@@ -46,9 +52,17 @@ from typing import Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import QMenu
 
+from engine.decimator import (
+    MAX_ANALOGUE_POINTS,
+    MAX_DIGITAL_POINTS,
+    decimate_digital,
+    decimate_minmax,
+    decimate_uniform,
+)
 from models.channel import AnalogueChannel, DigitalChannel
 from models.disturbance_record import DisturbanceRecord
 from utils.channel_ordering import (
@@ -92,6 +106,9 @@ TRIGGER_LABEL_POS: float    = 0.95
 
 AXIS_LABEL_COLOUR: str      = '#AAAAAA'
 
+FAULT_WINDOW_S: float       = 0.200   # ±200 ms around trigger for fault zoom
+VP_DEBOUNCE_MS: int         = 16      # 1 frame debounce for viewport updates
+
 
 class ChannelCanvas(pg.GraphicsLayoutWidget):
     """Stacked multi-channel waveform canvas (BEN32 style).
@@ -102,14 +119,16 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
     (or first plot of any kind if no analogue channels are present).
 
     All decimation is pre-computed on the background thread by
-    ``engine.decimator.prepare_display_data()``.  The UI thread only
-    calls ``pg.PlotDataItem.setData()`` — zero computation here.
+    ``engine.decimator.prepare_display_data()``.  On zoom or pan,
+    ``_update_viewport()`` re-decimates the visible window slice at full
+    resolution, debounced to one frame (16ms) for 60fps performance.
 
     Usage::
 
         canvas = ChannelCanvas()
         canvas.load_record(record)          # record already has _display_t/_display_d
         canvas.update_channel_visibility(3, False)
+        canvas.zoom_to_fault()              # snap to ±200ms window
     """
 
     def __init__(self, parent=None) -> None:
@@ -132,6 +151,14 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         self._curves: dict[int, pg.PlotDataItem | pg.ScatterPlotItem] = {}
         self._trigger_lines: list[pg.InfiniteLine]                     = []
         self._ref_plot: Optional[pg.PlotItem]                          = None   # X-link reference
+        self._record: Optional[DisturbanceRecord]                      = None   # current record
+
+        # Viewport debounce timer — fires _on_vp_timer 16ms after last range change
+        self._vp_timer: QTimer = QTimer(self)
+        self._vp_timer.setSingleShot(True)
+        self._vp_timer.setInterval(VP_DEBOUNCE_MS)
+        self._vp_timer.timeout.connect(self._on_vp_timer)
+        self._pending_range: Optional[tuple[float, float]] = None
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -147,6 +174,7 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
             record: The DisturbanceRecord to display (with _display_t/_display_d set).
         """
         self._clear_canvas()
+        self._record = record
 
         if not record.time_array.size:
             return
@@ -187,6 +215,13 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
                 )
 
         self._add_time_axis(t_display, time_axis_label)
+
+        # Connect X-range changes to viewport re-decimation (star topology ref)
+        if self._ref_plot is not None:
+            self._ref_plot.getViewBox().sigXRangeChanged.connect(
+                lambda vb, rng: self._schedule_viewport(rng)
+            )
+
         print(
             f'[ChannelCanvas] total_height={total_height}'
             f'  grid_rows={self.ci.layout.rowCount()}'
@@ -204,15 +239,160 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         if plot is not None:
             plot.setVisible(visible)
 
+    def zoom_to_fit(self) -> None:
+        """Reset X range to full record duration; Y axes auto-fit."""
+        if self._ref_plot is None or self._record is None:
+            return
+        t = self._record._t_display
+        self._ref_plot.setXRange(float(t[0]), float(t[-1]), padding=0.02)
+
+    def zoom_to_fault(self) -> None:
+        """Zoom to trigger ±200 ms (WAVEFORM) or ±0.2 s / ±0.003 min (TREND).
+
+        Trigger is at t=0 in all display units.  The half-window is
+        FAULT_WINDOW_S converted to the active display unit.
+        """
+        if self._ref_plot is None or self._record is None:
+            return
+        label: str = getattr(self._record, '_time_axis_label', 'Time (ms)')
+        if 'min' in label:
+            half = FAULT_WINDOW_S / 60.0
+        elif 'ms' in label:
+            half = FAULT_WINDOW_S * 1000.0
+        else:   # seconds
+            half = FAULT_WINDOW_S
+        self._ref_plot.setXRange(-half, half, padding=0)
+
+    def zoom_in(self) -> None:
+        """Reduce X range by 50% centred on current view centre."""
+        if self._ref_plot is None:
+            return
+        vb = self._ref_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        centre = (x_min + x_max) / 2.0
+        half = (x_max - x_min) / 4.0   # 50% width reduction → ¼ of current span
+        vb.setXRange(centre - half, centre + half, padding=0)
+
+    def zoom_out(self) -> None:
+        """Increase X range by 100% centred on current view centre."""
+        if self._ref_plot is None:
+            return
+        vb = self._ref_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        centre = (x_min + x_max) / 2.0
+        half = (x_max - x_min)          # 100% increase → current span becomes half
+        vb.setXRange(centre - half, centre + half, padding=0)
+
+    # ── Mouse overrides ────────────────────────────────────────────────────────
+
+    def wheelEvent(self, event) -> None:
+        """Ctrl+Wheel zooms the X axis; plain Wheel propagates to scroll area.
+
+        Without this override the QScrollArea and PyQtGraph ViewBox both
+        compete for wheel events.  The convention (standard in engineering
+        tools) is:
+          Ctrl + Wheel → canvas zoom (X axis)
+          plain Wheel  → vertical scroll (QScrollArea)
+        """
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+    def contextMenuEvent(self, event) -> None:
+        """Right-click shows a minimal context menu (Zoom to Fit).
+
+        Args:
+            event: The context menu QContextMenuEvent.
+        """
+        menu = QMenu(self)
+        fit_action = menu.addAction("Zoom to Fit")
+        fit_action.triggered.connect(self.zoom_to_fit)
+        menu.exec(event.globalPos())
+
     # ── Private — canvas lifecycle ─────────────────────────────────────────────
 
     def _clear_canvas(self) -> None:
         """Remove all plots and reset tracking state."""
+        self._vp_timer.stop()
+        self._pending_range = None
         self.clear()
         self._plots.clear()
         self._curves.clear()
         self._trigger_lines.clear()
         self._ref_plot = None
+        self._record = None
+
+    # ── Private — viewport re-decimation ──────────────────────────────────────
+
+    def _schedule_viewport(self, view_range: tuple[float, float]) -> None:
+        """Debounce viewport updates — store latest range, fire after 16ms idle.
+
+        Args:
+            view_range: (t_start, t_end) in display units from sigXRangeChanged.
+        """
+        self._pending_range = view_range
+        self._vp_timer.start()   # restarts countdown if already running
+
+    def _on_vp_timer(self) -> None:
+        """Fired by debounce timer — delegates to _update_viewport."""
+        if self._pending_range is not None:
+            self._update_viewport(self._pending_range)
+
+    def _update_viewport(self, view_range: tuple[float, float]) -> None:
+        """Re-decimate all channels for the current viewport.
+
+        Masks the full display-unit time array to the visible window, then
+        re-decimates.  With narrow zoom windows the slice may be < max_points,
+        so setData receives the full raw resolution — no decimation loss.
+
+        Uses ``record._t_display`` (trigger-centred display units) for masking,
+        NOT ``record.time_array`` (raw seconds), because view_range comes from
+        sigXRangeChanged which reports in display units.
+
+        Args:
+            view_range: (t_start, t_end) in display units (ms / s / min).
+        """
+        record = self._record
+        if record is None:
+            return
+
+        t_start, t_end = view_range
+        t_disp: np.ndarray = record._t_display   # type: ignore[attr-defined]
+        is_trend = record.display_mode == 'TREND'
+
+        for ch in record.analogue_channels:
+            curve = self._curves.get(ch.channel_id)
+            if curve is None or not ch.visible:
+                continue
+            n = min(len(t_disp), len(ch.raw_data))
+            t_full = t_disp[:n]
+            d_full = ch.raw_data[:n]
+            mask = (t_full >= t_start) & (t_full <= t_end)
+            t_vis = t_full[mask]
+            d_vis = d_full[mask]
+            if len(t_vis) == 0:
+                continue
+            if is_trend:
+                t_dec, d_dec = decimate_uniform(t_vis, d_vis, MAX_ANALOGUE_POINTS)
+            else:
+                t_dec, d_dec = decimate_minmax(t_vis, d_vis, MAX_ANALOGUE_POINTS)
+            curve.setData(t_dec, d_dec)
+
+        for ch in record.digital_channels:
+            curve = self._curves.get(ch.channel_id)
+            if curve is None or not ch.visible:
+                continue
+            n = min(len(t_disp), len(ch.data))
+            t_full = t_disp[:n]
+            d_full = ch.data[:n]
+            mask = (t_full >= t_start) & (t_full <= t_end)
+            t_vis = t_full[mask]
+            d_vis = d_full[mask]
+            if len(t_vis) == 0:
+                continue
+            t_dec, d_dec = decimate_digital(t_vis, d_vis, MAX_DIGITAL_POINTS)
+            curve.setData(t_dec, d_dec)
 
     # ── Private — row builders ─────────────────────────────────────────────────
 
@@ -260,6 +440,7 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         # First analogue plot becomes the X-link reference (star topology)
         if self._ref_plot is None:
             self._ref_plot = plot
+            self._ref_plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         else:
             plot.setXLink(self._ref_plot)
 
@@ -297,6 +478,7 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
 
         if self._ref_plot is None:
             self._ref_plot = plot
+            self._ref_plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         else:
             plot.setXLink(self._ref_plot)
 
@@ -442,6 +624,9 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         plot.showGrid(x=True, y=True, alpha=GRID_ALPHA)
         plot.getViewBox().setBorder(None)
         plot.getViewBox().setBackgroundColor(BACKGROUND_COLOUR)
+        plot.enableAutoRange(axis='y', enable=True)
+        plot.setMenuEnabled(False)
+        plot.getViewBox().setMenuEnabled(False)
 
     def _configure_digital_plot(self, plot: pg.PlotItem) -> None:
         """Apply settings for a compact digital-channel plot.
@@ -455,6 +640,8 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         plot.setYRange(DIG_Y_MIN, DIG_Y_MAX, padding=0)
         plot.getViewBox().setBackgroundColor(BACKGROUND_COLOUR)
         plot.getViewBox().setBorder(None)
+        plot.setMenuEnabled(False)
+        plot.getViewBox().setMenuEnabled(False)
 
     def _add_trigger_line(
         self,

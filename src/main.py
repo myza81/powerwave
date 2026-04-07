@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QScrollArea,
+    QToolBar,
     QWidget,
 )
 from PyQt6.QtGui import QAction
@@ -89,6 +90,7 @@ class MainWindow(QMainWindow):
 
         self._setup_central_widget()
         self._setup_menu()
+        self._setup_toolbar()
         self._connect_signals()
 
         self.statusBar().showMessage("Ready — open a disturbance record to begin.")
@@ -142,6 +144,44 @@ class MainWindow(QMainWindow):
         exit_action.setStatusTip("Exit PowerWave Analyst")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+    def _setup_toolbar(self) -> None:
+        """Add navigation toolbar with zoom buttons.
+
+        Keyboard shortcuts:
+          Ctrl+0  — Zoom to Fit (full record)
+          Ctrl+F  — Zoom to Fault (trigger ±200 ms)
+          +       — Zoom In 50%
+          -       — Zoom Out 100%
+        """
+        toolbar: QToolBar = self.addToolBar("Navigation")
+        toolbar.setMovable(False)
+
+        fit_action = QAction("Fit", self)
+        fit_action.setShortcut("Ctrl+0")
+        fit_action.setStatusTip("Zoom to fit full record (Ctrl+0)")
+        fit_action.triggered.connect(self._canvas.zoom_to_fit)
+        toolbar.addAction(fit_action)
+
+        fault_action = QAction("Fault ±200ms", self)
+        fault_action.setShortcut("Ctrl+F")
+        fault_action.setStatusTip("Zoom to trigger ±200 ms (Ctrl+F)")
+        fault_action.triggered.connect(self._canvas.zoom_to_fault)
+        toolbar.addAction(fault_action)
+
+        toolbar.addSeparator()
+
+        zoomin_action = QAction("Zoom In", self)
+        zoomin_action.setShortcut("+")
+        zoomin_action.setStatusTip("Zoom in 50% (+)")
+        zoomin_action.triggered.connect(self._canvas.zoom_in)
+        toolbar.addAction(zoomin_action)
+
+        zoomout_action = QAction("Zoom Out", self)
+        zoomout_action.setShortcut("-")
+        zoomout_action.setStatusTip("Zoom out 100% (-)")
+        zoomout_action.triggered.connect(self._canvas.zoom_out)
+        toolbar.addAction(zoomout_action)
 
     def _connect_signals(self) -> None:
         """Wire app_state signals to panel/canvas slots."""
