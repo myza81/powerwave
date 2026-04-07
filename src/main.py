@@ -50,6 +50,7 @@ from parsers.csv_parser import CsvParser
 from parsers.excel_parser import ExcelParser
 from parsers.parser_exceptions import NeedsMappingDialog, NeedsSheetSelection
 from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
+from engine.decimator import prepare_display_data
 from ui.channel_canvas import ChannelCanvas
 from ui.waveform_panel import LabelPanel
 
@@ -205,9 +206,9 @@ class MainWindow(QMainWindow):
             path: Path to the .cfg (or .dat) file.
 
         Returns:
-            Parsed DisturbanceRecord.
+            Parsed DisturbanceRecord with display arrays pre-computed.
         """
-        return ComtradeParser().load(path)
+        return prepare_display_data(ComtradeParser().load(path))
 
     def _load_csv(self, path: Path) -> DisturbanceRecord:
         """Load a CSV file, routing PMU CSV files to PmuCsvParser.
@@ -226,10 +227,10 @@ class MainWindow(QMainWindow):
             RuntimeError: When the file requires manual channel mapping.
         """
         if is_pmu_csv(path):
-            return PmuCsvParser().load(path)
+            return prepare_display_data(PmuCsvParser().load(path))
 
         try:
-            return CsvParser().load(path)
+            return prepare_display_data(CsvParser().load(path))
         except NeedsMappingDialog as exc:
             n = len(exc.columns)
             raise RuntimeError(
@@ -253,12 +254,12 @@ class MainWindow(QMainWindow):
         """
         parser = ExcelParser()
         try:
-            return parser.load(path)
+            return prepare_display_data(parser.load(path))
         except NeedsSheetSelection as exc:
             first_sheet = exc.sheet_names[0]
             self._auto_selected_sheet = first_sheet
             try:
-                return parser.load(path, sheet_name=first_sheet)
+                return prepare_display_data(parser.load(path, sheet_name=first_sheet))
             except NeedsMappingDialog as exc2:
                 n = len(exc2.columns)
                 raise RuntimeError(

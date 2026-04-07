@@ -2,10 +2,10 @@
 
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
-Phase: Phase 1
-Milestone: Milestone 1E — Decimation & Zoom Performance
-Module: src/engine/decimator.py, src/ui/channel_canvas.py
-Status: IN PROGRESS
+Phase:     Phase 1
+Milestone: Milestone 1F — Zoom, Pan & Navigation Controls
+Module:    src/ui/channel_canvas.py, src/ui/main_window.py
+Status:    IN PROGRESS
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -409,6 +409,9 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 # ✓ 1D — Basic waveform display: analogue+digital rendering, BEN32-style
 
 # label panel, bay grouping, shared row ordering, PMU CSV display | UI working
+
+# ✓ 1E  — Decimation & performance: vectorised minmax/uniform/digital,
+#          background thread prep, star-topology xlink. 40x speedup. | 90 tests
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
