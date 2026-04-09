@@ -147,8 +147,10 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         self.ci.layout.setSpacing(0)
         self.ci.layout.setContentsMargins(0, 0, 0, 0)
 
-        self._plots: dict[int, pg.PlotItem]                            = {}
-        self._curves: dict[int, pg.PlotDataItem | pg.ScatterPlotItem] = {}
+        self._analogue_plots:  dict[int, pg.PlotItem]                           = {}
+        self._digital_plots:   dict[int, pg.PlotItem]                           = {}
+        self._analogue_curves: dict[int, pg.PlotDataItem | pg.ScatterPlotItem] = {}
+        self._digital_curves:  dict[int, pg.PlotDataItem]                      = {}
         self._trigger_lines: list[pg.InfiniteLine]                     = []
         self._ref_plot: Optional[pg.PlotItem]                          = None   # X-link reference
         self._record: Optional[DisturbanceRecord]                      = None   # current record
@@ -225,17 +227,20 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         print(
             f'[ChannelCanvas] total_height={total_height}'
             f'  grid_rows={self.ci.layout.rowCount()}'
-            f'  channel_plots={len(self._plots)}'
+            f'  channel_plots={len(self._analogue_plots) + len(self._digital_plots)}'
         )
 
     def update_channel_visibility(self, channel_id: int, visible: bool) -> None:
         """Show or hide the PlotItem for ``channel_id``.
 
+        Searches both analogue and digital plot dicts — their channel_ids
+        are independent namespaces and must not share a single dict.
+
         Args:
             channel_id: The channel to update.
             visible:    True = show, False = hide.
         """
-        plot = self._plots.get(channel_id)
+        plot = self._analogue_plots.get(channel_id) or self._digital_plots.get(channel_id)
         if plot is not None:
             plot.setVisible(visible)
 
@@ -317,8 +322,10 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         self._vp_timer.stop()
         self._pending_range = None
         self.clear()
-        self._plots.clear()
-        self._curves.clear()
+        self._analogue_plots.clear()
+        self._digital_plots.clear()
+        self._analogue_curves.clear()
+        self._digital_curves.clear()
         self._trigger_lines.clear()
         self._ref_plot = None
         self._record = None
@@ -342,13 +349,13 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
     def _update_viewport(self, view_range: tuple[float, float]) -> None:
         """Re-decimate all channels for the current viewport.
 
-        Masks the full display-unit time array to the visible window, then
-        re-decimates.  With narrow zoom windows the slice may be < max_points,
-        so setData receives the full raw resolution — no decimation loss.
+        Converts view_range (display units) → raw seconds, masks
+        ``record.time_array`` directly, reads ``ch.raw_data`` / ``ch.data``
+        at those indices, converts the masked time back to display units,
+        then decimates and calls setData().
 
-        Uses ``record._t_display`` (trigger-centred display units) for masking,
-        NOT ``record.time_array`` (raw seconds), because view_range comes from
-        sigXRangeChanged which reports in display units.
+        This guarantees every zoom/pan call decimates from the original raw
+        arrays regardless of zoom history — never from pre-decimated data.
 
         Args:
             view_range: (t_start, t_end) in display units (ms / s / min).
@@ -358,21 +365,39 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
             return
 
         t_start, t_end = view_range
-        t_disp: np.ndarray = record._t_display   # type: ignore[attr-defined]
+        t_raw: np.ndarray = record.time_array
         is_trend = record.display_mode == 'TREND'
 
+        # ── Convert display-unit range → raw seconds ───────────────────────────
+        trigger_offset_s: float = (
+            record.trigger_time - record.start_time
+        ).total_seconds()
+        label: str = getattr(record, '_time_axis_label', 'Time (ms)')
+        if 'ms' in label:
+            scale = 1_000.0          # raw s → ms
+        elif 'min' in label:
+            scale = 1.0 / 60.0      # raw s → min
+        else:
+            scale = 1.0             # raw s → s
+
+        t_start_raw = t_start / scale + trigger_offset_s
+        t_end_raw   = t_end   / scale + trigger_offset_s
+
+        # Full-array boolean mask (raw seconds, same indices for all channels)
+        mask: np.ndarray = (t_raw >= t_start_raw) & (t_raw <= t_end_raw)
+
         for ch in record.analogue_channels:
-            curve = self._curves.get(ch.channel_id)
+            curve = self._analogue_curves.get(ch.channel_id)
             if curve is None or not ch.visible:
                 continue
-            n = min(len(t_disp), len(ch.raw_data))
-            t_full = t_disp[:n]
-            d_full = ch.raw_data[:n]
-            mask = (t_full >= t_start) & (t_full <= t_end)
-            t_vis = t_full[mask]
-            d_vis = d_full[mask]
-            if len(t_vis) == 0:
+            n = min(len(t_raw), len(ch.raw_data))
+            mask_n = mask[:n]
+            t_vis_raw = t_raw[:n][mask_n]         # raw seconds
+            d_vis     = ch.raw_data[:n][mask_n]   # raw data — always from source
+            if len(t_vis_raw) == 0:
                 continue
+            # Convert time to display units for setData (axes calibrated in display units)
+            t_vis = (t_vis_raw - trigger_offset_s) * scale
             if is_trend:
                 t_dec, d_dec = decimate_uniform(t_vis, d_vis, MAX_ANALOGUE_POINTS)
             else:
@@ -380,17 +405,16 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
             curve.setData(t_dec, d_dec)
 
         for ch in record.digital_channels:
-            curve = self._curves.get(ch.channel_id)
+            curve = self._digital_curves.get(ch.channel_id)
             if curve is None or not ch.visible:
                 continue
-            n = min(len(t_disp), len(ch.data))
-            t_full = t_disp[:n]
-            d_full = ch.data[:n]
-            mask = (t_full >= t_start) & (t_full <= t_end)
-            t_vis = t_full[mask]
-            d_vis = d_full[mask]
-            if len(t_vis) == 0:
+            n = min(len(t_raw), len(ch.data))
+            mask_n = mask[:n]
+            t_vis_raw = t_raw[:n][mask_n]         # raw seconds
+            d_vis     = ch.data[:n][mask_n]       # raw data — always from source
+            if len(t_vis_raw) == 0:
                 continue
+            t_vis = (t_vis_raw - trigger_offset_s) * scale
             t_dec, d_dec = decimate_digital(t_vis, d_vis, MAX_DIGITAL_POINTS)
             curve.setData(t_dec, d_dec)
 
@@ -451,8 +475,8 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         plot.addItem(curve)
         self._add_trigger_line(plot, trigger_pos=0.0)
 
-        self._plots[ch.channel_id]  = plot
-        self._curves[ch.channel_id] = curve
+        self._analogue_plots[ch.channel_id]  = plot
+        self._analogue_curves[ch.channel_id] = curve
         return grid_row + 1
 
     def _add_digital_plot(
@@ -490,8 +514,8 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         plot.addItem(filled)
         self._add_trigger_line(plot, trigger_pos=0.0, show_label=False)
 
-        self._plots[ch.channel_id]  = plot
-        self._curves[ch.channel_id] = filled
+        self._digital_plots[ch.channel_id]  = plot
+        self._digital_curves[ch.channel_id] = filled
         return grid_row + 1
 
     # ── Private — curve factories ──────────────────────────────────────────────

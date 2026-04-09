@@ -30,10 +30,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.models.channel import AnalogueChannel, RoleConfidence, SignalRole
-from src.models.disturbance_record import DisturbanceRecord, SourceFormat
-from src.parsers.csv_parser import CsvParser
-from src.parsers.parser_exceptions import NeedsMappingDialog
+from models.channel import AnalogueChannel, RoleConfidence, SignalRole
+from models.disturbance_record import DisturbanceRecord, SourceFormat
+from parsers.csv_parser import CsvParser
+from parsers.parser_exceptions import NeedsMappingDialog
 
 # ── Path helper ───────────────────────────────────────────────────────────────
 

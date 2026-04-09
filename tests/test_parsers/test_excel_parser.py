@@ -26,10 +26,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.models.channel import SignalRole
-from src.models.disturbance_record import DisturbanceRecord, SourceFormat
-from src.parsers.excel_parser import ExcelParser
-from src.parsers.parser_exceptions import NeedsMappingDialog, NeedsSheetSelection
+from models.channel import SignalRole
+from models.disturbance_record import DisturbanceRecord, SourceFormat
+from parsers.excel_parser import ExcelParser
+from parsers.parser_exceptions import NeedsMappingDialog, NeedsSheetSelection
 
 
 # ── Fixture helpers ───────────────────────────────────────────────────────────

@@ -18,7 +18,7 @@ import time
 import numpy as np
 import pytest
 
-from src.engine.decimator import (
+from engine.decimator import (
     MAX_ANALOGUE_POINTS,
     MAX_DIGITAL_POINTS,
     decimate_digital,
@@ -215,8 +215,8 @@ class TestPrepareDisplayData:
 
         import numpy as np
 
-        from src.models.channel import AnalogueChannel, DigitalChannel
-        from src.models.disturbance_record import DisturbanceRecord
+        from models.channel import AnalogueChannel, DigitalChannel
+        from models.disturbance_record import DisturbanceRecord
 
         t = np.linspace(0.0, n_samples / sample_rate, n_samples, dtype=np.float64)
         start = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -311,7 +311,7 @@ class TestPrepareDisplayData:
 
     def test_empty_record_does_not_crash(self) -> None:
         from datetime import datetime, timezone
-        from src.models.disturbance_record import DisturbanceRecord
+        from models.disturbance_record import DisturbanceRecord
         record = DisturbanceRecord(
             station_name='EMPTY',
             device_id='0',

@@ -50,23 +50,23 @@ class TestAppState:
     """app_state singleton must expose all required signals."""
 
     def test_app_state_singleton_exists(self) -> None:
-        from src.core.app_state import app_state
+        from core.app_state import app_state
         assert app_state is not None
 
     def test_record_loaded_signal_exists(self) -> None:
-        from src.core.app_state import app_state
+        from core.app_state import app_state
         assert hasattr(app_state, "record_loaded")
 
     def test_cursor_moved_signal_exists(self) -> None:
-        from src.core.app_state import app_state
+        from core.app_state import app_state
         assert hasattr(app_state, "cursor_moved")
 
     def test_channel_toggled_signal_exists(self) -> None:
-        from src.core.app_state import app_state
+        from core.app_state import app_state
         assert hasattr(app_state, "channel_toggled")
 
     def test_view_mode_changed_signal_exists(self) -> None:
-        from src.core.app_state import app_state
+        from core.app_state import app_state
         assert hasattr(app_state, "view_mode_changed")
 
 
@@ -76,15 +76,15 @@ class TestWorkerSignals:
     """WorkerSignals must have finished, error, and progress."""
 
     def test_finished_attribute(self) -> None:
-        from src.core.thread_manager import WorkerSignals
+        from core.thread_manager import WorkerSignals
         assert hasattr(WorkerSignals, "finished")
 
     def test_error_attribute(self) -> None:
-        from src.core.thread_manager import WorkerSignals
+        from core.thread_manager import WorkerSignals
         assert hasattr(WorkerSignals, "error")
 
     def test_progress_attribute(self) -> None:
-        from src.core.thread_manager import WorkerSignals
+        from core.thread_manager import WorkerSignals
         assert hasattr(WorkerSignals, "progress")
 
 
@@ -94,21 +94,21 @@ class TestWorker:
     """Worker must accept a callable and expose a signals attribute."""
 
     def test_worker_has_run_method(self) -> None:
-        from src.core.thread_manager import Worker
+        from core.thread_manager import Worker
         assert callable(getattr(Worker, "run", None))
 
     def test_worker_constructor_accepts_callable(self) -> None:
-        from src.core.thread_manager import Worker
+        from core.thread_manager import Worker
         # Constructing Worker should not raise (no QApplication needed for
         # QRunnable — it is not a QObject)
         w = Worker(lambda: 42)
         assert w.fn() == 42
 
     def test_worker_signals_attribute(self) -> None:
-        from src.core.thread_manager import Worker
+        from core.thread_manager import Worker
         w = Worker(lambda: None)
         assert hasattr(w, "signals")
-        from src.core.thread_manager import WorkerSignals
+        from core.thread_manager import WorkerSignals
         assert isinstance(w.signals, WorkerSignals)
 
 
@@ -118,7 +118,7 @@ class TestRunInThread:
     """run_in_thread must be a callable exported from thread_manager."""
 
     def test_run_in_thread_is_callable(self) -> None:
-        from src.core.thread_manager import run_in_thread
+        from core.thread_manager import run_in_thread
         assert callable(run_in_thread)
 
 
@@ -128,11 +128,11 @@ class TestChannelCanvasInterface:
     """ChannelCanvas class must expose the required public methods."""
 
     def test_load_record_method_exists(self) -> None:
-        from src.ui.channel_canvas import ChannelCanvas
+        from ui.channel_canvas import ChannelCanvas
         assert callable(getattr(ChannelCanvas, "load_record", None))
 
     def test_update_channel_visibility_method_exists(self) -> None:
-        from src.ui.channel_canvas import ChannelCanvas
+        from ui.channel_canvas import ChannelCanvas
         assert callable(
             getattr(ChannelCanvas, "update_channel_visibility", None)
         )
@@ -144,7 +144,7 @@ class TestWaveformPanelInterface:
     """LabelPanel (renamed from WaveformPanel) must expose the load_record method."""
 
     def test_load_record_method_exists(self) -> None:
-        from src.ui.waveform_panel import LabelPanel
+        from ui.waveform_panel import LabelPanel
         assert callable(getattr(LabelPanel, "load_record", None))
 
 
@@ -154,9 +154,9 @@ class TestMainWindowInterface:
     """MainWindow and the main() entry point must be present."""
 
     def test_main_window_class_exists(self) -> None:
-        from src.main import MainWindow
+        from main import MainWindow
         assert MainWindow is not None
 
     def test_main_function_exists(self) -> None:
-        from src.main import main
+        from main import main
         assert callable(main)

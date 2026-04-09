@@ -4,7 +4,7 @@
 
 Phase: Phase 2
 Milestone: Milestone 2A — Measurement Cursors
-Module: src/ui/channel_canvas.py, src/ui/measurement_panel.py
+Module: src/ui/measurement_panel.py, src/ui/channel_canvas.py
 Status: IN PROGRESS
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
@@ -417,6 +417,12 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 # ✓ 1F — Zoom/pan/navigation: viewport decimation, debounced redraws,
 
 # toolbar controls, Ctrl+Wheel zoom, Y auto-scale | 28 tests
+
+# ✓ 1F — Zoom/pan/navigation: viewport decimation, debounced redraws,
+
+# toolbar controls, Ctrl+Wheel zoom, Y auto-scale. Bug fixed:
+
+# always decimate from raw_data not display cache. | tests passing
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 

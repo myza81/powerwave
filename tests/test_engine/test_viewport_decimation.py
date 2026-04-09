@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.engine.decimator import decimate_minmax
+from engine.decimator import decimate_minmax
 
 
 # ── Test 1 — Viewport slice correctness ───────────────────────────────────────

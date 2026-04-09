@@ -21,13 +21,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.models.channel import (
+from models.channel import (
     AnalogueChannel,
     DigitalChannel,
     RoleConfidence,
     SignalRole,
 )
-from src.parsers.signal_role_detector import (
+from parsers.signal_role_detector import (
     detect_analogue_role,
     detect_complementary_cb_pairs,
     detect_digital_role,

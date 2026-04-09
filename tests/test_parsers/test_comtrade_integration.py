@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.parsers.comtrade_parser import ComtradeParser
+from parsers.comtrade_parser import ComtradeParser
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 

@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.models.channel import (
+from models.channel import (
     AnalogueChannel,
     COLOUR_MAP,
     DigitalChannel,
@@ -352,7 +352,7 @@ class TestComplementaryPair:
 # DisturbanceRecord tests
 # ═════════════════════════════════════════════════════════════════════════════
 
-from src.models.disturbance_record import (
+from models.disturbance_record import (
     DisturbanceRecord,
     SourceFormat,
     WAVEFORM_THRESHOLD,
