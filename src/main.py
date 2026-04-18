@@ -32,6 +32,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication,
+    QDockWidget,
     QFileDialog,
     QHBoxLayout,
     QMainWindow,
@@ -53,6 +54,7 @@ from parsers.parser_exceptions import NeedsMappingDialog, NeedsSheetSelection
 from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
 from engine.decimator import prepare_display_data
 from ui.channel_canvas import ChannelCanvas
+from ui.measurement_panel import MeasurementPanel
 from ui.waveform_panel import LabelPanel
 
 # ── Module constants ──────────────────────────────────────────────────────────
@@ -60,6 +62,7 @@ from ui.waveform_panel import LabelPanel
 WINDOW_TITLE: str   = "PowerWave Analyst"
 MIN_WIDTH:    int   = 1280
 MIN_HEIGHT:   int   = 800
+MEASURE_DOCK_MIN_WIDTH: int = 240
 
 FILE_FILTER: str = (
     "Disturbance Records (*.cfg *.CFG *.csv *.CSV *.xlsx *.xls);;"
@@ -88,9 +91,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
 
+        self._record: DisturbanceRecord | None = None
+
         self._setup_central_widget()
         self._setup_menu()
         self._setup_toolbar()
+        self._setup_measurement_dock()
         self._connect_signals()
 
         self.statusBar().showMessage("Ready — open a disturbance record to begin.")
@@ -183,12 +189,73 @@ class MainWindow(QMainWindow):
         zoomout_action.triggered.connect(self._canvas.zoom_out)
         toolbar.addAction(zoomout_action)
 
+        toolbar.addSeparator()
+
+        autofit_action = QAction("Auto-fit All", self)
+        autofit_action.setStatusTip("Fit all analogue Y-axes to visible data")
+        autofit_action.triggered.connect(self._canvas.autofit_all_channels)
+        toolbar.addAction(autofit_action)
+
+    def _setup_measurement_dock(self) -> None:
+        """Create the right-side measurement dock widget."""
+        self._measurement_panel = MeasurementPanel()
+
+        dock = QDockWidget("Measurements", self)
+        dock.setWidget(self._measurement_panel)
+        dock.setMinimumWidth(MEASURE_DOCK_MIN_WIDTH)
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
     def _connect_signals(self) -> None:
         """Wire app_state signals to panel/canvas slots."""
         app_state.record_loaded.connect(self._label_panel.load_record)
         app_state.record_loaded.connect(self._canvas.load_record)
         app_state.record_loaded.connect(self._on_record_loaded_status)
+        app_state.record_loaded.connect(self._on_record_stored)
         app_state.channel_toggled.connect(self._canvas.update_channel_visibility)
+        app_state.cursor_moved.connect(self._on_cursor_moved)
+        self._label_panel.y_scale_requested.connect(self._canvas.scale_y_channel)
+        self._label_panel.y_reset_requested.connect(self._canvas.reset_y_channel)
+        self._label_panel.y_autofit_requested.connect(self._canvas.autofit_y_channel)
+
+    # ── Cursor / record slots ──────────────────────────────────────────────────
+
+    def _on_record_stored(self, record: DisturbanceRecord) -> None:
+        """Store the current record and populate the measurement panel at load time.
+
+        Called after canvas.load_record (signal connection order), so cursor
+        initial positions are already set and get_cursor_time() is valid.
+
+        Args:
+            record: The freshly loaded DisturbanceRecord.
+        """
+        self._record = record
+        t_a = self._canvas.get_cursor_time(0)
+        t_b = self._canvas.get_cursor_time(1)
+        self._measurement_panel.refresh(record, t_a, t_b)
+        self._label_panel.update_values(record, t_a)
+
+    def _on_cursor_moved(self, cursor_id: int, time_display: float) -> None:
+        """Update measurement panel and label panel when a cursor moves.
+
+        Args:
+            cursor_id:    0 = cursor A, 1 = cursor B.
+            time_display: New cursor position in display units.
+        """
+        if self._record is None:
+            return
+        if cursor_id == 0:
+            t_a = time_display
+            t_b = self._canvas.get_cursor_time(1)
+        else:
+            t_a = self._canvas.get_cursor_time(0)
+            t_b = time_display
+        self._measurement_panel.refresh(self._record, t_a, t_b)
+        if cursor_id == 0:
+            self._label_panel.update_values(self._record, time_display)
 
     # ── File open flow ─────────────────────────────────────────────────────────
 

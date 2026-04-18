@@ -52,10 +52,11 @@ from typing import Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QMenu
+from PyQt6.QtCore import Qt, QRectF, QTimer
+from PyQt6.QtGui import QColor, QPainterPath, QPen
+from PyQt6.QtWidgets import QGraphicsLineItem, QGraphicsSimpleTextItem, QMenu
 
+from core.app_state import app_state
 from engine.decimator import (
     MAX_ANALOGUE_POINTS,
     MAX_DIGITAL_POINTS,
@@ -104,10 +105,89 @@ TRIGGER_COLOUR: str         = '#FF4444'
 TRIGGER_LINE_WIDTH: int     = 2
 TRIGGER_LABEL_POS: float    = 0.95
 
+CURSOR_A_COLOUR: str        = '#FFFF00'
+CURSOR_B_COLOUR: str        = '#FF8800'
+CURSOR_PEN_WIDTH: float     = 1.5
+CURSOR_LABEL_POS: float     = 0.05   # near top of each plot
+CURSOR_A_INIT: float        = 0.0    # display units — trigger position
+CURSOR_B_INIT_MS: float     = 100.0  # ms offset for WAVEFORM/ms records
+
 AXIS_LABEL_COLOUR: str      = '#AAAAAA'
 
 FAULT_WINDOW_S: float       = 0.200   # ±200 ms around trigger for fault zoom
 VP_DEBOUNCE_MS: int         = 16      # 1 frame debounce for viewport updates
+_Y_AUTOFIT_PADDING: float   = 0.075  # 7.5 % padding above/below data range
+
+
+class _SceneCursorLine(QGraphicsLineItem):
+    """Full-canvas-height cursor line drawn directly on the QGraphicsScene.
+
+    Replaces one ``pg.InfiniteLine`` per plot (392 objects for JMHE) with
+    two objects total — one per cursor — regardless of channel count.
+
+    The line spans from ``scene.sceneRect().top()`` to ``bottom()`` and is
+    kept at the correct scene-x coordinate by ``ChannelCanvas._update_scene_cursors()``.
+    It is draggable from any scroll position: mouse events are mapped from
+    scene coordinates back to ViewBox data coordinates via ``mapSceneToView``.
+
+    Args:
+        cursor_id: 0 = cursor A, 1 = cursor B.
+        canvas:    Owning ChannelCanvas (for coordinate transforms and callbacks).
+        pen:       Pen used to draw the line.
+        label:     Text shown near the top of the line ('A' or 'B').
+    """
+
+    _HIT_HALF_WIDTH: int = 5   # px hit area either side of the drawn line
+
+    def __init__(
+        self,
+        cursor_id: int,
+        canvas: 'ChannelCanvas',
+        pen: QPen,
+        label: str,
+    ) -> None:
+        super().__init__()
+        self._cursor_id = cursor_id
+        self._canvas    = canvas
+        self._dragging  = False
+        self.setPen(pen)
+        self.setZValue(100)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+
+        self._label = QGraphicsSimpleTextItem(label, parent=self)
+        self._label.setBrush(pen.color())
+        self._label.setZValue(101)
+
+    def setLine(self, x1: float, y1: float, x2: float, y2: float) -> None:  # type: ignore[override]
+        """Override to keep the 'A'/'B' label pinned near the top of the line."""
+        super().setLine(x1, y1, x2, y2)
+        self._label.setPos(x1 + 2.0, y1 + 4.0)
+
+    def shape(self) -> QPainterPath:
+        """Widen the hit area to ±_HIT_HALF_WIDTH px for easy grabbing."""
+        path = QPainterPath()
+        ln   = self.line()
+        w    = self._HIT_HALF_WIDTH
+        y0   = min(ln.y1(), ln.y2())
+        h    = abs(ln.y2() - ln.y1()) or 1.0
+        path.addRect(QRectF(ln.x1() - w, y0, w * 2.0, h))
+        return path
+
+    def mousePressEvent(self, event) -> None:
+        self._dragging = True
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._dragging or self._canvas._ref_plot is None:
+            return
+        vb       = self._canvas._ref_plot.getViewBox()
+        view_pos = vb.mapSceneToView(event.scenePos())
+        self._canvas._on_cursor_dragged(self._cursor_id, float(view_pos.x()))
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._dragging = False
+        event.accept()
 
 
 class ChannelCanvas(pg.GraphicsLayoutWidget):
@@ -155,12 +235,30 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         self._ref_plot: Optional[pg.PlotItem]                          = None   # X-link reference
         self._record: Optional[DisturbanceRecord]                      = None   # current record
 
+        # Two scene-level cursor lines span the full canvas height.
+        # _SceneCursorLine handles dragging from any scroll position.
+        # This replaces the per-plot InfiniteLine approach (392 objects → 2).
+        self._cursor_pos_a:   float                        = CURSOR_A_INIT
+        self._cursor_pos_b:   float                        = CURSOR_B_INIT_MS  # updated in load_record
+        self._scene_cursor_a: Optional[_SceneCursorLine]  = None
+        self._scene_cursor_b: Optional[_SceneCursorLine]  = None
+
+        # Performance: re-entrancy guard and viewport threshold (Fix 2, Fix 3)
+        self._updating_viewport: bool                      = False
+        self._last_viewport:     tuple                     = (None, None)
+
         # Viewport debounce timer — fires _on_vp_timer 16ms after last range change
         self._vp_timer: QTimer = QTimer(self)
         self._vp_timer.setSingleShot(True)
         self._vp_timer.setInterval(VP_DEBOUNCE_MS)
         self._vp_timer.timeout.connect(self._on_vp_timer)
         self._pending_range: Optional[tuple[float, float]] = None
+
+        # Update cursor scene positions whenever the scene rect changes
+        # (initial layout, window resize, record reload).
+        self.scene().sceneRectChanged.connect(
+            lambda _rect: self._update_scene_cursors()
+        )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -189,6 +287,15 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
             record, '_time_axis_label', TIME_AXIS_LABEL_FALLBACK
         )
         is_trend = record.display_mode == 'TREND'
+
+        # Set initial cursor B offset in the correct display unit
+        if 'min' in time_axis_label:
+            self._cursor_pos_b = CURSOR_B_INIT_MS / 1_000.0 / 60.0
+        elif 'ms' in time_axis_label:
+            self._cursor_pos_b = CURSOR_B_INIT_MS
+        else:
+            self._cursor_pos_b = CURSOR_B_INIT_MS / 1_000.0
+        self._cursor_pos_a = CURSOR_A_INIT
 
         # Compute canvas height from row list
         rows = get_ordered_rows(record)
@@ -223,12 +330,119 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
             self._ref_plot.getViewBox().sigXRangeChanged.connect(
                 lambda vb, rng: self._schedule_viewport(rng)
             )
+            self._ref_plot.getViewBox().sigXRangeChanged.connect(
+                lambda vb, rng: self._update_scene_cursors()
+            )
+            self._build_scene_cursors()
 
         print(
             f'[ChannelCanvas] total_height={total_height}'
             f'  grid_rows={self.ci.layout.rowCount()}'
             f'  channel_plots={len(self._analogue_plots) + len(self._digital_plots)}'
         )
+
+    def scale_y_channel(self, channel_id: int, scale_factor: float) -> None:
+        """Scale the Y axis of one analogue channel by ``scale_factor``.
+
+        Centres the zoom on the current mid-point of the Y range and disables
+        auto-range so the manual scale is preserved across pans.
+
+        Args:
+            channel_id:   The analogue channel whose Y axis to scale.
+            scale_factor: >1 zooms out (larger range), <1 zooms in (smaller range).
+        """
+        plot = self._analogue_plots.get(channel_id)
+        if plot is None:
+            return
+        y_min, y_max = plot.viewRange()[1]
+        centre    = (y_min + y_max) / 2.0
+        half_span = (y_max - y_min) / 2.0 * scale_factor
+        plot.setYRange(centre - half_span, centre + half_span, padding=0)
+        plot.enableAutoRange(axis='y', enable=False)
+
+    def reset_y_channel(self, channel_id: int) -> None:
+        """Restore auto Y-range for one analogue channel.
+
+        Called when the user double-clicks the channel's label row.
+
+        Args:
+            channel_id: The analogue channel to reset.
+        """
+        plot = self._analogue_plots.get(channel_id)
+        if plot is None:
+            return
+        plot.enableAutoRange(axis='y', enable=True)
+
+    def autofit_y_channel(self, channel_id: int) -> None:
+        """Fit the Y axis of one analogue channel tightly to the visible data.
+
+        Uses the current horizontal viewport to determine the visible data
+        slice, then applies nanmin/nanmax with 7.5 % padding.  Handles flat
+        channels (all values equal) by adding ±0.5 around the constant value.
+        Falls back to the full channel array when the viewport slice is empty.
+
+        Args:
+            channel_id: The analogue channel whose Y axis to auto-fit.
+        """
+        plot = self._analogue_plots.get(channel_id)
+        record = self._record
+        if plot is None or record is None or self._ref_plot is None:
+            return
+
+        ch = next(
+            (c for c in record.analogue_channels if c.channel_id == channel_id),
+            None,
+        )
+        if ch is None or len(ch.raw_data) == 0:
+            return
+
+        # ── Determine visible raw-seconds slice ──────────────────────────────
+        x_min, x_max = self._ref_plot.getViewBox().viewRange()[0]
+        trigger_offset_s: float = (
+            record.trigger_time - record.start_time
+        ).total_seconds()
+        label: str = getattr(record, '_time_axis_label', 'Time (ms)')
+        if 'ms' in label:
+            scale = 1_000.0
+        elif 'min' in label:
+            scale = 1.0 / 60.0
+        else:
+            scale = 1.0
+
+        t_raw = record.time_array
+        t_start_raw = x_min / scale + trigger_offset_s
+        t_end_raw   = x_max / scale + trigger_offset_s
+
+        n = min(len(t_raw), len(ch.raw_data))
+        mask = (t_raw[:n] >= t_start_raw) & (t_raw[:n] <= t_end_raw)
+        data = ch.raw_data[:n][mask]
+        if len(data) == 0:
+            data = ch.raw_data   # fallback to full channel
+
+        # ── Compute padded range ──────────────────────────────────────────────
+        y_lo = float(np.nanmin(data))
+        y_hi = float(np.nanmax(data))
+        span = y_hi - y_lo
+        if span == 0.0:
+            span = 1.0
+            y_lo -= 0.5
+            y_hi += 0.5
+        else:
+            pad   = span * _Y_AUTOFIT_PADDING
+            y_lo -= pad
+            y_hi += pad
+
+        plot.setYRange(y_lo, y_hi, padding=0)
+        plot.enableAutoRange(axis='y', enable=False)
+
+    def autofit_all_channels(self) -> None:
+        """Fit every visible analogue channel to the current viewport.
+
+        Iterates all analogue plots and applies autofit_y_channel().
+        Digital channels are untouched (fixed Y range by design).
+        """
+        for channel_id in list(self._analogue_plots.keys()):
+            self.autofit_y_channel(channel_id)
 
     def update_channel_visibility(self, channel_id: int, visible: bool) -> None:
         """Show or hide the PlotItem for ``channel_id``.
@@ -248,7 +462,9 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         """Reset X range to full record duration; Y axes auto-fit."""
         if self._ref_plot is None or self._record is None:
             return
-        t = self._record._t_display
+        t = getattr(self._record, '_t_display', None)
+        if t is None or len(t) == 0:
+            return
         self._ref_plot.setXRange(float(t[0]), float(t[-1]), padding=0.02)
 
     def zoom_to_fault(self) -> None:
@@ -288,21 +504,42 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         half = (x_max - x_min)          # 100% increase → current span becomes half
         vb.setXRange(centre - half, centre + half, padding=0)
 
+    def get_cursor_time(self, cursor_id: int) -> float:
+        """Return the current display-unit position of cursor A (0) or B (1).
+
+        Args:
+            cursor_id: 0 for cursor A, 1 for cursor B.
+
+        Returns:
+            Current position in display units, or 0.0 if not yet initialised.
+        """
+        return self._cursor_pos_a if cursor_id == 0 else self._cursor_pos_b
+
     # ── Mouse overrides ────────────────────────────────────────────────────────
 
-    def wheelEvent(self, event) -> None:
-        """Ctrl+Wheel zooms the X axis; plain Wheel propagates to scroll area.
+    def resizeEvent(self, event) -> None:
+        """Update scene cursor extents when the canvas widget is resized.
 
-        Without this override the QScrollArea and PyQtGraph ViewBox both
-        compete for wheel events.  The convention (standard in engineering
-        tools) is:
-          Ctrl + Wheel → canvas zoom (X axis)
-          plain Wheel  → vertical scroll (QScrollArea)
+        Args:
+            event: The QResizeEvent.
         """
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            super().wheelEvent(event)
-        else:
+        super().resizeEvent(event)
+        # Guard: PyQtGraph calls resizeEvent(None) during super().__init__()
+        # before our own __init__ has initialised _ref_plot.
+        if hasattr(self, '_ref_plot'):
+            self._update_scene_cursors()
+
+    def wheelEvent(self, event) -> None:
+        """Wheel zooms the X axis; Shift+Wheel propagates to scroll area.
+
+        Plain wheel and Ctrl+Wheel both zoom so the behaviour matches the
+        pre-ScrollArea convention familiar to the user.  Hold Shift to
+        scroll vertically instead.
+        """
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             event.ignore()
+        else:
+            super().wheelEvent(event)
 
     def contextMenuEvent(self, event) -> None:
         """Right-click shows a minimal context menu (Zoom to Fit).
@@ -317,10 +554,94 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
 
     # ── Private — canvas lifecycle ─────────────────────────────────────────────
 
+    def _on_cursor_dragged(self, cursor_id: int, new_pos: float) -> None:
+        """Update cursor position, sync scene line, and emit cursor_moved.
+
+        Called from ``_SceneCursorLine.mouseMoveEvent`` — no InfiniteLines,
+        no per-plot slave sync required.
+
+        Args:
+            cursor_id: 0 for cursor A, 1 for cursor B.
+            new_pos:   New position in display units.
+        """
+        if cursor_id == 0:
+            self._cursor_pos_a = new_pos
+        else:
+            self._cursor_pos_b = new_pos
+        self._update_scene_cursors()
+        app_state.cursor_moved.emit(cursor_id, new_pos)
+
+    def _build_scene_cursors(self) -> None:
+        """Create two full-height scene cursor lines and add them to the scene.
+
+        Called once per ``load_record`` after all plots are built and
+        ``_ref_plot`` is known.  Removes any previous scene lines first.
+        """
+        scene = self.scene()
+        if scene is None:
+            return
+
+        # Remove previous lines (e.g. from a prior load_record call)
+        for line in (self._scene_cursor_a, self._scene_cursor_b):
+            if line is not None:
+                scene.removeItem(line)
+
+        pen_a = QPen(QColor(CURSOR_A_COLOUR))
+        pen_a.setWidthF(CURSOR_PEN_WIDTH)
+        pen_a.setStyle(Qt.PenStyle.DashLine)
+
+        pen_b = QPen(QColor(CURSOR_B_COLOUR))
+        pen_b.setWidthF(CURSOR_PEN_WIDTH)
+        pen_b.setStyle(Qt.PenStyle.DashLine)
+
+        self._scene_cursor_a = _SceneCursorLine(0, self, pen_a, 'A')
+        self._scene_cursor_b = _SceneCursorLine(1, self, pen_b, 'B')
+        scene.addItem(self._scene_cursor_a)
+        scene.addItem(self._scene_cursor_b)
+
+        self._update_scene_cursors()
+
+    def _update_scene_cursors(self) -> None:
+        """Reposition both scene cursor lines to match current cursor times.
+
+        Called after any event that changes either the cursor time values
+        (drag) or the mapping from time → scene-x (zoom, pan, resize).
+        """
+        if (self._ref_plot is None
+                or self._scene_cursor_a is None
+                or self._scene_cursor_b is None):
+            return
+        scene = self.scene()
+        if scene is None:
+            return
+
+        rect = scene.sceneRect()
+        vb   = self._ref_plot.getViewBox()
+
+        x_a = vb.mapViewToScene(pg.Point(self._cursor_pos_a, 0)).x()
+        x_b = vb.mapViewToScene(pg.Point(self._cursor_pos_b, 0)).x()
+
+        self._scene_cursor_a.setLine(x_a, rect.top(), x_a, rect.bottom())
+        self._scene_cursor_b.setLine(x_b, rect.top(), x_b, rect.bottom())
+
     def _clear_canvas(self) -> None:
-        """Remove all plots and reset tracking state."""
+        """Remove all plots, scene cursor lines, and reset tracking state."""
         self._vp_timer.stop()
-        self._pending_range = None
+        self._pending_range   = None
+        self._updating_viewport = False
+        self._last_viewport   = (None, None)
+
+        # Remove scene cursor lines before clearing plots (scene.clear() is
+        # NOT called — ci.clear() only clears the GraphicsLayout, not raw
+        # scene items we added directly).
+        _scene = self.scene()
+        if _scene is not None:
+            for line in (self._scene_cursor_a, self._scene_cursor_b):
+                if line is not None:
+                    _scene.removeItem(line)
+        self._scene_cursor_a = None
+        self._scene_cursor_b = None
+
         self.clear()
         self._analogue_plots.clear()
         self._digital_plots.clear()
@@ -328,7 +649,7 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         self._digital_curves.clear()
         self._trigger_lines.clear()
         self._ref_plot = None
-        self._record = None
+        self._record   = None
 
     # ── Private — viewport re-decimation ──────────────────────────────────────
 
@@ -357,66 +678,96 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         This guarantees every zoom/pan call decimates from the original raw
         arrays regardless of zoom history — never from pre-decimated data.
 
+        Performance guards applied here:
+          Fix 2 — Re-entrancy guard: ``setData()`` triggers autorange which
+                   fires ``sigXRangeChanged`` which would re-enter this method;
+                   the guard breaks that loop immediately.
+          Fix 3a — Viewport threshold: skip if the view moved less than 1% of
+                   the current span (scroll inertia / floating-point noise).
+          Fix 3b — Static digital channels: channels whose state never changes
+                   (flagged by ``prepare_display_data``) are skipped entirely —
+                   89% of digital ``setData()`` calls eliminated for JMHE.
+
         Args:
             view_range: (t_start, t_end) in display units (ms / s / min).
         """
-        record = self._record
-        if record is None:
+        # Fix 2: re-entrancy guard — setData() → autorange → sigXRangeChanged
+        if self._updating_viewport:
             return
+        self._updating_viewport = True
+        try:
+            record = self._record
+            if record is None:
+                return
 
-        t_start, t_end = view_range
-        t_raw: np.ndarray = record.time_array
-        is_trend = record.display_mode == 'TREND'
+            t_start, t_end = view_range
 
-        # ── Convert display-unit range → raw seconds ───────────────────────────
-        trigger_offset_s: float = (
-            record.trigger_time - record.start_time
-        ).total_seconds()
-        label: str = getattr(record, '_time_axis_label', 'Time (ms)')
-        if 'ms' in label:
-            scale = 1_000.0          # raw s → ms
-        elif 'min' in label:
-            scale = 1.0 / 60.0      # raw s → min
-        else:
-            scale = 1.0             # raw s → s
+            # Fix 3a: skip sub-pixel / inertia pans (< 1% of visible span)
+            last_start, last_end = self._last_viewport
+            if last_start is not None:
+                span = t_end - t_start
+                if (span > 0
+                        and abs(t_start - last_start) < span * 0.01
+                        and abs(t_end - last_end) < span * 0.01):
+                    return
+            self._last_viewport = (t_start, t_end)
 
-        t_start_raw = t_start / scale + trigger_offset_s
-        t_end_raw   = t_end   / scale + trigger_offset_s
+            t_raw: np.ndarray = record.time_array
+            is_trend = record.display_mode == 'TREND'
 
-        # Full-array boolean mask (raw seconds, same indices for all channels)
-        mask: np.ndarray = (t_raw >= t_start_raw) & (t_raw <= t_end_raw)
-
-        for ch in record.analogue_channels:
-            curve = self._analogue_curves.get(ch.channel_id)
-            if curve is None or not ch.visible:
-                continue
-            n = min(len(t_raw), len(ch.raw_data))
-            mask_n = mask[:n]
-            t_vis_raw = t_raw[:n][mask_n]         # raw seconds
-            d_vis     = ch.raw_data[:n][mask_n]   # raw data — always from source
-            if len(t_vis_raw) == 0:
-                continue
-            # Convert time to display units for setData (axes calibrated in display units)
-            t_vis = (t_vis_raw - trigger_offset_s) * scale
-            if is_trend:
-                t_dec, d_dec = decimate_uniform(t_vis, d_vis, MAX_ANALOGUE_POINTS)
+            # ── Convert display-unit range → raw seconds ──────────────────────
+            trigger_offset_s: float = (
+                record.trigger_time - record.start_time
+            ).total_seconds()
+            label: str = getattr(record, '_time_axis_label', 'Time (ms)')
+            if 'ms' in label:
+                scale = 1_000.0          # raw s → ms
+            elif 'min' in label:
+                scale = 1.0 / 60.0      # raw s → min
             else:
-                t_dec, d_dec = decimate_minmax(t_vis, d_vis, MAX_ANALOGUE_POINTS)
-            curve.setData(t_dec, d_dec)
+                scale = 1.0             # raw s → s
 
-        for ch in record.digital_channels:
-            curve = self._digital_curves.get(ch.channel_id)
-            if curve is None or not ch.visible:
-                continue
-            n = min(len(t_raw), len(ch.data))
-            mask_n = mask[:n]
-            t_vis_raw = t_raw[:n][mask_n]         # raw seconds
-            d_vis     = ch.data[:n][mask_n]       # raw data — always from source
-            if len(t_vis_raw) == 0:
-                continue
-            t_vis = (t_vis_raw - trigger_offset_s) * scale
-            t_dec, d_dec = decimate_digital(t_vis, d_vis, MAX_DIGITAL_POINTS)
-            curve.setData(t_dec, d_dec)
+            t_start_raw = t_start / scale + trigger_offset_s
+            t_end_raw   = t_end   / scale + trigger_offset_s
+
+            # Full-array boolean mask — shared across all channels
+            mask: np.ndarray = (t_raw >= t_start_raw) & (t_raw <= t_end_raw)
+
+            for ch in record.analogue_channels:
+                curve = self._analogue_curves.get(ch.channel_id)
+                if curve is None or not ch.visible:
+                    continue
+                n = min(len(t_raw), len(ch.raw_data))
+                mask_n    = mask[:n]
+                t_vis_raw = t_raw[:n][mask_n]         # raw seconds
+                d_vis     = ch.raw_data[:n][mask_n]   # always from source
+                if len(t_vis_raw) == 0:
+                    continue
+                t_vis = (t_vis_raw - trigger_offset_s) * scale
+                if is_trend:
+                    t_dec, d_dec = decimate_uniform(t_vis, d_vis, MAX_ANALOGUE_POINTS)
+                else:
+                    t_dec, d_dec = decimate_minmax(t_vis, d_vis, MAX_ANALOGUE_POINTS)
+                curve.setData(t_dec, d_dec)
+
+            for ch in record.digital_channels:
+                # Fix 3b: skip channels whose state never changes (all zeros/ones)
+                if getattr(ch, '_display_is_static', False):
+                    continue
+                curve = self._digital_curves.get(ch.channel_id)
+                if curve is None or not ch.visible:
+                    continue
+                n = min(len(t_raw), len(ch.data))
+                mask_n    = mask[:n]
+                t_vis_raw = t_raw[:n][mask_n]         # raw seconds
+                d_vis     = ch.data[:n][mask_n]       # always from source
+                if len(t_vis_raw) == 0:
+                    continue
+                t_vis = (t_vis_raw - trigger_offset_s) * scale
+                t_dec, d_dec = decimate_digital(t_vis, d_vis, MAX_DIGITAL_POINTS)
+                curve.setData(t_dec, d_dec)
+        finally:
+            self._updating_viewport = False
 
     # ── Private — row builders ─────────────────────────────────────────────────
 
@@ -464,7 +815,7 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
         # First analogue plot becomes the X-link reference (star topology)
         if self._ref_plot is None:
             self._ref_plot = plot
-            self._ref_plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
+            plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         else:
             plot.setXLink(self._ref_plot)
 
@@ -502,7 +853,7 @@ class ChannelCanvas(pg.GraphicsLayoutWidget):
 
         if self._ref_plot is None:
             self._ref_plot = plot
-            self._ref_plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
+            plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         else:
             plot.setXLink(self._ref_plot)
 

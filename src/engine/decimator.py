@@ -238,5 +238,7 @@ def prepare_display_data(record: DisturbanceRecord) -> DisturbanceRecord:
         t = t_display[:n]
         d = ch.data[:n]
         ch._display_t, ch._display_d = decimate_digital(t, d, MAX_DIGITAL_POINTS)        # type: ignore[attr-defined]
+        # Flag channels whose state never changes — viewport update can skip them
+        ch._display_is_static = bool(len(np.unique(d)) == 1)                             # type: ignore[attr-defined]
 
     return record
