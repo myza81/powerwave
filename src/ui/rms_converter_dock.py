@@ -72,6 +72,7 @@ from engine.rms_merger import (
     merge_rms_channels,
     start_epoch_from_datetime,
 )
+from models.channel import SignalRole
 from models.disturbance_record import DisturbanceRecord
 from parsers.comtrade_parser import ComtradeParser
 from parsers.csv_parser import CsvParser
@@ -81,13 +82,37 @@ from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
 # ── Module constants ───────────────────────────────────────────────────────────
 
 TREE_COL_NAME:   int = 0    # column index: channel name / file stem
-FILE_PANEL_WIDTH: int = 220  # px — fixed left-panel width
+TREE_COL_BASE:   int = 1    # column index: base voltage kV spinbox (voltage channels)
+FILE_PANEL_WIDTH: int = 300  # px — fixed left-panel width
 SLIDER_RANGE:     int = 3000 # ± slider units (actual offset = units × step_s)
 OFFSET_DEBOUNCE_MS: int = 50 # ms — debounce before re-merging on slider drag
 DEFAULT_STEP_MS:  float = 10.0
 WAVEFORM_BG:      str = '#1E1E1E'
 NAN_WARN_COLOUR:  str = '#FF8800'
 NAN_OK_COLOUR:    str = '#888888'
+
+SQRT3: float = 1.7320508075688772   # √3 for phase-to-earth PU conversion
+
+# Signal roles that default to the right (current) Y-axis
+_CURRENT_ROLES: frozenset[str] = frozenset({
+    SignalRole.I_PHASE,
+    SignalRole.I_EARTH,
+    SignalRole.I1_PMU,
+})
+
+# Voltage roles eligible for PU conversion
+_VOLTAGE_ROLES: frozenset[str] = frozenset({
+    SignalRole.V_PHASE,
+    SignalRole.V_LINE,
+    SignalRole.V_RESIDUAL,
+    SignalRole.V1_PMU,
+    SignalRole.SEQ_RMS,
+})
+
+# Phase-to-phase roles: divide by V_base (not V_base/√3)
+_LINE_VOLTAGE_ROLES: frozenset[str] = frozenset({
+    SignalRole.V_LINE,
+})
 
 _FILE_FILTER = (
     "Disturbance Records (*.cfg *.CFG *.csv *.CSV *.xlsx *.xls);;"
@@ -284,6 +309,15 @@ class RmsConverterDock(QDockWidget):
         self._merge_result: Optional[MergeResult]   = None
         self._col_names:    dict[tuple[str, int], str] = {}  # (file_id, ch_id) → display name
         self._waveform_curves: dict[tuple[str, int], pg.PlotDataItem] = {}
+        # (file_id, ch_id) → 'left' | 'right'  — axis assignment per channel
+        self._axis_assignment: dict[tuple[str, int], str] = {}
+        # Per-unit mode state
+        self._pu_mode: bool = False
+        # (file_id, ch_id) → base voltage in kV (0.0 = not set)
+        self._base_kv: dict[tuple[str, int], float] = {}
+        # Secondary ViewBox and axis — initialised in _build_right_panel
+        self._vb2:        Optional[pg.ViewBox]  = None
+        self._right_axis: Optional[pg.AxisItem] = None
 
         # Debounce timer for slider → re-merge
         self._merge_timer = QTimer(self)
@@ -344,6 +378,18 @@ class RmsConverterDock(QDockWidget):
         self._tol_spin.valueChanged.connect(self._on_tolerance_changed)
         layout.addWidget(self._tol_spin)
 
+        layout.addWidget(self._make_separator())
+
+        self._pu_btn = QPushButton('PU Mode')
+        self._pu_btn.setCheckable(True)
+        self._pu_btn.setChecked(False)
+        self._pu_btn.setToolTip(
+            'Toggle between actual RMS values and per-unit (PU) values.\n'
+            'Right-click a voltage channel in the file tree to set its base kV.'
+        )
+        self._pu_btn.toggled.connect(self._on_pu_toggled)
+        layout.addWidget(self._pu_btn)
+
         layout.addStretch()
         return bar
 
@@ -360,10 +406,21 @@ class RmsConverterDock(QDockWidget):
         layout.addWidget(hdr)
 
         self._tree = QTreeWidget()
-        self._tree.setHeaderHidden(True)
-        self._tree.setColumnCount(1)
+        self._tree.setHeaderHidden(False)
+        self._tree.setColumnCount(2)
+        self._tree.setHeaderLabels(['Channel', 'Base kV'])
         self._tree.setStyleSheet('background: #252525; color: #DDDDDD; font-size: 8pt;')
+        self._tree.header().setStretchLastSection(False)
+        self._tree.header().setSectionResizeMode(
+            TREE_COL_NAME, QHeaderView.ResizeMode.Stretch
+        )
+        self._tree.header().setSectionResizeMode(
+            TREE_COL_BASE, QHeaderView.ResizeMode.Fixed
+        )
+        self._tree.header().resizeSection(TREE_COL_BASE, 76)
         self._tree.itemChanged.connect(self._on_tree_item_changed)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         layout.addWidget(self._tree)
         return panel
 
@@ -376,14 +433,32 @@ class RmsConverterDock(QDockWidget):
 
         v_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Waveform
+        # Waveform — primary PlotItem (left Y-axis) + secondary ViewBox (right Y-axis)
         self._waveform = pg.GraphicsLayoutWidget()
         self._waveform.setBackground(WAVEFORM_BG)
         self._waveform.setMinimumHeight(120)
         self._plot = self._waveform.addPlot(row=0, col=0)
         self._plot.showGrid(x=True, y=True, alpha=0.15)
         self._plot.setLabel('bottom', 'Time (s)')
-        self._plot.setLabel('left', 'RMS Value')
+        self._plot.setLabel('left', 'Voltage')
+        self._plot.getAxis('left').setStyle(tickFont=None)
+
+        # Secondary ViewBox for right (current) Y-axis.
+        # Use PlotItem's existing right AxisItem — do NOT add a new one to the
+        # layout at (2,2) as that cell is already occupied and triggers a warning.
+        self._plot.showAxis('right')
+        self._right_axis = self._plot.getAxis('right')
+        self._right_axis.setLabel('Current')
+        self._right_axis.hide()   # hidden until at least one channel is assigned there
+
+        self._vb2 = pg.ViewBox()
+        self._plot.scene().addItem(self._vb2)
+        self._right_axis.linkToView(self._vb2)
+        self._vb2.setXLink(self._plot)
+
+        # Keep vb2 geometry locked to the primary ViewBox
+        self._plot.getViewBox().sigResized.connect(self._sync_vb2)
+
         v_splitter.addWidget(self._waveform)
 
         # Table
@@ -494,11 +569,15 @@ class RmsConverterDock(QDockWidget):
         selected = {ch.channel_id for ch in record.analogue_channels}
         start_epoch = start_epoch_from_datetime(record.start_time)
 
-        # Build default column names: stem_channelname_RMS
+        # Build default column names and axis assignments
         stem = path.stem[:12]
         for ch in record.analogue_channels:
             key = (file_id, ch.channel_id)
             self._col_names[key] = f'{stem}_{ch.name}_RMS'
+            # Current roles → right axis; everything else → left axis
+            self._axis_assignment[key] = (
+                'right' if ch.signal_role in _CURRENT_ROLES else 'left'
+            )
 
         return _LoadedFile(
             file_id=file_id,
@@ -547,7 +626,9 @@ class RmsConverterDock(QDockWidget):
 
         self._tree.blockSignals(True)
         for ch in loaded.record.analogue_channels:
-            ch_item = QTreeWidgetItem([f'  {ch.name}  [{ch.unit or "—"}]'])
+            axis = self._axis_assignment.get((loaded.file_id, ch.channel_id), 'left')
+            axis_tag = '[R]' if axis == 'right' else '[L]'
+            ch_item = QTreeWidgetItem([f'  {axis_tag} {ch.name}  [{ch.unit or "—"}]', ''])
             ch_item.setData(TREE_COL_NAME, Qt.ItemDataRole.UserRole, ch.channel_id)
             ch_item.setFlags(ch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             ch_item.setCheckState(
@@ -556,6 +637,23 @@ class RmsConverterDock(QDockWidget):
                 else Qt.CheckState.Unchecked,
             )
             file_item.addChild(ch_item)
+
+            # Embed base-kV spinbox for voltage channels
+            if self._is_voltage_channel(loaded.file_id, ch.channel_id):
+                spin = QDoubleSpinBox()
+                spin.setRange(0.0, 9999.0)
+                spin.setDecimals(1)
+                spin.setSuffix(' kV')
+                spin.setSpecialValueText('—')   # 0.0 → "—" means "not set"
+                spin.setFixedWidth(74)
+                spin.setStyleSheet('font-size: 7pt;')
+                spin.setValue(self._base_kv.get((loaded.file_id, ch.channel_id), 0.0))
+                spin.valueChanged.connect(
+                    lambda v, fid=loaded.file_id, cid=ch.channel_id:
+                        self._on_base_kv_changed(fid, cid, v)
+                )
+                self._tree.setItemWidget(ch_item, TREE_COL_BASE, spin)
+
         self._tree.blockSignals(False)
 
         self._tree.addTopLevelItem(file_item)
@@ -583,6 +681,105 @@ class RmsConverterDock(QDockWidget):
             loaded.selected_ids.add(ch_id)
         else:
             loaded.selected_ids.discard(ch_id)
+
+    def _on_tree_context_menu(self, pos) -> None:
+        """Right-click on a channel item → offer left/right axis assignment.
+
+        Only channel-level items (children of file items) show this menu.
+        File-level items are ignored.
+
+        Args:
+            pos: Click position in tree widget coordinates.
+        """
+        item = self._tree.itemAt(pos)
+        if item is None or item.parent() is None:
+            return   # clicked on a file item or empty space
+
+        file_item = item.parent()
+        file_id   = file_item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+        ch_id     = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+        if file_id is None or ch_id is None:
+            return
+
+        key     = (file_id, ch_id)
+        current = self._axis_assignment.get(key, 'left')
+
+        from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
+        menu = QMenu(self)
+        left_action  = menu.addAction('→ Left Axis  (Voltage)')
+        right_action = menu.addAction('→ Right Axis (Current)')
+        left_action.setCheckable(True)
+        right_action.setCheckable(True)
+        left_action.setChecked(current == 'left')
+        right_action.setChecked(current == 'right')
+
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        new_axis = 'right' if chosen is right_action else 'left'
+        if new_axis == current:
+            return
+
+        self._axis_assignment[key] = new_axis
+        self._update_tree_item_label(item, file_id, ch_id, new_axis)
+        # Re-draw waveform with updated assignment (merge data unchanged)
+        if self._merge_result is not None:
+            channels = self._collect_rms_channels()
+            self._update_waveform(self._merge_result, channels)
+
+    def _update_tree_item_label(
+        self,
+        item: QTreeWidgetItem,
+        file_id: str,
+        ch_id: int,
+        axis: str,
+    ) -> None:
+        """Refresh the axis tag shown on a channel tree item.
+
+        Args:
+            item:    The QTreeWidgetItem to update.
+            file_id: The file this channel belongs to.
+            ch_id:   The channel_id.
+            axis:    'left' or 'right'.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return
+        ch_map = {ch.channel_id: ch for ch in loaded.record.analogue_channels}
+        ch = ch_map.get(ch_id)
+        if ch is None:
+            return
+        tag = '[R]' if axis == 'right' else '[L]'
+        self._tree.blockSignals(True)
+        item.setText(TREE_COL_NAME, f'  {tag} {ch.name}  [{ch.unit or "—"}]')
+        self._tree.blockSignals(False)
+
+    def _collect_rms_channels(self) -> list[RmsChannelData]:
+        """Build the RmsChannelData list from current file state.
+
+        Returns:
+            List of RmsChannelData for all selected channels that have RMS results.
+        """
+        channels: list[RmsChannelData] = []
+        for loaded in self._files.values():
+            for ch_id in loaded.selected_ids:
+                if ch_id not in loaded.rms_results:
+                    continue
+                t_from_start, rms_vals = loaded.rms_results[ch_id]
+                col_name = self._col_names.get(
+                    (loaded.file_id, ch_id),
+                    f'{loaded.path.stem}_{ch_id}_RMS',
+                )
+                channels.append(RmsChannelData(
+                    file_id=loaded.file_id,
+                    channel_id=ch_id,
+                    col_name=col_name,
+                    t_from_start=t_from_start,
+                    rms=rms_vals,
+                    start_epoch=loaded.start_epoch,
+                ))
+        return channels
 
     def _on_remove_file(self) -> None:
         """Remove the currently selected file from the tree and state dicts."""
@@ -716,46 +913,39 @@ class RmsConverterDock(QDockWidget):
 
     def _run_merge(self) -> None:
         """Build RmsChannelData list and run nearest-neighbour merge."""
-        channels: list[RmsChannelData] = []
-        for loaded in self._files.values():
-            for ch_id in loaded.selected_ids:
-                if ch_id not in loaded.rms_results:
-                    continue
-                t_from_start, rms_vals = loaded.rms_results[ch_id]
-                col_name = self._col_names.get(
-                    (loaded.file_id, ch_id),
-                    f'{loaded.path.stem}_{ch_id}_RMS',
-                )
-                channels.append(RmsChannelData(
-                    file_id=loaded.file_id,
-                    channel_id=ch_id,
-                    col_name=col_name,
-                    t_from_start=t_from_start,
-                    rms=rms_vals,
-                    start_epoch=loaded.start_epoch,
-                ))
-
+        channels = self._collect_rms_channels()
         if not channels:
             return
 
         result = merge_rms_channels(channels, self._offsets, self._tolerance_s)
         self._merge_result = result
         self._update_waveform(result, channels)
-        self._update_table(result)
+        self._update_table(result, channels)
         self._update_nan_label(result)
+
+    def _sync_vb2(self) -> None:
+        """Keep the secondary ViewBox geometry aligned with the primary ViewBox."""
+        if self._vb2 is not None:
+            self._vb2.setGeometry(self._plot.getViewBox().sceneBoundingRect())
 
     def _update_waveform(
         self,
         result: MergeResult,
         channels: list[RmsChannelData],
     ) -> None:
-        """Redraw all RMS trend lines in the waveform plot.
+        """Redraw all RMS trend lines, routing each channel to left or right Y-axis.
+
+        Voltage channels (and all 'left'-assigned channels) go to the primary
+        PlotItem ViewBox.  Current channels (and 'right'-assigned channels) go
+        to the secondary ViewBox linked to the right AxisItem.
 
         Args:
             result:   The current MergeResult.
             channels: The channel descriptors used to build result.
         """
         self._plot.clear()
+        if self._vb2 is not None:
+            self._vb2.clear()
         self._waveform_curves.clear()
 
         if len(result.t_common) == 0:
@@ -763,31 +953,66 @@ class RmsConverterDock(QDockWidget):
 
         t_rel = result.t_common - result.t_common[0]   # relative seconds from first point
 
+        left_label = 'Voltage (PU)' if self._pu_mode else 'Voltage'
+        self._plot.setLabel('left', left_label)
+
+        has_right = False
         for col_idx, rms_ch in enumerate(channels):
-            # Find colour from the record's channel object
             colour = self._get_channel_colour(rms_ch.file_id, rms_ch.channel_id)
             mask   = ~np.isnan(result.data_2d[:, col_idx])
             if not np.any(mask):
                 continue
+
+            y_data = result.data_2d[mask, col_idx].copy()
+            if self._pu_mode:
+                divisor = self._get_pu_divisor(rms_ch.file_id, rms_ch.channel_id)
+                if divisor > 0.0:
+                    y_data = y_data / divisor
+
             curve = pg.PlotDataItem(
                 t_rel[mask],
-                result.data_2d[mask, col_idx],
+                y_data,
                 pen=pg.mkPen(colour, width=1),
                 name=rms_ch.col_name,
             )
-            self._plot.addItem(curve)
+
+            axis = self._axis_assignment.get(
+                (rms_ch.file_id, rms_ch.channel_id), 'left'
+            )
+            if axis == 'right' and self._vb2 is not None:
+                self._vb2.addItem(curve)
+                has_right = True
+            else:
+                self._plot.addItem(curve)
+
             self._waveform_curves[(rms_ch.file_id, rms_ch.channel_id)] = curve
 
-    def _update_table(self, result: MergeResult) -> None:
+        # Show right axis only when at least one channel is assigned there
+        if self._right_axis is not None:
+            self._right_axis.setVisible(has_right)
+
+        self._sync_vb2()
+
+    def _update_table(self, result: MergeResult, channels: list[RmsChannelData]) -> None:
         """Populate the QTableWidget from the MergeResult.
 
         Uses setUpdatesEnabled(False) during bulk write for performance.
+        When PU mode is active, voltage columns are converted to per-unit values.
 
         Args:
-            result: The current MergeResult.
+            result:   The current MergeResult.
+            channels: The channel descriptors aligned with result.data_2d columns.
         """
         n_rows = len(result.t_common)
         n_cols = len(result.col_names) + 1   # +1 for Time column
+
+        # Pre-compute PU divisors for each column (0.0 = no conversion)
+        pu_divisors: list[float] = []
+        for rms_ch in channels:
+            if self._pu_mode:
+                pu_divisors.append(self._get_pu_divisor(rms_ch.file_id, rms_ch.channel_id))
+            else:
+                pu_divisors.append(0.0)
 
         self._table.setUpdatesEnabled(False)
         self._table.blockSignals(True)
@@ -813,7 +1038,9 @@ class RmsConverterDock(QDockWidget):
                         cell = QTableWidgetItem('')
                         cell.setBackground(pg.mkColor('#3A2200'))
                     else:
-                        cell = QTableWidgetItem(f'{val:.4f}')
+                        divisor = pu_divisors[col_idx]
+                        display_val = val / divisor if divisor > 0.0 else val
+                        cell = QTableWidgetItem(f'{display_val:.4f}')
                         cell.setTextAlignment(
                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                         )
@@ -984,6 +1211,75 @@ class RmsConverterDock(QDockWidget):
             QMessageBox.information(self, 'Export Complete', f'Saved to:\n{path}')
         except OSError as exc:
             QMessageBox.critical(self, 'Export Error', str(exc))
+
+    # ── Per-unit mode ─────────────────────────────────────────────────────────
+
+    def _on_pu_toggled(self, checked: bool) -> None:
+        """Switch between actual RMS and per-unit display modes.
+
+        Args:
+            checked: True → PU mode; False → actual RMS values.
+        """
+        self._pu_mode = checked
+        if self._merge_result is not None and len(self._merge_result.t_common) > 0:
+            channels = self._collect_rms_channels()
+            self._update_waveform(self._merge_result, channels)
+            self._update_table(self._merge_result, channels)
+
+    def _on_base_kv_changed(self, file_id: str, ch_id: int, value: float) -> None:
+        """Store updated base voltage and refresh PU display if active.
+
+        Called by the inline spinbox in the file tree (value 0.0 = not set).
+
+        Args:
+            file_id: The _LoadedFile.file_id.
+            ch_id:   The analogue channel_id.
+            value:   New base voltage in kV (0.0 means not set).
+        """
+        self._base_kv[(file_id, ch_id)] = value
+        if self._pu_mode and self._merge_result is not None:
+            channels = self._collect_rms_channels()
+            self._update_waveform(self._merge_result, channels)
+            self._update_table(self._merge_result, channels)
+
+    def _is_voltage_channel(self, file_id: str, ch_id: int) -> bool:
+        """Return True if the channel is a voltage type eligible for PU conversion.
+
+        Args:
+            file_id: The _LoadedFile.file_id.
+            ch_id:   The analogue channel_id.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return False
+        ch_map = {ch.channel_id: ch for ch in loaded.record.analogue_channels}
+        ch = ch_map.get(ch_id)
+        return ch is not None and ch.signal_role in _VOLTAGE_ROLES
+
+    def _get_pu_divisor(self, file_id: str, ch_id: int) -> float:
+        """Return the PU divisor for a voltage channel; 0.0 if not applicable.
+
+        Phase-to-phase (V_LINE): divisor = V_base.
+        Phase-to-earth / residual: divisor = V_base / √3.
+        Returns 0.0 if base voltage is not set or channel is not a voltage type.
+
+        Args:
+            file_id: The _LoadedFile.file_id.
+            ch_id:   The analogue channel_id.
+        """
+        base = self._base_kv.get((file_id, ch_id), 0.0)
+        if base <= 0.0:
+            return 0.0
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return 0.0
+        ch_map = {ch.channel_id: ch for ch in loaded.record.analogue_channels}
+        ch = ch_map.get(ch_id)
+        if ch is None or ch.signal_role not in _VOLTAGE_ROLES:
+            return 0.0
+        if ch.signal_role in _LINE_VOLTAGE_ROLES:
+            return base
+        return base / SQRT3
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
