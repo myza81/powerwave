@@ -55,6 +55,7 @@ from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
 from engine.decimator import prepare_display_data
 from ui.channel_canvas import ChannelCanvas
 from ui.measurement_panel import MeasurementPanel
+from ui.rms_converter_dock import RmsConverterDock
 from ui.waveform_panel import LabelPanel
 
 # ── Module constants ──────────────────────────────────────────────────────────
@@ -97,6 +98,7 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._setup_toolbar()
         self._setup_measurement_dock()
+        self._setup_rms_converter_dock()
         self._connect_signals()
 
         self.statusBar().showMessage("Ready — open a disturbance record to begin.")
@@ -132,7 +134,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(scroll_area)
 
     def _setup_menu(self) -> None:
-        """Build the File menu with Open and Exit actions."""
+        """Build the File and Tools menus."""
         menu_bar = self.menuBar()
 
         file_menu = menu_bar.addMenu("&File")
@@ -150,6 +152,15 @@ class MainWindow(QMainWindow):
         exit_action.setStatusTip("Exit PowerWave Analyst")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        tools_menu = menu_bar.addMenu("&Tools")
+
+        self._rms_toggle_action = QAction("&RMS Converter", self)
+        self._rms_toggle_action.setShortcut("Ctrl+R")
+        self._rms_toggle_action.setStatusTip("Open / close the RMS Converter (Ctrl+R)")
+        self._rms_toggle_action.setCheckable(True)
+        self._rms_toggle_action.triggered.connect(self._toggle_rms_dock)
+        tools_menu.addAction(self._rms_toggle_action)
 
     def _setup_toolbar(self) -> None:
         """Add navigation toolbar with zoom buttons.
@@ -208,6 +219,25 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def _setup_rms_converter_dock(self) -> None:
+        """Create the RMS Converter dock (hidden by default)."""
+        self._rms_dock = RmsConverterDock(parent=self)
+        self._rms_dock.setMinimumHeight(300)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._rms_dock)
+        self._rms_dock.hide()
+        self._rms_dock.visibilityChanged.connect(self._rms_toggle_action.setChecked)
+
+    def _toggle_rms_dock(self, checked: bool) -> None:
+        """Show or hide the RMS Converter dock.
+
+        Args:
+            checked: True = show, False = hide.
+        """
+        if checked:
+            self._rms_dock.show()
+        else:
+            self._rms_dock.hide()
 
     def _connect_signals(self) -> None:
         """Wire app_state signals to panel/canvas slots."""

@@ -3,9 +3,15 @@
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
 Phase: Phase 2
-Milestone: Milestone 2A — Measurement Cursors
-Module: src/ui/measurement_panel.py, src/ui/channel_canvas.py
-Status: IN PROGRESS
+Milestone: Milestone 2B — RMS Converter Feature
+Modules:
+  src/engine/rms_calculator.py   (NEW — cycle-by-cycle RMS computation)
+  src/engine/rms_merger.py       (NEW — nearest-neighbour multi-file time join)
+  src/ui/rms_converter_dock.py   (NEW — standalone RMS Converter dock)
+  src/main.py                    (MODIFIED — Tools menu, RMS dock wired up)
+  src/ui/waveform_panel.py       (MODIFIED — Y-axis scroll scaling per channel row)
+  src/ui/channel_canvas.py       (MODIFIED — scale_y_channel / reset_y_channel)
+Status: IN PROGRESS — core implemented, pending live UI test
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -423,6 +429,24 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 # toolbar controls, Ctrl+Wheel zoom, Y auto-scale. Bug fixed:
 
 # always decimate from raw_data not display cache. | tests passing
+
+# ✓ 2A (partial) — Y-axis scroll scaling per channel:
+
+# Wheel on label row → scale_y_channel(); double-click → reset_y_channel().
+
+# _AnalogueRow class in waveform_panel.py; signals wired via main.py.
+
+# ✓ 2B (in progress) — RMS Converter dock:
+
+# engine/rms_calculator.py — cycle-by-cycle RMS (numpy, no Pandas)
+
+# engine/rms_merger.py — nearest-neighbour multi-file time join, NaN detection
+
+# ui/rms_converter_dock.py — standalone dock: file tree, waveform, table,
+
+#   per-file offset slider+buttons, tolerance control, CSV/Excel export
+
+# Tools > RMS Converter (Ctrl+R) wired in main.py
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
