@@ -37,7 +37,7 @@ from typing import Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
@@ -91,6 +91,10 @@ WAVEFORM_BG:      str = '#1E1E1E'
 NAN_WARN_COLOUR:  str = '#FF8800'
 NAN_OK_COLOUR:    str = '#888888'
 
+CURSOR1_COLOUR:   str = '#FFD700'   # gold
+CURSOR2_COLOUR:   str = '#00E5FF'   # cyan
+READOUT_MARGIN:   int = 8           # px from bottom-right edge of plot viewport
+
 SQRT3: float = 1.7320508075688772   # √3 for phase-to-earth PU conversion
 
 # Signal roles that default to the right (current) Y-axis
@@ -124,6 +128,55 @@ _FILE_FILTER = (
 _COMTRADE_EXT: frozenset[str] = frozenset({'.cfg', '.dat'})
 _CSV_EXT:      frozenset[str] = frozenset({'.csv'})
 _EXCEL_EXT:    frozenset[str] = frozenset({'.xlsx', '.xls', '.xlsm'})
+
+
+# ── Draggable readout label ────────────────────────────────────────────────────
+
+class _DraggableLabel(QLabel):
+    """QLabel that can be repositioned by mouse drag.
+
+    Emits ``user_moved`` after each drag step so the parent can track that the
+    user has manually positioned it (suppressing future auto-repositioning).
+    """
+
+    user_moved: pyqtSignal = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._drag_origin: Optional[object] = None   # QPoint of mouse-down in label coords
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_origin is not None and (
+            event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            delta    = event.position().toPoint() - self._drag_origin
+            new_pos  = self.pos() + delta
+            parent   = self.parentWidget()
+            if parent:
+                new_pos.setX(max(0, min(new_pos.x(), parent.width()  - self.width())))
+                new_pos.setY(max(0, min(new_pos.y(), parent.height() - self.height())))
+            self.move(new_pos)
+            self.user_moved.emit()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
 
 # ── Internal state dataclass ───────────────────────────────────────────────────
@@ -318,6 +371,16 @@ class RmsConverterDock(QDockWidget):
         # Secondary ViewBox and axis — initialised in _build_right_panel
         self._vb2:        Optional[pg.ViewBox]  = None
         self._right_axis: Optional[pg.AxisItem] = None
+        # Crosshair cursor state — initialised in _build_right_panel
+        self._cursor1_enabled: bool = False
+        self._cursor2_enabled: bool = False
+        self._cursor1: Optional[pg.InfiniteLine]  = None
+        self._cursor2: Optional[pg.InfiniteLine]  = None
+        self._readout: Optional[_DraggableLabel]  = None
+        self._readout_pinned: bool                = False   # True once user drags it
+        # Snapshot of last rendered data for cursor value lookup
+        self._t_rel:         Optional[np.ndarray]        = None
+        self._rms_channels:  list[RmsChannelData]        = []
 
         # Debounce timer for slider → re-merge
         self._merge_timer = QTimer(self)
@@ -341,6 +404,14 @@ class RmsConverterDock(QDockWidget):
         root_layout.addWidget(content_splitter, stretch=1)
 
         root_layout.addWidget(self._build_bottom_bar())
+
+    # ── Qt overrides ──────────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event) -> bool:
+        """Reposition the readout overlay when the waveform widget is resized."""
+        if obj is self._waveform and event.type() == QEvent.Type.Resize:
+            self._reposition_readout()
+        return super().eventFilter(obj, event)
 
     # ── UI builders ───────────────────────────────────────────────────────────
 
@@ -458,6 +529,51 @@ class RmsConverterDock(QDockWidget):
 
         # Keep vb2 geometry locked to the primary ViewBox
         self._plot.getViewBox().sigResized.connect(self._sync_vb2)
+
+        # ── Crosshair cursors ─────────────────────────────────────────────────
+        # Disable PyQtGraph's default right-click menu so we can show ours
+        self._plot.getViewBox().setMenuEnabled(False)
+        self._vb2.setMenuEnabled(False)
+
+        self._cursor1 = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=True,
+            pen=pg.mkPen(CURSOR1_COLOUR, width=1, style=Qt.PenStyle.DashLine),
+            label='C1', labelOpts={'position': 0.97, 'color': CURSOR1_COLOUR,
+                                   'fill': pg.mkBrush(40, 40, 40, 180)},
+        )
+        self._cursor1.sigDragged.connect(self._on_cursor_moved)
+
+        self._cursor2 = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=True,
+            pen=pg.mkPen(CURSOR2_COLOUR, width=1, style=Qt.PenStyle.DashLine),
+            label='C2', labelOpts={'position': 0.90, 'color': CURSOR2_COLOUR,
+                                   'fill': pg.mkBrush(40, 40, 40, 180)},
+        )
+        self._cursor2.sigDragged.connect(self._on_cursor_moved)
+
+        # Readout panel — draggable QLabel overlay on the waveform widget.
+        # Using a child widget (not a scene item) avoids data-coordinate positioning
+        # problems and gives reliable semi-transparent rendering on all platforms.
+        self._readout = _DraggableLabel(self._waveform)
+        self._readout.setStyleSheet(
+            'background-color: rgba(255,255,255,210);'
+            'color: #111111;'
+            'font-family: Monospace;'
+            'font-size: 8pt;'
+            'padding: 6px 8px;'
+            'border-radius: 4px;'
+        )
+        self._readout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self._readout.user_moved.connect(lambda: setattr(self, '_readout_pinned', True))
+        self._readout.hide()
+
+        # Reposition overlay whenever the waveform widget is resized
+        self._waveform.installEventFilter(self)
+
+        # Right-click on waveform scene → cursor enable/disable menu
+        self._waveform.scene().sigMouseClicked.connect(self._on_waveform_clicked)
 
         v_splitter.addWidget(self._waveform)
 
@@ -952,6 +1068,8 @@ class RmsConverterDock(QDockWidget):
             return
 
         t_rel = result.t_common - result.t_common[0]   # relative seconds from first point
+        self._t_rel        = t_rel
+        self._rms_channels = list(channels)
 
         left_label = 'Voltage (PU)' if self._pu_mode else 'Voltage'
         self._plot.setLabel('left', left_label)
@@ -992,6 +1110,7 @@ class RmsConverterDock(QDockWidget):
             self._right_axis.setVisible(has_right)
 
         self._sync_vb2()
+        self._update_readout()
 
     def _update_table(self, result: MergeResult, channels: list[RmsChannelData]) -> None:
         """Populate the QTableWidget from the MergeResult.
@@ -1211,6 +1330,157 @@ class RmsConverterDock(QDockWidget):
             QMessageBox.information(self, 'Export Complete', f'Saved to:\n{path}')
         except OSError as exc:
             QMessageBox.critical(self, 'Export Error', str(exc))
+
+    # ── Crosshair cursors ─────────────────────────────────────────────────────
+
+    def _on_waveform_clicked(self, event) -> None:
+        """Show cursor enable/disable context menu on right-click inside the plot.
+
+        Args:
+            event: PyQtGraph MouseClickEvent from the scene.
+        """
+        from PyQt6.QtCore import Qt as _Qt  # noqa: PLC0415
+        if event.button() != _Qt.MouseButton.RightButton:
+            return
+        # Only respond to clicks within the primary ViewBox bounds
+        if not self._plot.getViewBox().sceneBoundingRect().contains(event.scenePos()):
+            return
+        event.accept()
+
+        from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
+        menu = QMenu(self)
+        act1 = menu.addAction('Cursor 1  (gold)')
+        act1.setCheckable(True)
+        act1.setChecked(self._cursor1_enabled)
+        act2 = menu.addAction('Cursor 2  (cyan)')
+        act2.setCheckable(True)
+        act2.setChecked(self._cursor2_enabled)
+
+        chosen = menu.exec(event.screenPos().toPoint())
+        if chosen is act1:
+            self._set_cursor_enabled(1, not self._cursor1_enabled)
+        elif chosen is act2:
+            self._set_cursor_enabled(2, not self._cursor2_enabled)
+
+    def _set_cursor_enabled(self, n: int, enabled: bool) -> None:
+        """Add or remove cursor n (1 or 2) from the plot.
+
+        Args:
+            n:       Cursor index (1 or 2).
+            enabled: True to show, False to hide.
+        """
+        cursor = self._cursor1 if n == 1 else self._cursor2
+        if cursor is None:
+            return
+        if n == 1:
+            self._cursor1_enabled = enabled
+        else:
+            self._cursor2_enabled = enabled
+
+        if enabled:
+            # Place cursor at the centre of the current X range
+            vr = self._plot.getViewBox().viewRange()
+            mid = (vr[0][0] + vr[0][1]) / 2.0
+            cursor.setValue(mid)
+            self._plot.addItem(cursor)
+        else:
+            self._plot.removeItem(cursor)
+
+        self._update_readout()
+
+    def _on_cursor_moved(self) -> None:
+        """Called while a cursor is being dragged — refreshes the readout panel."""
+        self._update_readout()
+
+    def _update_readout(self) -> None:
+        """Rebuild the readout QLabel text from active cursor positions."""
+        if self._readout is None:
+            return
+
+        any_active = self._cursor1_enabled or self._cursor2_enabled
+        if not any_active or self._merge_result is None or self._t_rel is None:
+            self._readout.hide()
+            return
+
+        lines: list[str] = []
+
+        for n, cursor, enabled in (
+            (1, self._cursor1, self._cursor1_enabled),
+            (2, self._cursor2, self._cursor2_enabled),
+        ):
+            if not enabled or cursor is None:
+                continue
+            t = cursor.value()
+            lines.append(f'C{n}  {t:.3f} s')
+            for col_idx, rms_ch in enumerate(self._rms_channels):
+                val = self._get_value_at_t(t, col_idx)
+                if np.isnan(val):
+                    val_str = '---'
+                else:
+                    if self._pu_mode:
+                        div = self._get_pu_divisor(rms_ch.file_id, rms_ch.channel_id)
+                        if div > 0.0:
+                            val = val / div
+                    val_str = f'{val:.4f}'
+                name = self._merge_result.col_names[col_idx]
+                short = name if len(name) <= 18 else name[:17] + '…'
+                lines.append(f'  {short:<18}  {val_str}')
+
+        if self._cursor1_enabled and self._cursor2_enabled:
+            dx = abs(self._cursor2.value() - self._cursor1.value())
+            lines.append(f'ΔX = {dx:.3f} s')
+
+        self._readout.setText('\n'.join(lines))
+        self._readout.adjustSize()
+        self._readout.show()
+        self._reposition_readout()
+
+    def _reposition_readout(self) -> None:
+        """Position the readout QLabel within the waveform widget.
+
+        If the user has not yet dragged the panel, it auto-snaps to the
+        bottom-right corner.  After the user drags it, only clamping is applied
+        so the panel stays within bounds when the waveform is resized.
+        """
+        if self._readout is None or not self._readout.isVisible():
+            return
+        m  = READOUT_MARGIN
+        pw = self._waveform.width()
+        ph = self._waveform.height()
+        rw = self._readout.width()
+        rh = self._readout.height()
+
+        if not self._readout_pinned:
+            # Auto snap to bottom-right
+            self._readout.move(max(0, pw - rw - m), max(0, ph - rh - m))
+        else:
+            # User has positioned it manually — only clamp to keep it in view
+            cur = self._readout.pos()
+            self._readout.move(
+                max(0, min(cur.x(), pw - rw - m)),
+                max(0, min(cur.y(), ph - rh - m)),
+            )
+
+    def _get_value_at_t(self, t: float, col_idx: int) -> float:
+        """Return the nearest RMS value for col_idx at relative time t (seconds).
+
+        Args:
+            t:       Cursor X position in relative seconds (t_rel).
+            col_idx: Column index into merge_result.data_2d.
+
+        Returns:
+            Nearest data value, or NaN if out of range or no data.
+        """
+        if self._merge_result is None or self._t_rel is None:
+            return float('nan')
+        t_arr = self._t_rel
+        if len(t_arr) == 0:
+            return float('nan')
+        idx = int(np.searchsorted(t_arr, t))
+        idx = int(np.clip(idx, 0, len(t_arr) - 1))
+        if idx > 0 and abs(t_arr[idx - 1] - t) < abs(t_arr[idx] - t):
+            idx -= 1
+        return float(self._merge_result.data_2d[idx, col_idx])
 
     # ── Per-unit mode ─────────────────────────────────────────────────────────
 
