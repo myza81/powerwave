@@ -82,10 +82,11 @@ from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
 # ── Module constants ───────────────────────────────────────────────────────────
 
 TREE_COL_NAME:   int = 0    # column index: channel name / file stem
-TREE_COL_BASE:   int = 1    # column index: base voltage kV spinbox (voltage channels)
+# column index: base voltage kV spinbox (voltage channels)
+TREE_COL_BASE:   int = 1
 FILE_PANEL_WIDTH: int = 300  # px — fixed left-panel width
-SLIDER_RANGE:     int = 3000 # ± slider units (actual offset = units × step_s)
-OFFSET_DEBOUNCE_MS: int = 50 # ms — debounce before re-merging on slider drag
+SLIDER_RANGE:     int = 3000  # ± slider units (actual offset = units × step_s)
+OFFSET_DEBOUNCE_MS: int = 50  # ms — debounce before re-merging on slider drag
 DEFAULT_STEP_MS:  float = 10.0
 WAVEFORM_BG:      str = '#1E1E1E'
 NAN_WARN_COLOUR:  str = '#FF8800'
@@ -143,7 +144,8 @@ class _DraggableLabel(QLabel):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self._drag_origin: Optional[object] = None   # QPoint of mouse-down in label coords
+        # QPoint of mouse-down in label coords
+        self._drag_origin: Optional[object] = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def mousePressEvent(self, event) -> None:
@@ -158,12 +160,14 @@ class _DraggableLabel(QLabel):
         if self._drag_origin is not None and (
             event.buttons() & Qt.MouseButton.LeftButton
         ):
-            delta    = event.position().toPoint() - self._drag_origin
-            new_pos  = self.pos() + delta
-            parent   = self.parentWidget()
+            delta = event.position().toPoint() - self._drag_origin
+            new_pos = self.pos() + delta
+            parent = self.parentWidget()
             if parent:
-                new_pos.setX(max(0, min(new_pos.x(), parent.width()  - self.width())))
-                new_pos.setY(max(0, min(new_pos.y(), parent.height() - self.height())))
+                new_pos.setX(
+                    max(0, min(new_pos.x(), parent.width() - self.width())))
+                new_pos.setY(
+                    max(0, min(new_pos.y(), parent.height() - self.height())))
             self.move(new_pos)
             self.user_moved.emit()
             event.accept()
@@ -200,9 +204,10 @@ class _LoadedFile:
     path:         Path
     record:       DisturbanceRecord
     nominal_freq: float
-    selected_ids: set[int]         = field(default_factory=set)
-    rms_results:  dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
-    start_epoch:  float            = 0.0
+    selected_ids: set[int] = field(default_factory=set)
+    rms_results:  dict[int, tuple[np.ndarray, np.ndarray]
+                       ] = field(default_factory=dict)
+    start_epoch:  float = 0.0
     tree_item:    Optional[QTreeWidgetItem] = field(default=None, repr=False)
 
 
@@ -230,10 +235,10 @@ class _OffsetRow(QWidget):
             parent:       Optional parent widget.
         """
         super().__init__(parent)
-        self._file_id   = file_id
-        self._step_s    = DEFAULT_STEP_MS / 1000.0
-        self._offset_s  = 0.0
-        self._updating  = False
+        self._file_id = file_id
+        self._step_s = DEFAULT_STEP_MS / 1000.0
+        self._offset_s = 0.0
+        self._updating = False
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
@@ -320,8 +325,10 @@ class _OffsetRow(QWidget):
         """Adjust slider position to keep actual offset constant when step changes."""
         self._updating = True
         self._step_s = new_ms / 1000.0
-        new_pos = int(round(self._offset_s / self._step_s)) if self._step_s > 0 else 0
-        self._slider.setValue(int(np.clip(new_pos, -SLIDER_RANGE, SLIDER_RANGE)))
+        new_pos = int(round(self._offset_s / self._step_s)
+                      ) if self._step_s > 0 else 0
+        self._slider.setValue(
+            int(np.clip(new_pos, -SLIDER_RANGE, SLIDER_RANGE)))
         self._updating = False
 
     def _on_freq_changed(self, index: int) -> None:
@@ -355,12 +362,14 @@ class RmsConverterDock(QDockWidget):
         )
 
         # ── State ────────────────────────────────────────────────────────────
-        self._files:        dict[str, _LoadedFile]  = {}  # file_id → _LoadedFile
-        self._file_counter: int                      = 0
-        self._offsets:      dict[str, float]        = {}  # file_id → offset_s
-        self._tolerance_s:  float                   = DEFAULT_TOLERANCE_S
-        self._merge_result: Optional[MergeResult]   = None
-        self._col_names:    dict[tuple[str, int], str] = {}  # (file_id, ch_id) → display name
+        # file_id → _LoadedFile
+        self._files:        dict[str, _LoadedFile] = {}
+        self._file_counter: int = 0
+        self._offsets:      dict[str, float] = {}  # file_id → offset_s
+        self._tolerance_s:  float = DEFAULT_TOLERANCE_S
+        self._merge_result: Optional[MergeResult] = None
+        # (file_id, ch_id) → display name
+        self._col_names:    dict[tuple[str, int], str] = {}
         self._waveform_curves: dict[tuple[str, int], pg.PlotDataItem] = {}
         # (file_id, ch_id) → 'left' | 'right'  — axis assignment per channel
         self._axis_assignment: dict[tuple[str, int], str] = {}
@@ -369,18 +378,18 @@ class RmsConverterDock(QDockWidget):
         # (file_id, ch_id) → base voltage in kV (0.0 = not set)
         self._base_kv: dict[tuple[str, int], float] = {}
         # Secondary ViewBox and axis — initialised in _build_right_panel
-        self._vb2:        Optional[pg.ViewBox]  = None
+        self._vb2:        Optional[pg.ViewBox] = None
         self._right_axis: Optional[pg.AxisItem] = None
         # Crosshair cursor state — initialised in _build_right_panel
         self._cursor1_enabled: bool = False
         self._cursor2_enabled: bool = False
-        self._cursor1: Optional[pg.InfiniteLine]  = None
-        self._cursor2: Optional[pg.InfiniteLine]  = None
-        self._readout: Optional[_DraggableLabel]  = None
-        self._readout_pinned: bool                = False   # True once user drags it
+        self._cursor1: Optional[pg.InfiniteLine] = None
+        self._cursor2: Optional[pg.InfiniteLine] = None
+        self._readout: Optional[_DraggableLabel] = None
+        self._readout_pinned: bool = False   # True once user drags it
         # Snapshot of last rendered data for cursor value lookup
-        self._t_rel:         Optional[np.ndarray]        = None
-        self._rms_channels:  list[RmsChannelData]        = []
+        self._t_rel:         Optional[np.ndarray] = None
+        self._rms_channels:  list[RmsChannelData] = []
 
         # Debounce timer for slider → re-merge
         self._merge_timer = QTimer(self)
@@ -473,14 +482,16 @@ class RmsConverterDock(QDockWidget):
         layout.setSpacing(0)
 
         hdr = QLabel(' Files & Channels')
-        hdr.setStyleSheet('background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;')
+        hdr.setStyleSheet(
+            'background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;')
         layout.addWidget(hdr)
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(False)
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(['Channel', 'Base kV'])
-        self._tree.setStyleSheet('background: #252525; color: #DDDDDD; font-size: 8pt;')
+        self._tree.setStyleSheet(
+            'background: #252525; color: #DDDDDD; font-size: 8pt;')
         self._tree.header().setStretchLastSection(False)
         self._tree.header().setSectionResizeMode(
             TREE_COL_NAME, QHeaderView.ResizeMode.Stretch
@@ -491,7 +502,8 @@ class RmsConverterDock(QDockWidget):
         self._tree.header().resizeSection(TREE_COL_BASE, 76)
         self._tree.itemChanged.connect(self._on_tree_item_changed)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
+        self._tree.customContextMenuRequested.connect(
+            self._on_tree_context_menu)
         layout.addWidget(self._tree)
         return panel
 
@@ -566,7 +578,8 @@ class RmsConverterDock(QDockWidget):
         self._readout.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
         )
-        self._readout.user_moved.connect(lambda: setattr(self, '_readout_pinned', True))
+        self._readout.user_moved.connect(
+            lambda: setattr(self, '_readout_pinned', True))
         self._readout.hide()
 
         # Reposition overlay whenever the waveform widget is resized
@@ -585,7 +598,8 @@ class RmsConverterDock(QDockWidget):
             'QHeaderView::section { background: #3A3A3A; color: #CCCCCC; }'
             'QTableWidget::item:alternate { background: #252525; }'
         )
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.horizontalHeader().setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
@@ -600,7 +614,8 @@ class RmsConverterDock(QDockWidget):
 
         # Offset strip (scrollable, one row per file)
         offset_hdr = QLabel(' Time Offset Controls')
-        offset_hdr.setStyleSheet('background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;')
+        offset_hdr.setStyleSheet(
+            'background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;')
         layout.addWidget(offset_hdr)
 
         self._offset_scroll = QScrollArea()
@@ -636,7 +651,8 @@ class RmsConverterDock(QDockWidget):
         layout.addWidget(self._make_separator())
 
         self._nan_label = QLabel('No data')
-        self._nan_label.setStyleSheet(f'color: {NAN_OK_COLOUR}; font-size: 8pt;')
+        self._nan_label.setStyleSheet(
+            f'color: {NAN_OK_COLOUR}; font-size: 8pt;')
         layout.addWidget(self._nan_label)
 
         layout.addStretch()
@@ -732,7 +748,8 @@ class RmsConverterDock(QDockWidget):
             loaded: The _LoadedFile to add to the tree.
         """
         file_item = QTreeWidgetItem([f'📄 {loaded.path.stem}'])
-        file_item.setData(TREE_COL_NAME, Qt.ItemDataRole.UserRole, loaded.file_id)
+        file_item.setData(
+            TREE_COL_NAME, Qt.ItemDataRole.UserRole, loaded.file_id)
         file_item.setFlags(
             file_item.flags()
             | Qt.ItemFlag.ItemIsAutoTristate
@@ -742,10 +759,13 @@ class RmsConverterDock(QDockWidget):
 
         self._tree.blockSignals(True)
         for ch in loaded.record.analogue_channels:
-            axis = self._axis_assignment.get((loaded.file_id, ch.channel_id), 'left')
+            axis = self._axis_assignment.get(
+                (loaded.file_id, ch.channel_id), 'left')
             axis_tag = '[R]' if axis == 'right' else '[L]'
-            ch_item = QTreeWidgetItem([f'  {axis_tag} {ch.name}  [{ch.unit or "—"}]', ''])
-            ch_item.setData(TREE_COL_NAME, Qt.ItemDataRole.UserRole, ch.channel_id)
+            ch_item = QTreeWidgetItem(
+                [f'  {axis_tag} {ch.name}  [{ch.unit or "—"}]', ''])
+            ch_item.setData(
+                TREE_COL_NAME, Qt.ItemDataRole.UserRole, ch.channel_id)
             ch_item.setFlags(ch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             ch_item.setCheckState(
                 TREE_COL_NAME,
@@ -763,7 +783,8 @@ class RmsConverterDock(QDockWidget):
                 spin.setSpecialValueText('—')   # 0.0 → "—" means "not set"
                 spin.setFixedWidth(74)
                 spin.setStyleSheet('font-size: 7pt;')
-                spin.setValue(self._base_kv.get((loaded.file_id, ch.channel_id), 0.0))
+                spin.setValue(self._base_kv.get(
+                    (loaded.file_id, ch.channel_id), 0.0))
                 spin.valueChanged.connect(
                     lambda v, fid=loaded.file_id, cid=ch.channel_id:
                         self._on_base_kv_changed(fid, cid, v)
@@ -788,8 +809,8 @@ class RmsConverterDock(QDockWidget):
             return  # file-level item (tristate handled by Qt automatically)
 
         file_id = parent.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-        ch_id   = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-        loaded  = self._files.get(file_id)
+        ch_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+        loaded = self._files.get(file_id)
         if loaded is None or ch_id is None:
             return
 
@@ -812,17 +833,17 @@ class RmsConverterDock(QDockWidget):
             return   # clicked on a file item or empty space
 
         file_item = item.parent()
-        file_id   = file_item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-        ch_id     = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+        file_id = file_item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+        ch_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
         if file_id is None or ch_id is None:
             return
 
-        key     = (file_id, ch_id)
+        key = (file_id, ch_id)
         current = self._axis_assignment.get(key, 'left')
 
         from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
         menu = QMenu(self)
-        left_action  = menu.addAction('→ Left Axis  (Voltage)')
+        left_action = menu.addAction('→ Left Axis  (Voltage)')
         right_action = menu.addAction('→ Right Axis (Current)')
         left_action.setCheckable(True)
         right_action.setCheckable(True)
@@ -993,17 +1014,19 @@ class RmsConverterDock(QDockWidget):
 
         # Snapshot required info before handing to thread (avoid cross-thread record access)
         for loaded in files_to_compute:
-            file_id       = loaded.file_id
-            record        = loaded.record
-            selected_ids  = list(loaded.selected_ids)
-            nominal_freq  = loaded.nominal_freq
+            file_id = loaded.file_id
+            record = loaded.record
+            selected_ids = list(loaded.selected_ids)
+            nominal_freq = loaded.nominal_freq
 
             run_in_thread(
                 lambda r=record, ids=selected_ids, freq=nominal_freq: (
                     compute_rms_for_record(r, ids, freq)
                 ),
-                on_done=lambda results, fid=file_id: self._on_rms_done(fid, results),
-                on_error=lambda exc: QMessageBox.critical(self, 'RMS Error', str(exc)),
+                on_done=lambda results, fid=file_id: self._on_rms_done(
+                    fid, results),
+                on_error=lambda exc: QMessageBox.critical(
+                    self, 'RMS Error', str(exc)),
             )
 
     def _on_rms_done(
@@ -1067,8 +1090,9 @@ class RmsConverterDock(QDockWidget):
         if len(result.t_common) == 0:
             return
 
-        t_rel = result.t_common - result.t_common[0]   # relative seconds from first point
-        self._t_rel        = t_rel
+        # relative seconds from first point
+        t_rel = result.t_common - result.t_common[0]
+        self._t_rel = t_rel
         self._rms_channels = list(channels)
 
         left_label = 'Voltage (PU)' if self._pu_mode else 'Voltage'
@@ -1076,14 +1100,16 @@ class RmsConverterDock(QDockWidget):
 
         has_right = False
         for col_idx, rms_ch in enumerate(channels):
-            colour = self._get_channel_colour(rms_ch.file_id, rms_ch.channel_id)
-            mask   = ~np.isnan(result.data_2d[:, col_idx])
+            colour = self._get_channel_colour(
+                rms_ch.file_id, rms_ch.channel_id)
+            mask = ~np.isnan(result.data_2d[:, col_idx])
             if not np.any(mask):
                 continue
 
             y_data = result.data_2d[mask, col_idx].copy()
             if self._pu_mode:
-                divisor = self._get_pu_divisor(rms_ch.file_id, rms_ch.channel_id)
+                divisor = self._get_pu_divisor(
+                    rms_ch.file_id, rms_ch.channel_id)
                 if divisor > 0.0:
                     y_data = y_data / divisor
 
@@ -1109,6 +1135,12 @@ class RmsConverterDock(QDockWidget):
         if self._right_axis is not None:
             self._right_axis.setVisible(has_right)
 
+        # PU mode default Y range: 0 … +1.5 pu for voltage left axis
+        if self._pu_mode:
+            self._plot.setYRange(0.0, 1.5, padding=0)
+        else:
+            self._plot.enableAutoRange(axis='y', enable=True)
+
         self._sync_vb2()
         self._update_readout()
 
@@ -1129,7 +1161,8 @@ class RmsConverterDock(QDockWidget):
         pu_divisors: list[float] = []
         for rms_ch in channels:
             if self._pu_mode:
-                pu_divisors.append(self._get_pu_divisor(rms_ch.file_id, rms_ch.channel_id))
+                pu_divisors.append(self._get_pu_divisor(
+                    rms_ch.file_id, rms_ch.channel_id))
             else:
                 pu_divisors.append(0.0)
 
@@ -1142,7 +1175,8 @@ class RmsConverterDock(QDockWidget):
             headers = ['Time'] + result.col_names
             self._table.setHorizontalHeaderLabels(headers)
 
-            time_strs = format_time_column(result.t_common, result.has_timestamps)
+            time_strs = format_time_column(
+                result.t_common, result.has_timestamps)
 
             for row in range(n_rows):
                 t_item = QTableWidgetItem(time_strs[row])
@@ -1181,10 +1215,13 @@ class RmsConverterDock(QDockWidget):
         n_nan = len(result.nan_cells)
         if n_nan == 0:
             self._nan_label.setText('No missing values')
-            self._nan_label.setStyleSheet(f'color: {NAN_OK_COLOUR}; font-size: 8pt;')
+            self._nan_label.setStyleSheet(
+                f'color: {NAN_OK_COLOUR}; font-size: 8pt;')
         else:
-            self._nan_label.setText(f'⚠ {n_nan} missing cell{"s" if n_nan > 1 else ""}')
-            self._nan_label.setStyleSheet(f'color: {NAN_WARN_COLOUR}; font-size: 8pt;')
+            self._nan_label.setText(
+                f'⚠ {n_nan} missing cell{"s" if n_nan > 1 else ""}')
+            self._nan_label.setStyleSheet(
+                f'color: {NAN_WARN_COLOUR}; font-size: 8pt;')
 
     # ── Header rename ─────────────────────────────────────────────────────────
 
@@ -1204,7 +1241,8 @@ class RmsConverterDock(QDockWidget):
             self, 'Rename Column', 'New column name:', text=current.text()
         )
         if ok and name.strip():
-            self._table.setHorizontalHeaderItem(col, QTableWidgetItem(name.strip()))
+            self._table.setHorizontalHeaderItem(
+                col, QTableWidgetItem(name.strip()))
             # Update col_names in merge result and _col_names map
             if self._merge_result and col - 1 < len(self._merge_result.col_names):
                 self._merge_result.col_names[col - 1] = name.strip()
@@ -1278,7 +1316,7 @@ class RmsConverterDock(QDockWidget):
         result = self._merge_result
         assert result is not None
         time_strs = format_time_column(result.t_common, result.has_timestamps)
-        headers   = self._collect_current_headers()
+        headers = self._collect_current_headers()
 
         try:
             with path.open('w', newline='', encoding='utf-8') as f:
@@ -1290,7 +1328,8 @@ class RmsConverterDock(QDockWidget):
                         val = result.data_2d[row_idx, col_idx]
                         row_data.append('' if np.isnan(val) else f'{val:.4f}')
                     writer.writerow(row_data)
-            QMessageBox.information(self, 'Export Complete', f'Saved to:\n{path}')
+            QMessageBox.information(
+                self, 'Export Complete', f'Saved to:\n{path}')
         except OSError as exc:
             QMessageBox.critical(self, 'Export Error', str(exc))
 
@@ -1313,7 +1352,7 @@ class RmsConverterDock(QDockWidget):
         result = self._merge_result
         assert result is not None
         time_strs = format_time_column(result.t_common, result.has_timestamps)
-        headers   = self._collect_current_headers()
+        headers = self._collect_current_headers()
 
         try:
             wb = openpyxl.Workbook()
@@ -1324,10 +1363,12 @@ class RmsConverterDock(QDockWidget):
                 row_data = [t_str]
                 for col_idx in range(result.data_2d.shape[1]):
                     val = result.data_2d[row_idx, col_idx]
-                    row_data.append(None if np.isnan(val) else round(float(val), 4))
+                    row_data.append(None if np.isnan(
+                        val) else round(float(val), 4))
                 ws.append(row_data)
             wb.save(path)
-            QMessageBox.information(self, 'Export Complete', f'Saved to:\n{path}')
+            QMessageBox.information(
+                self, 'Export Complete', f'Saved to:\n{path}')
         except OSError as exc:
             QMessageBox.critical(self, 'Export Error', str(exc))
 
@@ -1418,7 +1459,8 @@ class RmsConverterDock(QDockWidget):
                     val_str = '---'
                 else:
                     if self._pu_mode:
-                        div = self._get_pu_divisor(rms_ch.file_id, rms_ch.channel_id)
+                        div = self._get_pu_divisor(
+                            rms_ch.file_id, rms_ch.channel_id)
                         if div > 0.0:
                             val = val / div
                     val_str = f'{val:.4f}'
@@ -1444,7 +1486,7 @@ class RmsConverterDock(QDockWidget):
         """
         if self._readout is None or not self._readout.isVisible():
             return
-        m  = READOUT_MARGIN
+        m = READOUT_MARGIN
         pw = self._waveform.width()
         ph = self._waveform.height()
         rw = self._readout.width()

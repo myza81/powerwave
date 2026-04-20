@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QScrollArea,
+    QTabWidget,
     QToolBar,
     QWidget,
 )
@@ -56,6 +57,7 @@ from engine.decimator import prepare_display_data
 from ui.channel_canvas import ChannelCanvas
 from ui.measurement_panel import MeasurementPanel
 from ui.rms_converter_dock import RmsConverterDock
+from ui.unified_canvas import UnifiedCanvasWidget
 from ui.waveform_panel import LabelPanel
 
 # ── Module constants ──────────────────────────────────────────────────────────
@@ -106,15 +108,15 @@ class MainWindow(QMainWindow):
     # ── Layout setup ──────────────────────────────────────────────────────────
 
     def _setup_central_widget(self) -> None:
-        """Create the combined LabelPanel + ChannelCanvas scroll view.
+        """Create the tab widget with Waveform and Unified Canvas tabs.
 
-        Both widgets sit side-by-side inside a single QScrollArea so
-        vertical scrolling keeps them perfectly synchronised.
+        Tab 0 — Waveform: original LabelPanel + ChannelCanvas scroll view.
+        Tab 1 — Unified Canvas: multi-file, multi-stack overlay view.
         """
         self._label_panel = LabelPanel()
         self._canvas = ChannelCanvas()
 
-        # Horizontal container — no margins, no spacing
+        # ── Tab 0: Waveform ───────────────────────────────────────────────────
         container = QWidget()
         h_layout = QHBoxLayout(container)
         h_layout.setContentsMargins(0, 0, 0, 0)
@@ -131,7 +133,15 @@ class MainWindow(QMainWindow):
         scroll_area.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
-        self.setCentralWidget(scroll_area)
+
+        # ── Tab 1: Unified Canvas ─────────────────────────────────────────────
+        self._unified_canvas = UnifiedCanvasWidget()
+
+        # ── Tab widget ────────────────────────────────────────────────────────
+        tabs = QTabWidget()
+        tabs.addTab(scroll_area, 'Waveform')
+        tabs.addTab(self._unified_canvas, 'Unified Canvas')
+        self.setCentralWidget(tabs)
 
     def _setup_menu(self) -> None:
         """Build the File and Tools menus."""
