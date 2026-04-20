@@ -3,15 +3,32 @@
 ## ── CURRENT SESSION ────────────────────────────────────────────────────────
 
 Phase: Phase 2
-Milestone: Milestone 2B — RMS Converter Feature
+Milestone: Milestone 2C — Unified Canvas Tab
 Modules:
-  src/engine/rms_calculator.py   (NEW — cycle-by-cycle RMS computation)
-  src/engine/rms_merger.py       (NEW — nearest-neighbour multi-file time join)
-  src/ui/rms_converter_dock.py   (NEW — standalone RMS Converter dock)
-  src/main.py                    (MODIFIED — Tools menu, RMS dock wired up)
-  src/ui/waveform_panel.py       (MODIFIED — Y-axis scroll scaling per channel row)
-  src/ui/channel_canvas.py       (MODIFIED — scale_y_channel / reset_y_channel)
-Status: IN PROGRESS — core implemented, pending live UI test
+src/ui/unified_canvas.py (NEW — multi-file multi-stack analogue canvas tab)
+src/main.py (MODIFIED — QTabWidget: Waveform tab + Unified Canvas tab)
+src/ui/rms_converter_dock.py (MODIFIED — PU mode Y-range default ±2.0 pu)
+Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested
+
+Unified Canvas features implemented:
+
+- Independent file loading (same parsers as RMS Converter)
+- Multi-stack canvas (Voltage/Current, Freq/Power, DC Field, Mechanical, Generic)
+- Shared X-axis across all stacks via pg.setXLink star topology
+- Secondary ViewBox per stack for dual Y-axes (left=voltage/freq, right=current/power)
+- Per-channel Raw / RMS / Value (locked) mode toggle in file tree
+- RMS auto-computed on first toggle (background thread, cached per channel)
+- Per-file time offset strip (same slider design as RMS Converter)
+- PU mode for voltage channels with per-channel base kV spinbox
+- Dual vertical cursors (C1 gold, C2 cyan) — right-click to enable/disable
+- Cursors sync across all stacks; draggable readout overlay shows values + ΔX
+- Phasor Display button → floating moveable QDialog (value table + arrow canvas)
+- ViewBox X-link unlink fix before glw.clear() — prevents "wrapped C++ deleted" crash
+
+Pending / deferred:
+
+- Phasor live data hookup (cursor → angle/magnitude from PMU or phasor calculator)
+- Viewport-aware re-decimation on zoom (currently full-record fixed 2000-pt)
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 
@@ -434,9 +451,9 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 
 # Wheel on label row → scale_y_channel(); double-click → reset_y_channel().
 
-# _AnalogueRow class in waveform_panel.py; signals wired via main.py.
+# \_AnalogueRow class in waveform_panel.py; signals wired via main.py.
 
-# ✓ 2B (in progress) — RMS Converter dock:
+# ✓ 2B — RMS Converter dock:
 
 # engine/rms_calculator.py — cycle-by-cycle RMS (numpy, no Pandas)
 
@@ -444,9 +461,19 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 
 # ui/rms_converter_dock.py — standalone dock: file tree, waveform, table,
 
-#   per-file offset slider+buttons, tolerance control, CSV/Excel export
+# per-file offset slider+buttons, tolerance control, CSV/Excel export
+
+# dual cursors (C1 gold / C2 cyan), draggable readout, PU mode ±2.0 default
 
 # Tools > RMS Converter (Ctrl+R) wired in main.py
+
+# ✓ 2C (in progress) — Unified Canvas tab:
+
+# ui/unified_canvas.py — QTabWidget tab alongside Waveform; independent file
+
+# loading; multi-stack canvas (5 stacks, dual Y-axes); Raw/RMS/Value toggle;
+
+# per-file offset; PU mode; dual cursors + draggable readout; Phasor dialog
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
