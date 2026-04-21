@@ -996,6 +996,29 @@ class UnifiedCanvasWidget(QWidget):
         """
         parent = item.parent()
         if parent is None:
+            # File-level checkbox: propagate to all children in one pass to
+            # avoid N separate _rebuild_canvas calls (one per child signal).
+            file_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+            loaded = self._files.get(file_id)
+            if loaded is None:
+                return
+            state = item.checkState(TREE_COL_NAME)
+            self._tree.blockSignals(True)
+            if state == Qt.CheckState.Checked:
+                loaded.selected_ids = {
+                    ch.channel_id for ch in loaded.record.analogue_channels
+                }
+                for i in range(item.childCount()):
+                    item.child(i).setCheckState(TREE_COL_NAME, Qt.CheckState.Checked)
+            elif state == Qt.CheckState.Unchecked:
+                loaded.selected_ids.clear()
+                for i in range(item.childCount()):
+                    item.child(i).setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+            # PartiallyChecked is set automatically by ItemIsAutoTristate when
+            # individual children change — selected_ids already updated by the
+            # per-child path below, nothing more to do here.
+            self._tree.blockSignals(False)
+            self._rebuild_canvas()
             return
 
         file_id = parent.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
@@ -1176,9 +1199,18 @@ class UnifiedCanvasWidget(QWidget):
         # Break all X-links before destroying the scene.  PyQtGraph does not
         # disconnect these itself and a pending resize event after clear() will
         # call screenGeometry() on the already-deleted C++ ViewBox objects.
+        # vb2 items are added directly to the scene (not to the GLW layout),
+        # so glw.clear() does NOT remove them — must be removed explicitly or
+        # they persist as ghost ViewBoxes with stale curves still visible.
         for vb2 in self._stack_vb2s.values():
             try:
                 vb2.setXLink(None)
+            except RuntimeError:
+                pass
+            try:
+                s = vb2.scene()
+                if s is not None:
+                    s.removeItem(vb2)
             except RuntimeError:
                 pass
         for plot in self._stack_plots.values():
@@ -1197,6 +1229,7 @@ class UnifiedCanvasWidget(QWidget):
 
         active = sorted(self._get_active_stacks())
         if not active:
+            self._update_readout()
             return
 
         ref_plot: Optional[pg.PlotItem] = None
@@ -1278,6 +1311,7 @@ class UnifiedCanvasWidget(QWidget):
 
         self._ref_plot = ref_plot
         self._plot_all_channels()
+        self._update_readout()
 
     def _get_active_stacks(self) -> set[int]:
         """Return stack indices that have at least one checked channel.

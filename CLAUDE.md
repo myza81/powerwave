@@ -8,7 +8,7 @@ Modules:
 src/ui/unified_canvas.py (NEW — multi-file multi-stack analogue canvas tab)
 src/main.py (MODIFIED — QTabWidget: Waveform tab + Unified Canvas tab)
 src/ui/rms_converter_dock.py (MODIFIED — PU mode Y-range default ±2.0 pu)
-Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested
+Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, 3 bugs fixed
 
 Unified Canvas features implemented:
 
@@ -24,6 +24,12 @@ Unified Canvas features implemented:
 - Cursors sync across all stacks; draggable readout overlay shows values + ΔX
 - Phasor Display button → floating moveable QDialog (value table + arrow canvas)
 - ViewBox X-link unlink fix before glw.clear() — prevents "wrapped C++ deleted" crash
+- BUG FIX: vb2 (secondary ViewBox) now explicitly removed from scene before glw.clear()
+  — was persisting as ghost with stale curves, visible as smaller residual waveforms
+- BUG FIX: file-level checkbox now handles selected_ids in one pass (blockSignals) —
+  was triggering N separate _rebuild_canvas calls (one per child), each leaving a ghost vb2
+- BUG FIX: _rebuild_canvas now calls _update_readout() on both the early-return (no active
+  stacks) and normal paths — readout overlay now hides immediately when file is removed
 
 Pending / deferred:
 
