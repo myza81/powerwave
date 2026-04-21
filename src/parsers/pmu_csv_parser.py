@@ -134,6 +134,93 @@ class PmuCsvParser:
             record = PmuCsvParser().load(path)
     """
 
+    def load_with_report(
+        self, filepath: Path
+    ) -> 'tuple[DisturbanceRecord, object]':
+        """Load a PMU CSV file and return (DisturbanceRecord, ParseInspectionReport).
+
+        Performs the same parse as ``load()``, then runs a lightweight second
+        pass over the column headers to collect prefix and scaling metadata for
+        the validator.
+
+        Args:
+            filepath: Path to the PMU CSV file.
+
+        Returns:
+            Tuple of (DisturbanceRecord, ParseInspectionReport).
+        """
+        from parsers.pmu_import_validator import build_report  # noqa: PLC0415
+
+        filepath = Path(filepath)
+        record = self.load(filepath)
+
+        # ── Collect metadata for the validator ───────────────────────────────
+        raw_first = self._read_first_line(filepath)
+        pmu_id, station_name = self._parse_metadata(raw_first, filepath)
+
+        # Read just the header row + first data row for analysis
+        try:
+            df_probe = pd.read_csv(
+                filepath, skiprows=1, nrows=1, dtype=str, encoding='utf-8-sig'
+            )
+            df_probe.columns = [str(c).strip() for c in df_probe.columns]
+        except Exception:
+            df_probe = pd.DataFrame()
+
+        date_col = self._find_date_column(df_probe) if not df_probe.empty else None
+        time_col = self._find_time_column(df_probe) if not df_probe.empty else None
+
+        first_date_str = ''
+        first_time_str = ''
+        if date_col and not df_probe.empty and date_col in df_probe.columns:
+            first_date_str = str(df_probe[date_col].iloc[0]).strip()
+        if time_col and not df_probe.empty and time_col in df_probe.columns:
+            first_time_str = str(df_probe[time_col].iloc[0]).strip()
+
+        # Identify stripped prefixes from column headers
+        skip_set: set[str] = set()
+        if date_col:
+            skip_set.add(date_col)
+        if time_col:
+            skip_set.add(time_col)
+
+        stripped_prefixes: list[str] = []
+        for col in df_probe.columns:
+            if col in skip_set:
+                continue
+            col_lower = col.strip().lower()
+            if any(kw in col_lower for kw in _SKIP_KEYWORDS):
+                continue
+            core = self._strip_prefix(col)
+            if core.strip() != col.strip():
+                # Everything before the separator character is the prefix
+                sep_pos = col.strip().find(core.strip())
+                if sep_pos > 0:
+                    stripped_prefixes.append(col.strip()[:sep_pos].rstrip('_*'))
+
+        voltage_scaled = any(
+            ch.unit in ('kV', 'kA') for ch in record.analogue_channels
+        )
+
+        # GPS quality from the stored header text
+        gps_quality = 'UNKNOWN'
+        if 'GPS: OK' in record.header_text:
+            gps_quality = 'OK'
+        elif 'GPS: LOW' in record.header_text:
+            gps_quality = 'LOW (GPS fault)'
+
+        report = build_report(
+            station_name=station_name,
+            pmu_id=pmu_id,
+            filepath=filepath,
+            gps_quality=gps_quality,
+            first_date_str=first_date_str,
+            first_time_str=first_time_str,
+            stripped_prefixes=stripped_prefixes,
+            voltage_scaled=voltage_scaled,
+        )
+        return record, report
+
     def load(self, filepath: Path) -> DisturbanceRecord:
         """Load a PMU CSV file and return a populated DisturbanceRecord.
 

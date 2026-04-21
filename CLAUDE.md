@@ -8,7 +8,7 @@ Modules:
 src/ui/unified_canvas.py (NEW — multi-file multi-stack analogue canvas tab)
 src/main.py (MODIFIED — QTabWidget: Waveform tab + Unified Canvas tab)
 src/ui/rms_converter_dock.py (MODIFIED — PU mode Y-range default ±2.0 pu)
-Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, 3 bugs fixed
+Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, 3 UI bugs fixed, PMU time-sync implemented
 
 Unified Canvas features implemented:
 
@@ -31,10 +31,18 @@ Unified Canvas features implemented:
 - BUG FIX: _rebuild_canvas now calls _update_readout() on both the early-return (no active
   stacks) and normal paths — readout overlay now hides immediately when file is removed
 
+PMU time-sync implemented (3 mechanisms):
+- parsers/pmu_import_validator.py (NEW) — pure-logic validator, IssueKind/IssueSeverity/ParseInspectionReport
+- ui/pmu_import_dialog.py (NEW) — PmuImportDialog (import-time anchor) + SetStartTimeDialog (post-load fix)
+- pmu_csv_parser.py: added load_with_report() → (DisturbanceRecord, ParseInspectionReport)
+- unified_canvas.py: dialog wired in _on_file_parsed; right-click file → Set Start Time / Auto-align from Frequency;
+  _xcorr_freq_lag() FFT cross-correlation; _LoadedFile.timestamp_ok flag
+
 Pending / deferred:
 
 - Phasor live data hookup (cursor → angle/magnitude from PMU or phasor calculator)
 - Viewport-aware re-decimation on zoom (currently full-record fixed 2000-pt)
+- PMU import profile save/recall (remember checkbox wired to UI but not yet persisted)
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 

@@ -72,11 +72,12 @@ from engine.decimator import decimate_minmax, decimate_uniform
 from engine.rms_calculator import compute_cycle_rms
 from engine.rms_merger import start_epoch_from_datetime
 from models.channel import SignalRole
-from models.disturbance_record import DisturbanceRecord
+from models.disturbance_record import DisturbanceRecord, SourceFormat
 from parsers.comtrade_parser import ComtradeParser
 from parsers.csv_parser import CsvParser
 from parsers.excel_parser import ExcelParser
 from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
+from ui.pmu_import_dialog import PmuImportDialog, SetStartTimeDialog
 
 # ── Module constants ───────────────────────────────────────────────────────────
 
@@ -87,8 +88,9 @@ DEFAULT_STEP_MS:     float = 10.0
 CANVAS_BG:           str   = '#1E1E1E'
 MAX_DISPLAY_PTS:     int   = 2000      # LAW 3 — never render > 4000 pts/channel
 
-CURSOR1_COLOUR: str = '#FFD700'        # gold
-CURSOR2_COLOUR: str = '#00E5FF'        # cyan
+CURSOR1_COLOUR:  str   = '#FFD700'     # gold
+CURSOR2_COLOUR:  str   = '#00E5FF'     # cyan
+PMU_SAMPLE_RATE: float = 50.0          # Hz — used for xcorr lag conversion
 READOUT_MARGIN: int = 8                # px from edge of GLW widget
 
 SQRT3: float = 1.7320508075688772      # √3 for phase-to-earth PU conversion
@@ -251,13 +253,15 @@ class _LoadedFile:
     """Runtime state for one file loaded into the Unified Canvas.
 
     Attributes:
-        file_id:      Unique string key (sequential integer as string).
-        path:         Absolute path to the source file.
-        record:       Parsed DisturbanceRecord.
-        nominal_freq: Active nominal frequency used for RMS computation (Hz).
-        selected_ids: Set of analogue channel_ids currently checked in the tree.
-        start_epoch:  POSIX epoch float for record.start_time (UTC).
-        tree_item:    The top-level QTreeWidgetItem for this file.
+        file_id:       Unique string key (sequential integer as string).
+        path:          Absolute path to the source file.
+        record:        Parsed DisturbanceRecord.
+        nominal_freq:  Active nominal frequency used for RMS computation (Hz).
+        selected_ids:  Set of analogue channel_ids currently checked in the tree.
+        start_epoch:   POSIX epoch float for record.start_time (UTC).
+        timestamp_ok:  False when the file had a broken timestamp and the user
+                       has not yet provided a corrected start time.
+        tree_item:     The top-level QTreeWidgetItem for this file.
     """
     file_id:      str
     path:         Path
@@ -265,6 +269,7 @@ class _LoadedFile:
     nominal_freq: float
     selected_ids: set[int]            = field(default_factory=set)
     start_epoch:  float               = 0.0
+    timestamp_ok: bool                = True
     tree_item:    Optional[object]    = field(default=None, repr=False)
 
 
@@ -549,6 +554,42 @@ class PhasorDialog(QDialog):
         self._canvas.set_phasors(phasors)
 
 
+# ── Frequency cross-correlation helper (module level — runs on worker thread) ──
+
+def _xcorr_freq_lag(
+    target_freq: np.ndarray,
+    ref_freq:    np.ndarray,
+) -> float:
+    """Return the time lag (seconds) of target_freq relative to ref_freq.
+
+    Uses FFT-based cross-correlation (scipy) for speed.  Both arrays are
+    de-meaned so that slow DC drift does not dominate the peak.
+
+    Positive return value means target_freq starts AFTER ref_freq
+    (i.e. to align, shift target forward by lag_s).
+    Negative return value means target_freq starts BEFORE ref_freq.
+
+    Args:
+        target_freq: Raw Frequency channel array from the file to align.
+        ref_freq:    Raw Frequency channel array from the reference file.
+
+    Returns:
+        Lag in seconds at PMU_SAMPLE_RATE (50 fps → 0.020 s resolution).
+    """
+    from scipy.signal import correlate  # noqa: PLC0415
+
+    # Trim to same length and de-mean
+    n = min(len(target_freq), len(ref_freq))
+    a = ref_freq[:n]    - ref_freq[:n].mean()
+    b = target_freq[:n] - target_freq[:n].mean()
+
+    corr = correlate(a, b, mode='full', method='fft')
+    # correlate(ref, target): peak at index n-1-k when target lags ref by k.
+    # Negate to get lag as "target is k samples AFTER ref".
+    lag_samples = (n - 1) - int(np.argmax(corr))
+    return float(lag_samples) / PMU_SAMPLE_RATE
+
+
 # ── Main widget ────────────────────────────────────────────────────────────────
 
 class UnifiedCanvasWidget(QWidget):
@@ -785,20 +826,30 @@ class UnifiedCanvasWidget(QWidget):
                 ),
             )
 
-    def _parse_file(self, path: Path) -> _LoadedFile:
-        """Parse one file and return a _LoadedFile (runs on background thread).
+    def _parse_file(
+        self, path: Path
+    ) -> tuple[_LoadedFile, object]:
+        """Parse one file and return (_LoadedFile, report) (background thread).
+
+        For PMU CSV files, also runs the import validator and returns a
+        ParseInspectionReport.  For all other formats, the report is None.
 
         Args:
             path: Path to the file to parse.
 
         Returns:
-            _LoadedFile with record populated and all analogue channels selected.
+            (loaded, report) where report is a ParseInspectionReport or None.
         """
         ext = path.suffix.lower()
+        report = None
+
         if ext in _COMTRADE_EXT:
             record = ComtradeParser().load(path)
         elif ext in _CSV_EXT:
-            record = PmuCsvParser().load(path) if is_pmu_csv(path) else CsvParser().load(path)
+            if is_pmu_csv(path):
+                record, report = PmuCsvParser().load_with_report(path)
+            else:
+                record = CsvParser().load(path)
         elif ext in _EXCEL_EXT:
             record = ExcelParser().load(path)
         else:
@@ -807,21 +858,37 @@ class UnifiedCanvasWidget(QWidget):
         file_id = str(self._file_counter)
         self._file_counter += 1
 
-        return _LoadedFile(
+        loaded = _LoadedFile(
             file_id=file_id,
             path=path,
             record=record,
             nominal_freq=50.0,
             selected_ids={ch.channel_id for ch in record.analogue_channels},
             start_epoch=start_epoch_from_datetime(record.start_time),
+            timestamp_ok=(report is None or not report.has_blockers),
         )
+        return loaded, report
 
-    def _on_file_parsed(self, loaded: _LoadedFile) -> None:
-        """Integrate a freshly parsed file into UI state (runs on UI thread).
+    def _on_file_parsed(self, result: tuple) -> None:
+        """Integrate a freshly parsed file into UI state (UI thread).
+
+        Shows PmuImportDialog when the report contains BLOCKER issues.
+        Applies any user-provided start-time anchor before integrating.
 
         Args:
-            loaded: The _LoadedFile returned by the background parser.
+            result: (loaded, report) tuple from _parse_file.
         """
+        loaded, report = result
+
+        # ── Show import dialog for PMU files with broken timestamps ───────────
+        if report is not None and report.has_blockers:
+            hints = self._build_time_hints(report.first_date_str)
+            dlg = PmuImportDialog(report, hints, parent=self)
+            if dlg.exec() and dlg.anchor_utc is not None:
+                loaded.start_epoch = start_epoch_from_datetime(dlg.anchor_utc)
+                loaded.timestamp_ok = True
+
+        # ── Integrate into state ──────────────────────────────────────────────
         self._files[loaded.file_id] = loaded
         self._offsets[loaded.file_id] = 0.0
 
@@ -835,6 +902,32 @@ class UnifiedCanvasWidget(QWidget):
         self._add_tree_item(loaded)
         self._add_offset_row(loaded)
         self._rebuild_canvas()
+
+    def _build_time_hints(self, date_str: str) -> list[tuple[str, str]]:
+        """Return (filename, time_str) hints for already-loaded files.
+
+        Used to populate the hint section of PmuImportDialog so the user can
+        see what times other files on the same date were recorded.
+
+        Args:
+            date_str: Date string from the broken file (e.g. '10/15/25').
+
+        Returns:
+            List of (stem, 'HH:MM:SS SGT') tuples for files whose epoch is
+            a valid non-fallback value.
+        """
+        import datetime as _dt_mod  # noqa: PLC0415
+        hints: list[tuple[str, str]] = []
+        for f in self._files.values():
+            if f.start_epoch <= 86400 or not f.timestamp_ok:
+                continue
+            try:
+                utc = _dt_mod.datetime.utcfromtimestamp(f.start_epoch)
+                sgt = utc + _dt_mod.timedelta(hours=8)
+                hints.append((f.path.stem[:20], sgt.strftime('%H:%M:%S') + ' SGT'))
+            except Exception:
+                pass
+        return hints
 
     def _on_remove_file(self) -> None:
         """Remove the currently selected file from tree and state dicts."""
@@ -1035,23 +1128,61 @@ class UnifiedCanvasWidget(QWidget):
         self._rebuild_canvas()
 
     def _on_tree_context_menu(self, pos) -> None:
-        """Right-click on a channel item → offer stack reassignment.
+        """Right-click on tree item → context menu.
+
+        File-level items:  Set Start Time / Auto-align from Frequency.
+        Channel-level items: stack reassignment (existing behaviour).
 
         Args:
             pos: Click position in tree viewport coordinates.
         """
         from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
         item = self._tree.itemAt(pos)
-        if item is None or item.parent() is None:
+        if item is None:
             return
 
+        global_pos = self._tree.viewport().mapToGlobal(pos)
+
+        # ── File-level context menu ───────────────────────────────────────────
+        if item.parent() is None:
+            file_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+            if file_id is None:
+                return
+
+            menu = QMenu(self)
+            set_time_act = menu.addAction('Set Start Time…')
+
+            align_menu = menu.addMenu('Auto-align from Frequency to…')
+            align_acts: dict[str, object] = {}
+            for other_id, other in self._files.items():
+                if other_id != file_id and other.timestamp_ok:
+                    act = align_menu.addAction(other.path.stem)
+                    align_acts[other_id] = act
+            if not align_acts:
+                align_menu.setEnabled(False)
+                align_menu.setToolTip(
+                    'No other files with a valid timestamp are loaded.\n'
+                    'Set the start time on this file first, then use\n'
+                    'Auto-align to fine-tune sub-second drift.'
+                )
+
+            chosen = menu.exec(global_pos)
+            if chosen is set_time_act:
+                self._show_set_start_time_dialog(file_id)
+            else:
+                for ref_id, act in align_acts.items():
+                    if chosen is act:
+                        self._do_auto_align(file_id, ref_id)
+            return
+
+        # ── Channel-level context menu — stack reassignment ───────────────────
         file_item = item.parent()
         file_id = file_item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
         ch_id   = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
         if file_id is None or ch_id is None:
             return
 
-        key          = (file_id, ch_id)
+        key = (file_id, ch_id)
         curr_stack, curr_side = self._stack_assign.get(key, (4, 'left'))
 
         menu       = QMenu(self)
@@ -1071,7 +1202,7 @@ class UnifiedCanvasWidget(QWidget):
             ra.setChecked(curr_stack == sidx and curr_side == 'right')
             right_actions[sidx] = ra
 
-        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        chosen = menu.exec(global_pos)
         if chosen is None:
             return
 
@@ -1087,6 +1218,136 @@ class UnifiedCanvasWidget(QWidget):
                 self._refresh_tree_label(item, file_id, ch_id)
                 self._rebuild_canvas()
                 return
+
+    # ── Start-time anchor (mechanism 2) ───────────────────────────────────────
+
+    def _show_set_start_time_dialog(self, file_id: str) -> None:
+        """Open SetStartTimeDialog and apply any corrected epoch.
+
+        Args:
+            file_id: The _LoadedFile whose start time to correct.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return
+        dlg = SetStartTimeDialog(loaded.start_epoch, loaded.path.stem, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.anchor_utc is not None:
+            loaded.start_epoch = start_epoch_from_datetime(dlg.anchor_utc)
+            loaded.timestamp_ok = True
+            self._rebuild_canvas()
+
+    # ── Auto-align from frequency cross-correlation (mechanism 3) ─────────────
+
+    def _do_auto_align(self, target_id: str, reference_id: str) -> None:
+        """Cross-correlate frequency channels to find alignment offset.
+
+        Dispatches the computation to a background thread.  The UI remains
+        responsive while the correlation runs.
+
+        Args:
+            target_id:    file_id of the file to align (whose offset to adjust).
+            reference_id: file_id of the reference file (fixed, offset = 0).
+        """
+        target    = self._files.get(target_id)
+        reference = self._files.get(reference_id)
+        if target is None or reference is None:
+            return
+
+        t_freq = self._get_freq_raw(target)
+        r_freq = self._get_freq_raw(reference)
+
+        if t_freq is None or r_freq is None:
+            QMessageBox.warning(
+                self,
+                'Auto-align',
+                'Both files must have a Frequency channel for auto-alignment.\n'
+                'No Frequency channel found in one or both files.',
+            )
+            return
+
+        # Check epochs are close enough that xcorr makes sense.
+        # If they differ by more than 1 day, the user needs to set the start
+        # time first via mechanism 1 or 2.
+        epoch_gap = abs(target.start_epoch - reference.start_epoch)
+        if epoch_gap > 86400:
+            QMessageBox.warning(
+                self,
+                'Auto-align',
+                f'The two files are more than 24 hours apart on the time axis\n'
+                f'({epoch_gap / 3600:.1f} h gap).\n\n'
+                f'Set the approximate start time for "{target.path.stem}" first\n'
+                f'via right-click → "Set Start Time…", then retry auto-align.',
+            )
+            return
+
+        run_in_thread(
+            _xcorr_freq_lag,
+            t_freq,
+            r_freq,
+            on_done=lambda lag_s, tid=target_id, rid=reference_id:
+                self._on_auto_align_done(tid, rid, lag_s),
+            on_error=lambda msg: QMessageBox.critical(
+                self, 'Auto-align Error', msg
+            ),
+        )
+
+    def _on_auto_align_done(
+        self,
+        target_id:    str,
+        reference_id: str,
+        lag_s:        float,
+    ) -> None:
+        """Apply the cross-correlation lag as a per-file offset (UI thread).
+
+        The lag is added to any existing manual offset so the user's prior
+        coarse adjustment is preserved.
+
+        Args:
+            target_id:    file_id of the file whose offset to update.
+            reference_id: file_id of the reference file.
+            lag_s:        Time lag in seconds (target lags reference by this much).
+        """
+        target    = self._files.get(target_id)
+        reference = self._files.get(reference_id)
+        if target is None or reference is None:
+            return
+
+        # Alignment formula:
+        #   to make target overlap reference, set target's offset so that its
+        #   canvas t[0] matches reference's canvas t[0] + lag_s
+        ref_epoch  = self._get_ref_epoch()
+        ref_canvas = reference.start_epoch - ref_epoch + self._offsets.get(reference_id, 0.0)
+        tgt_canvas = target.start_epoch - ref_epoch
+
+        self._offsets[target_id] = ref_canvas + lag_s - tgt_canvas
+        self._update_curves()
+
+        # Reflect in the offset slider label (best-effort — slider range may not
+        # cover large offsets, but the curve data is already correct)
+        QMessageBox.information(
+            self,
+            'Auto-align complete',
+            f'Applied offset  {self._offsets[target_id] * 1000:+.1f} ms  '
+            f'to  "{target.path.stem}"\n'
+            f'(cross-correlation lag: {lag_s * 1000:+.1f} ms)',
+        )
+
+    @staticmethod
+    def _get_freq_raw(loaded: '_LoadedFile') -> Optional[np.ndarray]:
+        """Return the raw Frequency channel array for a loaded file, or None.
+
+        Args:
+            loaded: The _LoadedFile to search.
+
+        Returns:
+            float64 ndarray of frequency values, or None if not found.
+        """
+        for ch in loaded.record.analogue_channels:
+            if getattr(ch, 'signal_role', '') == SignalRole.FREQ:
+                d = getattr(ch, 'raw_data', None)
+                if d is not None and len(d) > 0:
+                    return d.astype(np.float64)
+        return None
 
     def _refresh_tree_label(
         self,
@@ -1437,11 +1698,27 @@ class UnifiedCanvasWidget(QWidget):
 
         if mode == 'rms':
             cached = self._rms_cache.get(key)
-            if cached is None:
-                return None, None
-            t_rms, rms_vals = cached
-            t_abs = t_rms.astype(np.float64) + t_shift
-            y = rms_vals.astype(np.float64)
+            if cached is not None:
+                t_rms, rms_vals = cached
+                t_abs = t_rms.astype(np.float64) + t_shift
+                y = rms_vals.astype(np.float64)
+            else:
+                # No computed RMS in cache.  For PMU files (source_format=PMU_CSV)
+                # raw_data already contains phasor magnitudes / RMS values — use
+                # it directly.  For non-PMU channels the toggle to RMS mode kicks
+                # off background computation; until it arrives return nothing.
+                if record.source_format not in _PMU_SOURCE_FORMATS:
+                    return None, None
+                t_raw = record.time_array
+                d_raw = getattr(ch, 'raw_data', None)
+                if d_raw is None:
+                    return None, None
+                n = min(len(t_raw), len(d_raw))
+                if n == 0:
+                    return None, None
+                t_abs_raw = t_raw[:n].astype(np.float64) + t_shift
+                d_raw_f   = d_raw[:n].astype(np.float64)
+                t_abs, y = decimate_uniform(t_abs_raw, d_raw_f, MAX_DISPLAY_PTS)
         else:
             t_raw = record.time_array
             d_raw = getattr(ch, 'raw_data', None)
