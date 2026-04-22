@@ -62,6 +62,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.app_settings import AppSettings
 from core.thread_manager import run_in_thread
 from engine.rms_calculator import compute_rms_for_record
 from engine.rms_merger import (
@@ -200,15 +201,15 @@ class _LoadedFile:
         start_epoch:  POSIX epoch float for the record's start_time.
         tree_item:    The QTreeWidgetItem for this file in the file tree.
     """
-    file_id:      str
-    path:         Path
-    record:       DisturbanceRecord
-    nominal_freq: float
-    selected_ids: set[int] = field(default_factory=set)
-    rms_results:  dict[int, tuple[np.ndarray, np.ndarray]
-                       ] = field(default_factory=dict)
-    start_epoch:  float = 0.0
-    tree_item:    Optional[QTreeWidgetItem] = field(default=None, repr=False)
+    file_id:            str
+    path:               Path
+    record:             DisturbanceRecord
+    nominal_freq:       float
+    selected_ids:       set[int]                                    = field(default_factory=set)
+    rms_results:        dict[int, tuple[np.ndarray, np.ndarray]]    = field(default_factory=dict)
+    start_epoch:        float                                       = 0.0
+    voltage_convention: str                                         = 'line_to_line'   # 'line_to_line' | 'line_to_earth'
+    tree_item:          Optional[QTreeWidgetItem]                   = field(default=None, repr=False)
 
 
 # ── Offset row widget ──────────────────────────────────────────────────────────
@@ -465,7 +466,7 @@ class RmsConverterDock(QDockWidget):
         self._pu_btn.setChecked(False)
         self._pu_btn.setToolTip(
             'Toggle between actual RMS values and per-unit (PU) values.\n'
-            'Right-click a voltage channel in the file tree to set its base kV.'
+            'Right-click a voltage channel in the file tree to set its nominal kV.'
         )
         self._pu_btn.toggled.connect(self._on_pu_toggled)
         layout.addWidget(self._pu_btn)
@@ -489,7 +490,7 @@ class RmsConverterDock(QDockWidget):
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(False)
         self._tree.setColumnCount(2)
-        self._tree.setHeaderLabels(['Channel', 'Base kV'])
+        self._tree.setHeaderLabels(['Channel', 'Nominal kV'])
         self._tree.setStyleSheet(
             'background: #252525; color: #DDDDDD; font-size: 8pt;')
         self._tree.header().setStretchLastSection(False)
@@ -747,7 +748,8 @@ class RmsConverterDock(QDockWidget):
         Args:
             loaded: The _LoadedFile to add to the tree.
         """
-        file_item = QTreeWidgetItem([f'📄 {loaded.path.stem}'])
+        conv_badge = '[L-L]' if loaded.voltage_convention == 'line_to_line' else '[L-E]'
+        file_item = QTreeWidgetItem([f'📄 {loaded.path.stem}  {conv_badge}'])
         file_item.setData(
             TREE_COL_NAME, Qt.ItemDataRole.UserRole, loaded.file_id)
         file_item.setFlags(
@@ -774,7 +776,7 @@ class RmsConverterDock(QDockWidget):
             )
             file_item.addChild(ch_item)
 
-            # Embed base-kV spinbox for voltage channels
+            # Nominal kV spinbox for voltage channels
             if self._is_voltage_channel(loaded.file_id, ch.channel_id):
                 spin = QDoubleSpinBox()
                 spin.setRange(0.0, 9999.0)
@@ -783,6 +785,11 @@ class RmsConverterDock(QDockWidget):
                 spin.setSpecialValueText('—')   # 0.0 → "—" means "not set"
                 spin.setFixedWidth(74)
                 spin.setStyleSheet('font-size: 7pt;')
+                spin.setToolTip(
+                    'System nominal voltage in line-to-line kV (e.g. 275).\n'
+                    'Right-click the file to set the voltage convention\n'
+                    '(Line-to-Line or Line-to-Earth channel values).'
+                )
                 spin.setValue(self._base_kv.get(
                     (loaded.file_id, ch.channel_id), 0.0))
                 spin.valueChanged.connect(
@@ -828,10 +835,37 @@ class RmsConverterDock(QDockWidget):
         Args:
             pos: Click position in tree widget coordinates.
         """
+        from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
         item = self._tree.itemAt(pos)
-        if item is None or item.parent() is None:
-            return   # clicked on a file item or empty space
+        if item is None:
+            return
 
+        global_pos = self._tree.viewport().mapToGlobal(pos)
+
+        # ── File-level context menu ───────────────────────────────────────────
+        if item.parent() is None:
+            file_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+            loaded_file = self._files.get(file_id)
+            if file_id is None or loaded_file is None:
+                return
+
+            menu = QMenu(self)
+            conv_menu = menu.addMenu('Voltage Convention (channel value format)')
+            ll_act = conv_menu.addAction('Channel values are Line-to-Line  (default)')
+            le_act = conv_menu.addAction('Channel values are Line-to-Earth  (phase-to-earth)')
+            ll_act.setCheckable(True)
+            le_act.setCheckable(True)
+            ll_act.setChecked(loaded_file.voltage_convention == 'line_to_line')
+            le_act.setChecked(loaded_file.voltage_convention == 'line_to_earth')
+
+            chosen = menu.exec(global_pos)
+            if chosen is ll_act:
+                self._set_voltage_convention(file_id, 'line_to_line')
+            elif chosen is le_act:
+                self._set_voltage_convention(file_id, 'line_to_earth')
+            return
+
+        # ── Channel-level context menu — axis assignment ──────────────────────
         file_item = item.parent()
         file_id = file_item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
         ch_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
@@ -841,7 +875,6 @@ class RmsConverterDock(QDockWidget):
         key = (file_id, ch_id)
         current = self._axis_assignment.get(key, 'left')
 
-        from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
         menu = QMenu(self)
         left_action = menu.addAction('→ Left Axis  (Voltage)')
         right_action = menu.addAction('→ Right Axis (Current)')
@@ -850,7 +883,7 @@ class RmsConverterDock(QDockWidget):
         left_action.setChecked(current == 'left')
         right_action.setChecked(current == 'right')
 
-        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        chosen = menu.exec(global_pos)
         if chosen is None:
             return
 
@@ -860,7 +893,6 @@ class RmsConverterDock(QDockWidget):
 
         self._axis_assignment[key] = new_axis
         self._update_tree_item_label(item, file_id, ch_id, new_axis)
-        # Re-draw waveform with updated assignment (merge data unchanged)
         if self._merge_result is not None:
             channels = self._collect_rms_channels()
             self._update_waveform(self._merge_result, channels)
@@ -1135,9 +1167,10 @@ class RmsConverterDock(QDockWidget):
         if self._right_axis is not None:
             self._right_axis.setVisible(has_right)
 
-        # PU mode default Y range: 0 … +1.5 pu for voltage left axis
+        # PU mode Y range: 0 … pu_yrange (absolute magnitudes are always positive)
         if self._pu_mode:
-            self._plot.setYRange(0.0, 1.5, padding=0)
+            _yr = AppSettings.get('calculation.pu_yrange', 2.0)
+            self._plot.setYRange(0.0, _yr, padding=0)
         else:
             self._plot.enableAutoRange(axis='y', enable=True)
 
@@ -1568,12 +1601,40 @@ class RmsConverterDock(QDockWidget):
         ch = ch_map.get(ch_id)
         return ch is not None and ch.signal_role in _VOLTAGE_ROLES
 
+    def _set_voltage_convention(self, file_id: str, convention: str) -> None:
+        """Set the base-kV input convention for a file and refresh.
+
+        Args:
+            file_id:    The _LoadedFile to update.
+            convention: ``'line_to_line'`` or ``'line_to_earth'``.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return
+        loaded.voltage_convention = convention
+        badge = '[L-L]' if convention == 'line_to_line' else '[L-E]'
+        if loaded.tree_item is not None:
+            self._tree.blockSignals(True)
+            loaded.tree_item.setText(
+                TREE_COL_NAME, f'📄 {loaded.path.stem}  {badge}')
+            self._tree.blockSignals(False)
+        if self._pu_mode and self._merge_result is not None:
+            channels = self._collect_rms_channels()
+            self._update_waveform(self._merge_result, channels)
+            self._update_table(self._merge_result, channels)
+
     def _get_pu_divisor(self, file_id: str, ch_id: int) -> float:
         """Return the PU divisor for a voltage channel; 0.0 if not applicable.
 
-        Phase-to-phase (V_LINE): divisor = V_base.
-        Phase-to-earth / residual: divisor = V_base / √3.
-        Returns 0.0 if base voltage is not set or channel is not a voltage type.
+        The base kV input is ALWAYS entered in line-to-line terms (e.g. 275 kV).
+        The ``voltage_convention`` on the file declares what format the channel
+        values are stored in:
+
+        - ``line_to_line``  (default) — channel data is in L-L form:
+            divisor = base  (e.g. 275 kV → use 275 directly)
+
+        - ``line_to_earth`` — channel data is in L-E (phase-to-earth) form:
+            divisor = base / √3  (e.g. 275 kV → use 275/1.732 = 158.77 kV)
 
         Args:
             file_id: The _LoadedFile.file_id.
@@ -1589,9 +1650,9 @@ class RmsConverterDock(QDockWidget):
         ch = ch_map.get(ch_id)
         if ch is None or ch.signal_role not in _VOLTAGE_ROLES:
             return 0.0
-        if ch.signal_role in _LINE_VOLTAGE_ROLES:
-            return base
-        return base / SQRT3
+        if loaded.voltage_convention == 'line_to_earth':
+            return base / SQRT3   # channel is L-E; derive phase base from L-L input
+        return base               # channel is L-L (default); use L-L base directly
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

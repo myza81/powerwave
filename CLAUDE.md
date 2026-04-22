@@ -6,9 +6,12 @@ Phase: Phase 2
 Milestone: Milestone 2C — Unified Canvas Tab
 Modules:
 src/ui/unified_canvas.py (NEW — multi-file multi-stack analogue canvas tab)
-src/main.py (MODIFIED — QTabWidget: Waveform tab + Unified Canvas tab)
-src/ui/rms_converter_dock.py (MODIFIED — PU mode Y-range default ±2.0 pu)
-Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, 3 UI bugs fixed, PMU time-sync implemented
+src/main.py (MODIFIED — QTabWidget: Waveform tab + Unified Canvas tab; Edit → Preferences)
+src/ui/rms_converter_dock.py (MODIFIED — PU mode, per-file nominal kV convention)
+src/core/app_settings.py (NEW — JSON-backed global settings singleton)
+src/ui/settings_dialog.py (NEW — two-panel modal Preferences dialog)
+Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, 3 UI bugs fixed,
+        PMU time-sync implemented, global settings / per-file voltage convention implemented
 
 Unified Canvas features implemented:
 
@@ -19,7 +22,7 @@ Unified Canvas features implemented:
 - Per-channel Raw / RMS / Value (locked) mode toggle in file tree
 - RMS auto-computed on first toggle (background thread, cached per channel)
 - Per-file time offset strip (same slider design as RMS Converter)
-- PU mode for voltage channels with per-channel base kV spinbox
+- PU mode for voltage channels with per-channel nominal kV spinbox
 - Dual vertical cursors (C1 gold, C2 cyan) — right-click to enable/disable
 - Cursors sync across all stacks; draggable readout overlay shows values + ΔX
 - Phasor Display button → floating moveable QDialog (value table + arrow canvas)
@@ -38,11 +41,37 @@ PMU time-sync implemented (3 mechanisms):
 - unified_canvas.py: dialog wired in _on_file_parsed; right-click file → Set Start Time / Auto-align from Frequency;
   _xcorr_freq_lag() FFT cross-correlation; _LoadedFile.timestamp_ok flag
 
+Global Settings implemented:
+- core/app_settings.py (NEW) — AppSettings singleton; persists to ~/.powerwave_analyst/settings.json
+  Sections: calculation (nominal_frequency, rms_tolerance_ms, pu_yrange),
+            display (theme, cursor_c1_colour, cursor_c2_colour), pmu (default_timezone)
+- ui/settings_dialog.py (NEW) — two-panel modal dialog (Edit → Preferences / Ctrl+,)
+  Left nav list; right QStackedWidget with pages: Calculation, Display, PMU, About
+  Restore Defaults button; OK / Cancel / Apply
+- main.py: Edit menu added with Preferences action (Ctrl+,)
+- PU Y-axis range now reads from AppSettings.get('calculation.pu_yrange') in both
+  unified_canvas.py and rms_converter_dock.py (was hardcoded 2.0 / 1.5)
+
+Per-file voltage convention implemented (Unified Canvas + RMS Converter):
+- _LoadedFile.voltage_convention: 'line_to_line' | 'line_to_earth' (default: 'line_to_line')
+- Right-click file in tree → "Voltage Convention (channel value format)"
+    → "Channel values are Line-to-Line (default)"
+    → "Channel values are Line-to-Earth (phase-to-earth)"
+- [L-L] / [L-E] badge shown on the file row in the tree
+- Nominal kV input is ALWAYS entered as line-to-line (e.g. 275 kV)
+- _get_pu_divisor() logic:
+    line_to_line  → divisor = base_kV         (use directly)
+    line_to_earth → divisor = base_kV / √3    (derive phase base from L-L input)
+- Spinbox column renamed "Nominal kV" (was "Base kV") in both views
+- Spinbox tooltip explains: always enter L-L nominal; right-click file for convention
+
 Pending / deferred:
 
 - Phasor live data hookup (cursor → angle/magnitude from PMU or phasor calculator)
 - Viewport-aware re-decimation on zoom (currently full-record fixed 2000-pt)
 - PMU import profile save/recall (remember checkbox wired to UI but not yet persisted)
+- Cursor colours from AppSettings not yet applied at runtime (saved but not read back
+  into pyqtgraph pen colours — deferred)
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 

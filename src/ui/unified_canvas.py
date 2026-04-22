@@ -67,6 +67,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.app_settings import AppSettings
 from core.thread_manager import run_in_thread
 from engine.decimator import decimate_minmax, decimate_uniform
 from engine.rms_calculator import compute_cycle_rms
@@ -263,14 +264,15 @@ class _LoadedFile:
                        has not yet provided a corrected start time.
         tree_item:     The top-level QTreeWidgetItem for this file.
     """
-    file_id:      str
-    path:         Path
-    record:       DisturbanceRecord
-    nominal_freq: float
-    selected_ids: set[int]            = field(default_factory=set)
-    start_epoch:  float               = 0.0
-    timestamp_ok: bool                = True
-    tree_item:    Optional[object]    = field(default=None, repr=False)
+    file_id:            str
+    path:               Path
+    record:             DisturbanceRecord
+    nominal_freq:       float
+    selected_ids:       set[int]         = field(default_factory=set)
+    start_epoch:        float            = 0.0
+    timestamp_ok:       bool             = True
+    voltage_convention: str              = 'line_to_line'   # 'line_to_line' | 'line_to_earth'
+    tree_item:          Optional[object] = field(default=None, repr=False)
 
 
 # ── Per-file offset control strip ─────────────────────────────────────────────
@@ -683,7 +685,7 @@ class UnifiedCanvasWidget(QWidget):
         self._pu_btn.setCheckable(True)
         self._pu_btn.setToolTip(
             'Toggle voltage display between actual values and per-unit (PU).\n'
-            'Right-click a voltage channel in the tree to set its base kV.'
+            'Right-click a voltage channel in the tree to set its nominal kV.'
         )
         self._pu_btn.toggled.connect(self._on_pu_toggled)
         layout.addWidget(self._pu_btn)
@@ -715,7 +717,7 @@ class UnifiedCanvasWidget(QWidget):
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(False)
         self._tree.setColumnCount(3)
-        self._tree.setHeaderLabels(['Channel', 'Mode', 'Base kV'])
+        self._tree.setHeaderLabels(['Channel', 'Mode', 'Nominal kV'])
         self._tree.setStyleSheet(
             'background: #252525; color: #DDDDDD; font-size: 8pt;'
         )
@@ -1013,7 +1015,8 @@ class UnifiedCanvasWidget(QWidget):
         Args:
             loaded: The _LoadedFile to add.
         """
-        file_item = QTreeWidgetItem([f'📄 {loaded.path.stem}'])
+        conv_badge = '[L-L]' if loaded.voltage_convention == 'line_to_line' else '[L-E]'
+        file_item = QTreeWidgetItem([f'📄 {loaded.path.stem}  {conv_badge}'])
         file_item.setData(TREE_COL_NAME, Qt.ItemDataRole.UserRole, loaded.file_id)
         file_item.setFlags(
             file_item.flags()
@@ -1059,7 +1062,7 @@ class UnifiedCanvasWidget(QWidget):
                 )
             self._tree.setItemWidget(ch_item, TREE_COL_MODE, btn)
 
-            # Base kV spinbox for voltage channels
+            # Nominal kV spinbox for voltage channels
             if self._is_voltage_channel(loaded.file_id, ch.channel_id):
                 spin = QDoubleSpinBox()
                 spin.setRange(0.0, 9999.0)
@@ -1068,6 +1071,11 @@ class UnifiedCanvasWidget(QWidget):
                 spin.setSpecialValueText('—')
                 spin.setFixedWidth(68)
                 spin.setStyleSheet('font-size: 7pt;')
+                spin.setToolTip(
+                    'System nominal voltage in line-to-line kV (e.g. 275).\n'
+                    'Right-click the file to set the voltage convention\n'
+                    '(Line-to-Line or Line-to-Earth channel values).'
+                )
                 spin.setValue(self._base_kv.get(key, 0.0))
                 spin.valueChanged.connect(
                     lambda v, fid=loaded.file_id, cid=ch.channel_id:
@@ -1149,6 +1157,10 @@ class UnifiedCanvasWidget(QWidget):
             if file_id is None:
                 return
 
+            loaded_file = self._files.get(file_id)
+            if loaded_file is None:
+                return
+
             menu = QMenu(self)
             set_time_act = menu.addAction('Set Start Time…')
 
@@ -1166,9 +1178,24 @@ class UnifiedCanvasWidget(QWidget):
                     'Auto-align to fine-tune sub-second drift.'
                 )
 
+            menu.addSeparator()
+
+            # Voltage convention submenu
+            conv_menu = menu.addMenu('Voltage Convention (channel value format)')
+            ll_act = conv_menu.addAction('Channel values are Line-to-Line  (default)')
+            le_act = conv_menu.addAction('Channel values are Line-to-Earth  (phase-to-earth)')
+            ll_act.setCheckable(True)
+            le_act.setCheckable(True)
+            ll_act.setChecked(loaded_file.voltage_convention == 'line_to_line')
+            le_act.setChecked(loaded_file.voltage_convention == 'line_to_earth')
+
             chosen = menu.exec(global_pos)
             if chosen is set_time_act:
                 self._show_set_start_time_dialog(file_id)
+            elif chosen is ll_act:
+                self._set_voltage_convention(file_id, 'line_to_line')
+            elif chosen is le_act:
+                self._set_voltage_convention(file_id, 'line_to_earth')
             else:
                 for ref_id, act in align_acts.items():
                     if chosen is act:
@@ -1639,7 +1666,8 @@ class UnifiedCanvasWidget(QWidget):
                 ax.hide()
 
         if self._pu_mode and 0 in self._stack_plots:
-            self._stack_plots[0].setYRange(-2.0, 2.0, padding=0)
+            _yr = AppSettings.get('calculation.pu_yrange', 2.0)
+            self._stack_plots[0].setYRange(-_yr, _yr, padding=0)
 
     # ── Curve update (no layout rebuild) ──────────────────────────────────────
 
@@ -1667,7 +1695,8 @@ class UnifiedCanvasWidget(QWidget):
                     curve.setData(t_data, y_data)
 
         if self._pu_mode and 0 in self._stack_plots:
-            self._stack_plots[0].setYRange(-2.0, 2.0, padding=0)
+            _yr = AppSettings.get('calculation.pu_yrange', 2.0)
+            self._stack_plots[0].setYRange(-_yr, _yr, padding=0)
         elif not self._pu_mode and 0 in self._stack_plots:
             self._stack_plots[0].enableAutoRange(axis='y', enable=True)
 
@@ -2016,11 +2045,38 @@ class UnifiedCanvasWidget(QWidget):
         ch = ch_map.get(ch_id)
         return ch is not None and ch.signal_role in _VOLTAGE_ROLES
 
+    def _set_voltage_convention(self, file_id: str, convention: str) -> None:
+        """Set the base-kV input convention for a file and refresh.
+
+        Args:
+            file_id:    The _LoadedFile to update.
+            convention: ``'line_to_line'`` or ``'line_to_earth'``.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return
+        loaded.voltage_convention = convention
+        badge = '[L-L]' if convention == 'line_to_line' else '[L-E]'
+        if loaded.tree_item is not None:
+            self._tree.blockSignals(True)
+            loaded.tree_item.setText(
+                TREE_COL_NAME, f'📄 {loaded.path.stem}  {badge}')
+            self._tree.blockSignals(False)
+        if self._pu_mode:
+            self._update_curves()
+
     def _get_pu_divisor(self, file_id: str, ch_id: int) -> float:
         """Return the PU divisor for a voltage channel; 0.0 if not applicable.
 
-        Phase-to-phase (V_LINE): divisor = V_base.
-        Phase-to-earth / residual: divisor = V_base / √3.
+        The base kV input is ALWAYS entered in line-to-line terms (e.g. 275 kV).
+        The ``voltage_convention`` on the file declares what format the channel
+        values are stored in:
+
+        - ``line_to_line``  (default) — channel data is in L-L form:
+            divisor = base  (e.g. 275 kV → use 275 directly)
+
+        - ``line_to_earth`` — channel data is in L-E (phase-to-earth) form:
+            divisor = base / √3  (e.g. 275 kV → use 275/1.732 = 158.77 kV)
 
         Args:
             file_id: The file this channel belongs to.
@@ -2036,7 +2092,9 @@ class UnifiedCanvasWidget(QWidget):
         ch = ch_map.get(ch_id)
         if ch is None or ch.signal_role not in _VOLTAGE_ROLES:
             return 0.0
-        return base if ch.signal_role in _LINE_VOLTAGE_ROLES else base / SQRT3
+        if loaded.voltage_convention == 'line_to_earth':
+            return base / SQRT3   # channel is L-E; derive phase base from L-L input
+        return base               # channel is L-L (default); use L-L base directly
 
     # ── Phasor dialog ──────────────────────────────────────────────────────────
 

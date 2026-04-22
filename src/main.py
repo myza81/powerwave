@@ -55,6 +55,7 @@ from parsers.parser_exceptions import NeedsMappingDialog, NeedsSheetSelection
 from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
 from engine.decimator import prepare_display_data
 from ui.channel_canvas import ChannelCanvas
+from ui.settings_dialog import SettingsDialog
 from ui.measurement_panel import MeasurementPanel
 from ui.rms_converter_dock import RmsConverterDock
 from ui.unified_canvas import UnifiedCanvasWidget
@@ -144,7 +145,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
 
     def _setup_menu(self) -> None:
-        """Build the File and Tools menus."""
+        """Build the File, Edit, and Tools menus."""
         menu_bar = self.menuBar()
 
         file_menu = menu_bar.addMenu("&File")
@@ -162,6 +163,14 @@ class MainWindow(QMainWindow):
         exit_action.setStatusTip("Exit PowerWave Analyst")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        edit_menu = menu_bar.addMenu("&Edit")
+
+        prefs_action = QAction("&Preferences…", self)
+        prefs_action.setShortcut("Ctrl+,")
+        prefs_action.setStatusTip("Open application preferences (Ctrl+,)")
+        prefs_action.triggered.connect(self._open_preferences)
+        edit_menu.addAction(prefs_action)
 
         tools_menu = menu_bar.addMenu("&Tools")
 
@@ -296,6 +305,13 @@ class MainWindow(QMainWindow):
         self._measurement_panel.refresh(self._record, t_a, t_b)
         if cursor_id == 0:
             self._label_panel.update_values(self._record, time_display)
+
+    # ── Preferences ───────────────────────────────────────────────────────────
+
+    def _open_preferences(self) -> None:
+        """Open the global Preferences dialog (Edit → Preferences / Ctrl+,)."""
+        dlg = SettingsDialog(parent=self)
+        dlg.exec()
 
     # ── File open flow ─────────────────────────────────────────────────────────
 
