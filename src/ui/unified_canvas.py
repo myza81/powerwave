@@ -860,13 +860,21 @@ class UnifiedCanvasWidget(QWidget):
         file_id = str(self._file_counter)
         self._file_counter += 1
 
+        raw_epoch = start_epoch_from_datetime(record.start_time)
+        # COMTRADE stores local wall-clock time (no timezone in the standard).
+        # PMU CSV is already converted to UTC by the parser.
+        # Apply the user-configured UTC offset to bring COMTRADE epochs to UTC.
+        if record.source_format not in _PMU_SOURCE_FORMATS and raw_epoch > 86400:
+            tz_h = AppSettings.get('calculation.comtrade_tz_offset_h', 0)
+            raw_epoch -= float(tz_h) * 3600.0
+
         loaded = _LoadedFile(
             file_id=file_id,
             path=path,
             record=record,
             nominal_freq=50.0,
             selected_ids={ch.channel_id for ch in record.analogue_channels},
-            start_epoch=start_epoch_from_datetime(record.start_time),
+            start_epoch=raw_epoch,
             timestamp_ok=(report is None or not report.has_blockers),
         )
         return loaded, report

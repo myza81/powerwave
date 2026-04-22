@@ -65,6 +65,20 @@ Per-file voltage convention implemented (Unified Canvas + RMS Converter):
 - Spinbox column renamed "Nominal kV" (was "Base kV") in both views
 - Spinbox tooltip explains: always enter L-L nominal; right-click file for convention
 
+COMTRADE timezone offset fix:
+- Root cause: COMTRADE CFG stores LOCAL wall-clock time (no timezone field in standard).
+  PMU CSV parser converts SGT→UTC correctly. Without the fix, a Malaysian BEN32 file
+  (18:04 MYT) and PMU CSV (18:04 SGT→10:04 UTC) appeared 8 hours = 28,809 s apart
+  on the shared X-axis, making the ±30 s offset slider useless.
+- Fix: AppSettings 'calculation.comtrade_tz_offset_h' (default 0 = UTC).
+  Set to 8 for Malaysian MYT/SGT substations.
+- Applied in _parse_file (unified_canvas) and _load_file (rms_converter_dock):
+    if source_format not in PMU_CSV and epoch > 86400:
+        epoch -= tz_offset_h * 3600
+- Settings dialog: Edit → Preferences → Calculation → Time alignment section
+  with timezone dropdown (UTC, MYT/SGT UTC+8, WIB, ICT, JST/KST, IST, CET, EST, PST)
+- After setting MYT/SGT and reloading: gap between COMTRADE and PMU = 9 s (was 28,809 s)
+
 Pending / deferred:
 
 - Phasor live data hookup (cursor → angle/magnitude from PMU or phasor calculator)
