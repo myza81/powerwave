@@ -6,12 +6,14 @@ Phase: Phase 2
 Milestone: Milestone 2C — Unified Canvas Tab
 Modules:
 src/ui/unified_canvas.py (NEW — multi-file multi-stack analogue canvas tab)
-src/main.py (MODIFIED — QTabWidget: Waveform tab + Unified Canvas tab; Edit → Preferences)
+src/main.py (MODIFIED — standalone Unified Canvas; waveform tab retired; Edit → Preferences)
 src/ui/rms_converter_dock.py (MODIFIED — PU mode, per-file nominal kV convention)
 src/core/app_settings.py (NEW — JSON-backed global settings singleton)
 src/ui/settings_dialog.py (NEW — two-panel modal Preferences dialog)
+src/ui/measurement_panel.py (MODIFIED — simplified single-layout, dynamic font, apply_settings API)
 Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, 3 UI bugs fixed,
-        PMU time-sync implemented, global settings / per-file voltage convention implemented
+        PMU time-sync implemented, global settings / per-file voltage convention implemented,
+        waveform tab retired, per-channel scatter mode implemented
 
 Unified Canvas features implemented:
 
@@ -33,6 +35,11 @@ Unified Canvas features implemented:
   was triggering N separate _rebuild_canvas calls (one per child), each leaving a ghost vb2
 - BUG FIX: _rebuild_canvas now calls _update_readout() on both the early-return (no active
   stacks) and normal paths — readout overlay now hides immediately when file is removed
+- Per-channel scatter mode: right-click analogue channel → "Display as Scatter" (checkable)
+  _LoadedFile.scatter_ids: set[int] — channels rendered as scatter (pen=None, symbol='o')
+  LAW 9 enforced at parse time: TREND records (sample_rate < 200 Hz) auto-populate scatter_ids
+  Bidirectional — TREND channels can revert to line by unchecking the toggle
+  Global scatter button removed; scatter is per-channel and per-file
 
 PMU time-sync implemented (3 mechanisms):
 - parsers/pmu_import_validator.py (NEW) — pure-logic validator, IssueKind/IssueSeverity/ParseInspectionReport
@@ -43,14 +50,42 @@ PMU time-sync implemented (3 mechanisms):
 
 Global Settings implemented:
 - core/app_settings.py (NEW) — AppSettings singleton; persists to ~/.powerwave_analyst/settings.json
-  Sections: calculation (nominal_frequency, rms_tolerance_ms, pu_yrange),
-            display (theme, cursor_c1_colour, cursor_c2_colour), pmu (default_timezone)
+  Sections: calculation (nominal_frequency, rms_tolerance_ms, pu_yrange, comtrade_tz_offset_h),
+            display (theme, cursor_c1_colour, cursor_c2_colour, panel_font_size),
+            pmu (default_timezone)
 - ui/settings_dialog.py (NEW) — two-panel modal dialog (Edit → Preferences / Ctrl+,)
   Left nav list; right QStackedWidget with pages: Calculation, Display, PMU, About
   Restore Defaults button; OK / Cancel / Apply
-- main.py: Edit menu added with Preferences action (Ctrl+,)
+  Display page: "Panel text" group with font-size spinbox (7–14 pt, live after Apply/OK)
+  Calculation page: "Time alignment" group with COMTRADE timezone dropdown
+- main.py: Edit menu added with Preferences action (Ctrl+,); _open_preferences() calls
+  measurement_panel.apply_settings() so font change takes effect immediately
 - PU Y-axis range now reads from AppSettings.get('calculation.pu_yrange') in both
   unified_canvas.py and rms_converter_dock.py (was hardcoded 2.0 / 1.5)
+
+Measurement panel improvements:
+- Simplified to single flat layout (QStackedWidget with waveform page removed)
+- Dynamic font via apply_settings() — re-styles all labels/table without widget rebuild
+- AppSettings key: display.panel_font_size (default 9 pt, range 7–14 pt)
+- Label references tracked in _title_lbls / _key_lbls / _val_lbls lists at construction
+- Column widths: Channel=100, Val C1=65, Val C2=65, Δ=65, Unit=42; row height 16 px
+- Sole public update method: update_readout(t_c1, t_c2, rows)
+
+COMTRADE timezone offset fix:
+- Root cause: COMTRADE CFG stores LOCAL wall-clock time (no timezone field in standard).
+  PMU CSV parser converts SGT→UTC correctly. Without the fix, a Malaysian BEN32 file
+  (18:04 MYT) and PMU CSV (18:04 SGT→10:04 UTC) appeared 8 hours = 28,809 s apart
+  on the shared X-axis, making the ±30 s offset slider useless.
+- Fix: AppSettings 'calculation.comtrade_tz_offset_h' (default 0 = UTC).
+  Set to 8 for Malaysian MYT/SGT substations.
+- Applied in _parse_file (unified_canvas) and _load_file (rms_converter_dock):
+    if source_format not in PMU_CSV and epoch > 86400:
+        epoch -= tz_offset_h * 3600
+- Settings dialog: Edit → Preferences → Calculation → Time alignment section
+  with timezone dropdown (UTC, MYT/SGT UTC+8, WIB, ICT, JST/KST, IST, CET, EST, PST)
+- After setting MYT/SGT and reloading: gap between COMTRADE and PMU = 9 s (was 28,809 s)
+  NOTE: code for this fix lives on remote origin/main (commit 03e48ae) — was not yet
+  merged into the local refactor branch at time of writing
 
 Per-file voltage convention implemented (Unified Canvas + RMS Converter):
 - _LoadedFile.voltage_convention: 'line_to_line' | 'line_to_earth' (default: 'line_to_line')
@@ -65,8 +100,16 @@ Per-file voltage convention implemented (Unified Canvas + RMS Converter):
 - Spinbox column renamed "Nominal kV" (was "Base kV") in both views
 - Spinbox tooltip explains: always enter L-L nominal; right-click file for convention
 
+Waveform tab retirement:
+- Old waveform infrastructure (LabelPanel, ChannelCanvas, waveform toolbar, parse/cursor/
+  record slots, QTabWidget) removed from main.py
+- main.py reduced from ~548 → ~165 lines; UnifiedCanvasWidget is now the sole central widget
+- File > Open (Ctrl+O) delegates to unified_canvas.open_file_dialog() (public bridge method)
+- MeasurementPanel wired to readout_updated signal from UnifiedCanvasWidget only
+
 Pending / deferred:
 
+- COMTRADE timezone fix merge: code on remote (03e48ae) must be merged into main local branch
 - Phasor live data hookup (cursor → angle/magnitude from PMU or phasor calculator)
 - Viewport-aware re-decimation on zoom (currently full-record fixed 2000-pt)
 - PMU import profile save/recall (remember checkbox wired to UI but not yet persisted)
@@ -512,11 +555,15 @@ No vendor should ever cause a crash — only a mapping dialog at worst.
 
 # ✓ 2C (in progress) — Unified Canvas tab:
 
-# ui/unified_canvas.py — QTabWidget tab alongside Waveform; independent file
+# ui/unified_canvas.py — standalone central widget (waveform tab retired); independent file
 
 # loading; multi-stack canvas (5 stacks, dual Y-axes); Raw/RMS/Value toggle;
 
-# per-file offset; PU mode; dual cursors + draggable readout; Phasor dialog
+# per-file offset; PU mode; dual cursors + draggable readout; Phasor dialog;
+
+# per-channel scatter mode (right-click toggle, LAW 9 TREND auto-scatter);
+
+# COMTRADE timezone offset (settings dialog + _parse_file/_load_file correction)
 
 ## ── ARCHITECTURE DECISIONS & KNOWN ISSUES ──────────────────────────────────
 
