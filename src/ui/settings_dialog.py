@@ -209,14 +209,65 @@ class _CalculationPage(QWidget):
         form.addRow('PU mode Y-axis range (±):', self._pu_spin)
 
         layout.addWidget(group)
+
+        # ── Time alignment group ──────────────────────────────────────────────
+        ta_group = QGroupBox('Time alignment')
+        ta_group.setStyleSheet(
+            'QGroupBox { font-weight: bold; color: #CCCCCC; '
+            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
+            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
+        )
+        ta_form = QFormLayout(ta_group)
+        ta_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        ta_form.setVerticalSpacing(10)
+        ta_form.setHorizontalSpacing(16)
+
+        self._tz_combo = QComboBox()
+        _tz_items = [
+            ('UTC  (0)',                    0),
+            ('MYT / SGT  (UTC+8)',          8),
+            ('WIB — Indonesia West  (UTC+7)', 7),
+            ('ICT — Thailand / Vietnam  (UTC+7)', 7),
+            ('JST / KST  (UTC+9)',          9),
+            ('IST — India  (UTC+5:30)',     5.5),
+            ('CET  (UTC+1)',                1),
+            ('CEST  (UTC+2)',               2),
+            ('EST  (UTC-5)',               -5),
+            ('PST  (UTC-8)',               -8),
+        ]
+        for label, offset in _tz_items:
+            self._tz_combo.addItem(label, userData=offset)
+        stored = data.get('comtrade_tz_offset_h', 0)
+        idx = self._tz_combo.findData(stored)
+        self._tz_combo.setCurrentIndex(max(0, idx))
+        self._tz_combo.setToolTip(
+            'Timezone of timestamps stored in COMTRADE CFG files.\n'
+            'COMTRADE stores local time with no timezone field.\n\n'
+            'PMU CSV files are always converted from SGT to UTC automatically.\n'
+            'Set this to match where your COMTRADE files were recorded so\n'
+            'COMTRADE and PMU waveforms align on the shared time axis.\n\n'
+            'Example: Malaysian BEN32 files → MYT / SGT (UTC+8)'
+        )
+        ta_form.addRow('COMTRADE timestamp timezone:', self._tz_combo)
+
+        tz_note = QLabel(
+            'COMTRADE stores local wall-clock time. Select the timezone of the\n'
+            'substation so timestamps align correctly with PMU CSV files (UTC).'
+        )
+        tz_note.setWordWrap(True)
+        tz_note.setStyleSheet('color: #888; font-size: 8pt;')
+        ta_form.addRow('', tz_note)
+
+        layout.addWidget(ta_group)
         layout.addStretch()
 
     def collect(self) -> dict[str, Any]:
         """Return the current widget values as a settings dict."""
         return {
-            'nominal_frequency': self._freq_combo.currentData(),
-            'rms_tolerance_ms':  self._tol_spin.value(),
-            'pu_yrange':         self._pu_spin.value(),
+            'nominal_frequency':    self._freq_combo.currentData(),
+            'rms_tolerance_ms':     self._tol_spin.value(),
+            'pu_yrange':            self._pu_spin.value(),
+            'comtrade_tz_offset_h': self._tz_combo.currentData(),
         }
 
 

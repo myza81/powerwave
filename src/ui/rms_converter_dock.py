@@ -701,6 +701,11 @@ class RmsConverterDock(QDockWidget):
         self._file_counter += 1
         selected = {ch.channel_id for ch in record.analogue_channels}
         start_epoch = start_epoch_from_datetime(record.start_time)
+        # COMTRADE stores local wall-clock time; PMU CSV is already UTC.
+        # Subtract the user-configured offset to convert COMTRADE to UTC.
+        if record.source_format not in {'PMU_CSV'} and start_epoch > 86400:
+            tz_h = AppSettings.get('calculation.comtrade_tz_offset_h', 0)
+            start_epoch -= float(tz_h) * 3600.0
 
         # Build default column names and axis assignments
         stem = path.stem[:12]

@@ -84,8 +84,6 @@ COMTRADE timezone offset fix:
 - Settings dialog: Edit → Preferences → Calculation → Time alignment section
   with timezone dropdown (UTC, MYT/SGT UTC+8, WIB, ICT, JST/KST, IST, CET, EST, PST)
 - After setting MYT/SGT and reloading: gap between COMTRADE and PMU = 9 s (was 28,809 s)
-  NOTE: code for this fix lives on remote origin/main (commit 03e48ae) — was not yet
-  merged into the local refactor branch at time of writing
 
 Per-file voltage convention implemented (Unified Canvas + RMS Converter):
 - _LoadedFile.voltage_convention: 'line_to_line' | 'line_to_earth' (default: 'line_to_line')
@@ -109,7 +107,6 @@ Waveform tab retirement:
 
 Pending / deferred:
 
-- COMTRADE timezone fix merge: code on remote (03e48ae) must be merged into main local branch
 - Phasor live data hookup (cursor → angle/magnitude from PMU or phasor calculator)
 - Viewport-aware re-decimation on zoom (currently full-record fixed 2000-pt)
 - PMU import profile save/recall (remember checkbox wired to UI but not yet persisted)
