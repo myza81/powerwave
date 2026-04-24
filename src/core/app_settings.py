@@ -28,6 +28,7 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
         'theme':            'dark',
         'cursor_c1_colour': '#FFD700',   # C1 gold
         'cursor_c2_colour': '#00E5FF',   # C2 cyan
+        'panel_font_size':  9,           # pt — Measurements panel font size
     },
     'pmu': {
         'default_timezone': 'SGT (UTC+8)',

@@ -53,6 +53,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -197,6 +198,19 @@ TREE_COL_NAME: int = 0   # channel name + checkbox
 TREE_COL_MODE: int = 1   # Raw / RMS toggle button (or locked label)
 TREE_COL_BASE: int = 2   # base voltage kV spinbox (voltage channels only)
 
+# Digital events strip
+STACK_DIGITAL:   int   = 5    # stack index — always rendered last
+DIG_CH_HEIGHT:   float = 0.72 # filled band height per digital channel (0..1)
+
+# Roles considered for "Select standard set" on a bay
+_STANDARD_SET_ROLES: frozenset[str] = frozenset({
+    SignalRole.V_PHASE,
+    SignalRole.V_LINE,
+    SignalRole.V_RESIDUAL,
+    SignalRole.I_PHASE,
+    SignalRole.I_EARTH,
+})
+
 
 # ── Draggable readout label ────────────────────────────────────────────────────
 
@@ -247,6 +261,58 @@ class _DraggableLabel(QLabel):
             super().mouseReleaseEvent(event)
 
 
+# ── Digital events ViewBox — wheel scrolls Y instead of zooming ───────────────
+
+class _DigitalViewBox(pg.ViewBox):
+    """ViewBox used exclusively for the digital events strip.
+
+    Mouse-wheel scrolls through channels (pans Y) rather than zooming,
+    so the user can navigate a tall strip that is cropped by the splitter.
+    The X axis is controlled by the shared X-link and is not affected.
+    """
+
+    def wheelEvent(self, ev, axis: Optional[int] = None) -> None:  # type: ignore[override]
+        """Pan Y by one channel per wheel notch; ignore X."""
+        delta = ev.delta() if hasattr(ev, 'delta') else ev.angleDelta().y()
+        notches = delta / 120.0                 # standard: 1 notch = 120 units
+        self.translateBy(y=notches * 0.8)       # 0.8 channel-heights per notch
+        ev.accept()
+
+
+# ── Time axis — seconds ↔ cycles display ─────────────────────────────────────
+
+class _TimeAxis(pg.AxisItem):
+    """AxisItem for the bottom time axis with optional cycles display.
+
+    When ``_cycles_mode`` is True, tick strings are multiplied by the nominal
+    frequency so the axis reads in power-system cycles instead of seconds.
+    The underlying data coordinates remain in seconds throughout; only the
+    displayed labels change.
+    """
+
+    def __init__(self, orientation: str = 'bottom', **kwargs) -> None:
+        super().__init__(orientation, **kwargs)
+        self._cycles_mode:  bool  = False
+        self._nominal_freq: float = 50.0
+
+    def set_cycles_mode(self, enabled: bool, nominal_freq: float = 50.0) -> None:
+        """Switch between seconds and cycles display and redraw."""
+        self._cycles_mode  = enabled
+        self._nominal_freq = nominal_freq
+        self.picture = None   # invalidate cached paint
+        self.update()
+
+    def tickStrings(self, values, scale, spacing) -> list[str]:  # type: ignore[override]
+        if not self._cycles_mode:
+            return super().tickStrings(values, scale, spacing)
+        freq = self._nominal_freq
+        cyc  = [v * freq for v in values]
+        # Use integer formatting when spacing is at least 1 cycle
+        if spacing * freq >= 0.99:
+            return [f'{v:.0f}' for v in cyc]
+        return [f'{v:.1f}' for v in cyc]
+
+
 # ── Internal state dataclass ───────────────────────────────────────────────────
 
 @dataclass
@@ -264,15 +330,17 @@ class _LoadedFile:
                        has not yet provided a corrected start time.
         tree_item:     The top-level QTreeWidgetItem for this file.
     """
-    file_id:            str
-    path:               Path
-    record:             DisturbanceRecord
-    nominal_freq:       float
-    selected_ids:       set[int]         = field(default_factory=set)
-    start_epoch:        float            = 0.0
-    timestamp_ok:       bool             = True
-    voltage_convention: str              = 'line_to_line'   # 'line_to_line' | 'line_to_earth'
-    tree_item:          Optional[object] = field(default=None, repr=False)
+    file_id:              str
+    path:                 Path
+    record:               DisturbanceRecord
+    nominal_freq:         float
+    selected_ids:         set[int]         = field(default_factory=set)
+    selected_digital_ids: set[int]         = field(default_factory=set)
+    scatter_ids:          set[int]         = field(default_factory=set)
+    start_epoch:          float            = 0.0
+    timestamp_ok:         bool             = True
+    voltage_convention:   str              = 'line_to_line'   # 'line_to_line' | 'line_to_earth'
+    tree_item:            Optional[object] = field(default=None, repr=False)
 
 
 # ── Per-file offset control strip ─────────────────────────────────────────────
@@ -603,6 +671,13 @@ class UnifiedCanvasWidget(QWidget):
     Freq/Power, etc.) with a shared synchronised X time axis.
     """
 
+    # Emitted whenever cursors move or channel selection changes.
+    # Carries (t_c1_s, t_c2_s, rows) where rows is a list of
+    # (display_name: str, unit: str, val_c1: float, val_c2: float).
+    # NaN is used for a disabled cursor's time and its channel values.
+    # Connected by main.py to MeasurementPanel.show_unified_mode().
+    readout_updated: pyqtSignal = pyqtSignal(float, float, object)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         """Build the layout and initialise all state."""
         super().__init__(parent)
@@ -626,16 +701,24 @@ class UnifiedCanvasWidget(QWidget):
         self._base_kv: dict[tuple[str, int], float] = {}
 
         # Canvas state — rebuilt on structural changes
-        self._stack_plots:   dict[int, pg.PlotItem]     = {}
-        self._stack_vb2s:    dict[int, pg.ViewBox]      = {}
-        self._cursor1_lines: dict[int, pg.InfiniteLine] = {}
-        self._cursor2_lines: dict[int, pg.InfiniteLine] = {}
-        self._cursor1_enabled: bool = False
+        self._stack_widgets:  dict[int, pg.PlotWidget]   = {}
+        self._stack_plots:    dict[int, pg.PlotItem]     = {}
+        self._stack_vb2s:     dict[int, pg.ViewBox]      = {}
+        self._cursor1_lines:  dict[int, pg.InfiniteLine] = {}
+        self._cursor2_lines:  dict[int, pg.InfiniteLine] = {}
+        self._cursor1_enabled: bool = True   # C1 shown by default
         self._cursor2_enabled: bool = False
-        self._readout:       Optional[_DraggableLabel]  = None
+        self._xaxis_cycles:   bool = False
+        self._time_axes: dict[int, _TimeAxis] = {}
+        self._readout:        Optional[_DraggableLabel]  = None
         self._readout_pinned: bool = False
-        self._curves:        dict[tuple[str, int], pg.PlotDataItem] = {}
-        self._ref_plot:      Optional[pg.PlotItem] = None
+        self._curves:         dict[tuple[str, int], pg.PlotDataItem] = {}
+        self._digital_curves: dict[tuple[str, int], pg.PlotDataItem] = {}
+        self._digital_row:    dict[tuple[str, int], int]              = {}
+        self._ref_plot:       Optional[pg.PlotItem] = None
+
+        # Guard flag — prevents recursive itemChanged during batch propagation
+        self._in_tree_change: bool = False
 
         # Debounce timer — offset slider drag → _update_curves
         self._update_timer = QTimer(self)
@@ -690,6 +773,15 @@ class UnifiedCanvasWidget(QWidget):
         self._pu_btn.toggled.connect(self._on_pu_toggled)
         layout.addWidget(self._pu_btn)
 
+        self._cycles_btn = QPushButton('s / cyc')
+        self._cycles_btn.setCheckable(True)
+        self._cycles_btn.setToolTip(
+            'Toggle X-axis between seconds and power-system cycles.\n'
+            'Cycle count uses the nominal frequency of the first loaded file.'
+        )
+        self._cycles_btn.toggled.connect(self._on_cycles_toggled)
+        layout.addWidget(self._cycles_btn)
+
         layout.addWidget(self._make_sep())
 
         phasor_btn = QPushButton('Phasor Display')
@@ -713,6 +805,16 @@ class UnifiedCanvasWidget(QWidget):
             'background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;'
         )
         layout.addWidget(hdr)
+
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText('Filter channels…')
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.setStyleSheet(
+            'background: #2A2A2A; color: #CCCCCC; font-size: 8pt;'
+            ' border: none; border-bottom: 1px solid #444; padding: 3px 6px;'
+        )
+        self._filter_edit.textChanged.connect(self._on_filter_changed)
+        layout.addWidget(self._filter_edit)
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(False)
@@ -740,17 +842,36 @@ class UnifiedCanvasWidget(QWidget):
         return panel
 
     def _build_canvas_panel(self) -> QWidget:
-        """Build the right panel containing the stacked GraphicsLayoutWidget."""
+        """Build the right panel containing the stack splitter.
+
+        Each active stack lives in its own PlotWidget inside a vertical
+        QSplitter, giving the user native drag-to-resize handles between
+        stacks.  The readout overlay floats above the whole canvas area.
+        """
         panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(0)
 
-        self._glw = pg.GraphicsLayoutWidget()
-        self._glw.setBackground(CANVAS_BG)
-        layout.addWidget(self._glw, stretch=1)
+        # ── Canvas container — holds splitter + floating readout overlay ──────
+        self._glw = QWidget()                    # alias kept for compat
+        self._glw.setStyleSheet(f'background: {CANVAS_BG};')
+        glw_layout = QVBoxLayout(self._glw)
+        glw_layout.setContentsMargins(0, 0, 0, 0)
+        glw_layout.setSpacing(0)
 
-        # Draggable readout overlay — child of the GLW widget
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter.setHandleWidth(5)
+        self._splitter.setStyleSheet(
+            'QSplitter::handle         { background: #2A2A2A; }'
+            'QSplitter::handle:hover   { background: #4A7A4A; }'
+            'QSplitter::handle:pressed { background: #5A9A5A; }'
+        )
+        glw_layout.addWidget(self._splitter)
+        self._splitter.splitterMoved.connect(self._update_digital_tick_font)
+        panel_layout.addWidget(self._glw, stretch=1)
+
+        # ── Draggable readout overlay — floats over the container ─────────────
         self._readout = _DraggableLabel(self._glw)
         self._readout.setStyleSheet(
             'background-color: rgba(255,255,255,210);'
@@ -767,12 +888,10 @@ class UnifiedCanvasWidget(QWidget):
             lambda: setattr(self, '_readout_pinned', True)
         )
         self._readout.hide()
+        self._readout.raise_()
 
-        # Reposition overlay on GLW resize
+        # Reposition overlay when container is resized
         self._glw.installEventFilter(self)
-
-        # Right-click on any stack → cursor enable/disable menu
-        self._glw.scene().sigMouseClicked.connect(self._on_canvas_clicked)
 
         return panel
 
@@ -812,6 +931,10 @@ class UnifiedCanvasWidget(QWidget):
         return super().eventFilter(obj, event)
 
     # ── File loading ───────────────────────────────────────────────────────────
+
+    def open_file_dialog(self) -> None:
+        """Public entry-point so File > Open in the main menu delegates here."""
+        self._on_add_file()
 
     def _on_add_file(self) -> None:
         """Open file dialog and dispatch parsing to the background thread."""
@@ -865,10 +988,14 @@ class UnifiedCanvasWidget(QWidget):
             path=path,
             record=record,
             nominal_freq=50.0,
-            selected_ids={ch.channel_id for ch in record.analogue_channels},
+            selected_ids=set(),           # all unchecked by default
+            selected_digital_ids=set(),
             start_epoch=start_epoch_from_datetime(record.start_time),
             timestamp_ok=(report is None or not report.has_blockers),
         )
+        # LAW 9: TREND records (sample_rate < 200 Hz) default to scatter display
+        if record.display_mode == 'TREND':
+            loaded.scatter_ids = {ch.channel_id for ch in record.analogue_channels}
         return loaded, report
 
     def _on_file_parsed(self, result: tuple) -> None:
@@ -953,6 +1080,10 @@ class UnifiedCanvasWidget(QWidget):
                 self._stack_assign.pop(key, None)
                 self._rms_cache.pop(key, None)
                 self._base_kv.pop(key, None)
+            for dch in loaded.record.digital_channels:
+                key = (file_id, dch.channel_id)
+                self._digital_curves.pop(key, None)
+                self._digital_row.pop(key, None)
 
         self._offsets.pop(file_id, None)
         idx = self._tree.indexOfTopLevelItem(item)
@@ -1010,7 +1141,19 @@ class UnifiedCanvasWidget(QWidget):
     # ── Tree management ────────────────────────────────────────────────────────
 
     def _add_tree_item(self, loaded: _LoadedFile) -> None:
-        """Add a file header + one channel row per analogue channel to the tree.
+        """Add a file node with bay → analogue/digital group → channel hierarchy.
+
+        Tree structure:
+          FILE (tristate, unchecked)
+            BAY_NAME (tristate, unchecked, collapsed)
+              Analogue (N)  (tristate, unchecked)
+                ch1 (unchecked) [Mode btn] [kV spin]
+                ...
+              Digital  (N)  (tristate, unchecked, collapsed)
+                dch1 (unchecked)
+                ...
+
+        All channels start unchecked — user selects what to display.
 
         Args:
             loaded: The _LoadedFile to add.
@@ -1023,123 +1166,353 @@ class UnifiedCanvasWidget(QWidget):
             | Qt.ItemFlag.ItemIsAutoTristate
             | Qt.ItemFlag.ItemIsUserCheckable
         )
-        file_item.setCheckState(TREE_COL_NAME, Qt.CheckState.Checked)
+        file_item.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+
+        # ── Group channels by bay ─────────────────────────────────────────────
+        analogue_by_bay: dict[str, list] = {}
+        for ch in loaded.record.analogue_channels:
+            bay = ch.bay_name or '(Ungrouped)'
+            analogue_by_bay.setdefault(bay, []).append(ch)
+
+        digital_by_bay: dict[str, list] = {}
+        for dch in loaded.record.digital_channels:
+            bay = dch.bay_name or '(Ungrouped)'
+            digital_by_bay.setdefault(bay, []).append(dch)
+
+        # Preserve parser-detected bay order; append any extras alphabetically
+        all_bays: set[str] = set(analogue_by_bay) | set(digital_by_bay)
+        bay_order: list[str] = list(loaded.record.bay_names) if loaded.record.bay_names else []
+        for b in sorted(all_bays):
+            if b not in bay_order:
+                bay_order.append(b)
+        if not bay_order:
+            bay_order = ['(All Channels)']
 
         self._tree.blockSignals(True)
-        for ch in loaded.record.analogue_channels:
-            key = (loaded.file_id, ch.channel_id)
-            mode   = self._channel_mode.get(key, 'raw')
-            locked = self._mode_locked.get(key, False)
-            _, side = self._stack_assign.get(key, (4, 'left'))
-            side_tag = '[R]' if side == 'right' else '[L]'
 
-            ch_item = QTreeWidgetItem([
-                f'  {side_tag} {ch.name}  [{ch.unit or "—"}]', '', '',
-            ])
-            ch_item.setData(TREE_COL_NAME, Qt.ItemDataRole.UserRole, ch.channel_id)
-            ch_item.setFlags(ch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            ch_item.setCheckState(
-                TREE_COL_NAME,
-                Qt.CheckState.Checked
-                if ch.channel_id in loaded.selected_ids
-                else Qt.CheckState.Unchecked,
+        for bay_name in bay_order:
+            a_chs = analogue_by_bay.get(bay_name, [])
+            d_chs = digital_by_bay.get(bay_name, [])
+            if not a_chs and not d_chs:
+                continue
+
+            bay_item = QTreeWidgetItem([bay_name])
+            bay_item.setData(
+                TREE_COL_NAME, Qt.ItemDataRole.UserRole,
+                ('bay', loaded.file_id, bay_name),
             )
-            file_item.addChild(ch_item)
+            bay_item.setFlags(
+                bay_item.flags()
+                | Qt.ItemFlag.ItemIsAutoTristate
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            bay_item.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+            file_item.addChild(bay_item)
 
-            # Mode toggle button — disabled for locked channels
-            btn = QPushButton()
-            btn.setFixedSize(54, 18)
-            btn.setStyleSheet('font-size: 7pt; padding: 1px;')
-            if locked:
-                btn.setText(mode.capitalize())
-                btn.setEnabled(False)
-                btn.setToolTip('Mode is fixed — this channel is in its native format.')
-            else:
-                btn.setText('Raw' if mode == 'raw' else 'RMS')
-                btn.clicked.connect(
-                    lambda _checked, fid=loaded.file_id, cid=ch.channel_id, b=btn:
-                        self._on_mode_toggled(fid, cid, b)
+            # ── Analogue sub-group ────────────────────────────────────────────
+            if a_chs:
+                agroup = QTreeWidgetItem([f'Analogue  ({len(a_chs)})'])
+                agroup.setData(
+                    TREE_COL_NAME, Qt.ItemDataRole.UserRole,
+                    ('agroup', loaded.file_id, bay_name),
                 )
-            self._tree.setItemWidget(ch_item, TREE_COL_MODE, btn)
+                agroup.setFlags(
+                    agroup.flags()
+                    | Qt.ItemFlag.ItemIsAutoTristate
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                agroup.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+                bay_item.addChild(agroup)
 
-            # Nominal kV spinbox for voltage channels
-            if self._is_voltage_channel(loaded.file_id, ch.channel_id):
-                spin = QDoubleSpinBox()
-                spin.setRange(0.0, 9999.0)
-                spin.setDecimals(1)
-                spin.setSuffix(' kV')
-                spin.setSpecialValueText('—')
-                spin.setFixedWidth(68)
-                spin.setStyleSheet('font-size: 7pt;')
-                spin.setToolTip(
-                    'System nominal voltage in line-to-line kV (e.g. 275).\n'
-                    'Right-click the file to set the voltage convention\n'
-                    '(Line-to-Line or Line-to-Earth channel values).'
-                )
-                spin.setValue(self._base_kv.get(key, 0.0))
-                spin.valueChanged.connect(
-                    lambda v, fid=loaded.file_id, cid=ch.channel_id:
-                        self._on_base_kv_changed(fid, cid, v)
-                )
-                self._tree.setItemWidget(ch_item, TREE_COL_BASE, spin)
+                for ch in a_chs:
+                    key = (loaded.file_id, ch.channel_id)
+                    mode   = self._channel_mode.get(key, 'raw')
+                    locked = self._mode_locked.get(key, False)
+                    _, side = self._stack_assign.get(key, (4, 'left'))
+                    side_tag = '[R]' if side == 'right' else '[L]'
+
+                    ch_item = QTreeWidgetItem(
+                        [f'{side_tag} {ch.name}  [{ch.unit or "—"}]', '', '']
+                    )
+                    ch_item.setData(
+                        TREE_COL_NAME, Qt.ItemDataRole.UserRole,
+                        ('ach', loaded.file_id, ch.channel_id),
+                    )
+                    ch_item.setFlags(ch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    ch_item.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+                    agroup.addChild(ch_item)
+
+                    btn = QPushButton()
+                    btn.setFixedSize(54, 18)
+                    btn.setStyleSheet('font-size: 7pt; padding: 1px;')
+                    if locked:
+                        btn.setText(mode.capitalize())
+                        btn.setEnabled(False)
+                        btn.setToolTip('Mode is fixed — channel is in its native format.')
+                    else:
+                        btn.setText('Raw' if mode == 'raw' else 'RMS')
+                        btn.clicked.connect(
+                            lambda _c, fid=loaded.file_id, cid=ch.channel_id, b=btn:
+                                self._on_mode_toggled(fid, cid, b)
+                        )
+                    self._tree.setItemWidget(ch_item, TREE_COL_MODE, btn)
+
+                    if self._is_voltage_channel(loaded.file_id, ch.channel_id):
+                        spin = QDoubleSpinBox()
+                        spin.setRange(0.0, 9999.0)
+                        spin.setDecimals(1)
+                        spin.setSuffix(' kV')
+                        spin.setSpecialValueText('—')
+                        spin.setFixedWidth(68)
+                        spin.setStyleSheet('font-size: 7pt;')
+                        spin.setToolTip(
+                            'System nominal voltage in line-to-line kV (e.g. 275).\n'
+                            'Right-click the file to set the voltage convention.'
+                        )
+                        spin.setValue(self._base_kv.get(key, 0.0))
+                        spin.valueChanged.connect(
+                            lambda v, fid=loaded.file_id, cid=ch.channel_id:
+                                self._on_base_kv_changed(fid, cid, v)
+                        )
+                        self._tree.setItemWidget(ch_item, TREE_COL_BASE, spin)
+
+            # ── Digital sub-group ─────────────────────────────────────────────
+            if d_chs:
+                # Skip secondary channels of complementary pairs (CLOSED side)
+                display_d = [
+                    dch for dch in d_chs
+                    if not (dch.is_complementary and not dch.is_primary_of_pair)
+                ]
+                if display_d:
+                    dgroup = QTreeWidgetItem([f'Digital  ({len(display_d)})'])
+                    dgroup.setData(
+                        TREE_COL_NAME, Qt.ItemDataRole.UserRole,
+                        ('dgroup', loaded.file_id, bay_name),
+                    )
+                    dgroup.setFlags(
+                        dgroup.flags()
+                        | Qt.ItemFlag.ItemIsAutoTristate
+                        | Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                    dgroup.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+                    bay_item.addChild(dgroup)
+                    dgroup.setExpanded(False)
+
+                    for dch in display_d:
+                        pair_tag = '  ⇌' if dch.is_primary_of_pair else ''
+                        dch_item = QTreeWidgetItem(
+                            [f'{dch.name}{pair_tag}', '', '']
+                        )
+                        dch_item.setData(
+                            TREE_COL_NAME, Qt.ItemDataRole.UserRole,
+                            ('dch', loaded.file_id, dch.channel_id),
+                        )
+                        dch_item.setFlags(dch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                        dch_item.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+                        dgroup.addChild(dch_item)
 
         self._tree.blockSignals(False)
         self._tree.addTopLevelItem(file_item)
         file_item.setExpanded(True)
+        # Bay nodes stay collapsed — user expands on demand
         loaded.tree_item = file_item
 
     def _on_tree_item_changed(self, item: QTreeWidgetItem, col: int) -> None:
-        """Sync selected_ids and rebuild canvas when a checkbox changes.
+        """Sync selected_ids / selected_digital_ids and rebuild when a checkbox changes.
+
+        Handles four tree levels: file → bay → group → channel.
+        File/bay/group nodes propagate their state down to all descendants.
+        PartiallyChecked state propagates upward automatically via ItemIsAutoTristate.
 
         Args:
             item: The item whose checkbox changed.
             col:  Column index (always TREE_COL_NAME).
         """
-        parent = item.parent()
-        if parent is None:
-            # File-level checkbox: propagate to all children in one pass to
-            # avoid N separate _rebuild_canvas calls (one per child signal).
-            file_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-            loaded = self._files.get(file_id)
-            if loaded is None:
-                return
-            state = item.checkState(TREE_COL_NAME)
-            self._tree.blockSignals(True)
-            if state == Qt.CheckState.Checked:
-                loaded.selected_ids = {
-                    ch.channel_id for ch in loaded.record.analogue_channels
-                }
-                for i in range(item.childCount()):
-                    item.child(i).setCheckState(TREE_COL_NAME, Qt.CheckState.Checked)
-            elif state == Qt.CheckState.Unchecked:
-                loaded.selected_ids.clear()
-                for i in range(item.childCount()):
-                    item.child(i).setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
-            # PartiallyChecked is set automatically by ItemIsAutoTristate when
-            # individual children change — selected_ids already updated by the
-            # per-child path below, nothing more to do here.
-            self._tree.blockSignals(False)
+        if col != TREE_COL_NAME or self._in_tree_change:
+            return
+
+        data  = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+        state = item.checkState(TREE_COL_NAME)
+
+        # PartiallyChecked propagates upward from children automatically.
+        # Just sync selected_ids from the current tree state and rebuild.
+        if state == Qt.CheckState.PartiallyChecked:
+            file_id = self._get_file_id_for_item(item)
+            if file_id and file_id in self._files:
+                self._sync_selected_ids(self._files[file_id])
             self._rebuild_canvas()
             return
 
-        file_id = parent.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-        ch_id   = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-        loaded  = self._files.get(file_id)
-        if loaded is None or ch_id is None:
+        file_id = self._get_file_id_for_item(item)
+        if file_id is None:
+            return
+        loaded = self._files.get(file_id)
+        if loaded is None:
             return
 
-        if item.checkState(TREE_COL_NAME) == Qt.CheckState.Checked:
-            loaded.selected_ids.add(ch_id)
+        is_group_node = (
+            isinstance(data, str)
+            or (isinstance(data, tuple) and data[0] in ('bay', 'agroup', 'dgroup'))
+        )
+
+        if is_group_node:
+            # Propagate down with signals blocked, then fix parent tristates
+            self._in_tree_change = True
+            try:
+                self._tree.blockSignals(True)
+                self._propagate_check_down(item, state)
+                self._tree.blockSignals(False)
+                self._update_ancestors(item)
+            finally:
+                self._in_tree_change = False
+            self._sync_selected_ids(loaded)
         else:
-            loaded.selected_ids.discard(ch_id)
+            # Channel node — update directly
+            if isinstance(data, tuple) and len(data) == 3:
+                kind, _fid, ch_id = data
+                if kind == 'ach':
+                    if state == Qt.CheckState.Checked:
+                        loaded.selected_ids.add(ch_id)
+                    else:
+                        loaded.selected_ids.discard(ch_id)
+                elif kind == 'dch':
+                    if state == Qt.CheckState.Checked:
+                        loaded.selected_digital_ids.add(ch_id)
+                    else:
+                        loaded.selected_digital_ids.discard(ch_id)
 
         self._rebuild_canvas()
+
+    # ── Tree helper methods ────────────────────────────────────────────────────
+
+    def _get_file_id_for_item(self, item: QTreeWidgetItem) -> Optional[str]:
+        """Walk up to the top-level (file) node and return its file_id.
+
+        Args:
+            item: Any QTreeWidgetItem in the tree.
+
+        Returns:
+            file_id string, or None if the root node is not a file node.
+        """
+        root = item
+        while root.parent() is not None:
+            root = root.parent()
+        data = root.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+        return data if isinstance(data, str) else None
+
+    def _propagate_check_down(
+        self,
+        item:  QTreeWidgetItem,
+        state: Qt.CheckState,
+    ) -> None:
+        """Recursively set all descendants to ``state``.
+
+        Must be called with signals blocked to prevent N rebuild calls.
+
+        Args:
+            item:  The parent whose subtree to update.
+            state: Target check state (Checked or Unchecked).
+        """
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(TREE_COL_NAME, state)
+            self._propagate_check_down(child, state)
+
+    def _recalculate_tristate(self, item: QTreeWidgetItem) -> None:
+        """Set ``item``'s check state to match the aggregate of its children.
+
+        Args:
+            item: A group/bay/file node with children.
+        """
+        n = item.childCount()
+        if n == 0:
+            return
+        checked = sum(
+            1 for i in range(n)
+            if item.child(i).checkState(TREE_COL_NAME) == Qt.CheckState.Checked
+        )
+        partial = sum(
+            1 for i in range(n)
+            if item.child(i).checkState(TREE_COL_NAME) == Qt.CheckState.PartiallyChecked
+        )
+        if checked == n:
+            item.setCheckState(TREE_COL_NAME, Qt.CheckState.Checked)
+        elif checked == 0 and partial == 0:
+            item.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+        else:
+            item.setCheckState(TREE_COL_NAME, Qt.CheckState.PartiallyChecked)
+
+    def _update_ancestors(self, item: QTreeWidgetItem) -> None:
+        """Walk upward from ``item`` and recalculate tristate on each ancestor.
+
+        Called after a blocked batch propagation, so parent nodes didn't
+        receive automatic tristate updates.
+
+        Args:
+            item: The item whose ancestors to update.
+        """
+        parent = item.parent()
+        while parent is not None:
+            self._tree.blockSignals(True)
+            self._recalculate_tristate(parent)
+            self._tree.blockSignals(False)
+            parent = parent.parent()
+
+    def _sync_selected_ids(self, loaded: _LoadedFile) -> None:
+        """Rebuild selected_ids and selected_digital_ids from current tree state.
+
+        Scans the entire file subtree; O(N) but N ≤ a few hundred channels.
+
+        Args:
+            loaded: The _LoadedFile whose selection to sync.
+        """
+        if loaded.tree_item is None:
+            return
+        loaded.selected_ids.clear()
+        loaded.selected_digital_ids.clear()
+
+        def _walk(node: QTreeWidgetItem) -> None:
+            data = node.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+            st   = node.checkState(TREE_COL_NAME)
+            if isinstance(data, tuple) and len(data) == 3:
+                kind = data[0]
+                if kind == 'ach' and st == Qt.CheckState.Checked:
+                    loaded.selected_ids.add(data[2])
+                elif kind == 'dch' and st == Qt.CheckState.Checked:
+                    loaded.selected_digital_ids.add(data[2])
+            for i in range(node.childCount()):
+                _walk(node.child(i))
+
+        _walk(loaded.tree_item)
+
+    def _find_bay_item(
+        self,
+        file_id:  str,
+        bay_name: str,
+    ) -> Optional[QTreeWidgetItem]:
+        """Return the QTreeWidgetItem for a bay node, or None if not found.
+
+        Args:
+            file_id:  The file this bay belongs to.
+            bay_name: The bay label string.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None or loaded.tree_item is None:
+            return None
+        for i in range(loaded.tree_item.childCount()):
+            bay = loaded.tree_item.child(i)
+            d = bay.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+            if isinstance(d, tuple) and d[0] == 'bay' and d[2] == bay_name:
+                return bay
+        return None
 
     def _on_tree_context_menu(self, pos) -> None:
         """Right-click on tree item → context menu.
 
-        File-level items:  Set Start Time / Auto-align from Frequency.
-        Channel-level items: stack reassignment (existing behaviour).
+        File nodes:    Set Start Time / Auto-align / Voltage Convention.
+        Bay nodes:     Select standard set / Check all / Uncheck all.
+        Analogue chs:  Stack reassignment.
+        Digital chs:   (reserved for future actions).
 
         Args:
             pos: Click position in tree viewport coordinates.
@@ -1150,13 +1523,11 @@ class UnifiedCanvasWidget(QWidget):
             return
 
         global_pos = self._tree.viewport().mapToGlobal(pos)
+        data = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
 
         # ── File-level context menu ───────────────────────────────────────────
-        if item.parent() is None:
-            file_id = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-            if file_id is None:
-                return
-
+        if isinstance(data, str):
+            file_id = data
             loaded_file = self._files.get(file_id)
             if loaded_file is None:
                 return
@@ -1172,15 +1543,8 @@ class UnifiedCanvasWidget(QWidget):
                     align_acts[other_id] = act
             if not align_acts:
                 align_menu.setEnabled(False)
-                align_menu.setToolTip(
-                    'No other files with a valid timestamp are loaded.\n'
-                    'Set the start time on this file first, then use\n'
-                    'Auto-align to fine-tune sub-second drift.'
-                )
 
             menu.addSeparator()
-
-            # Voltage convention submenu
             conv_menu = menu.addMenu('Voltage Convention (channel value format)')
             ll_act = conv_menu.addAction('Channel values are Line-to-Line  (default)')
             le_act = conv_menu.addAction('Channel values are Line-to-Earth  (phase-to-earth)')
@@ -1202,49 +1566,168 @@ class UnifiedCanvasWidget(QWidget):
                         self._do_auto_align(file_id, ref_id)
             return
 
-        # ── Channel-level context menu — stack reassignment ───────────────────
-        file_item = item.parent()
-        file_id = file_item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-        ch_id   = item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
-        if file_id is None or ch_id is None:
+        if not isinstance(data, tuple):
+            return
+        kind = data[0]
+
+        # ── Bay-level context menu ────────────────────────────────────────────
+        if kind == 'bay':
+            _, file_id, bay_name = data
+            menu = QMenu(self)
+            std_act  = menu.addAction('Select standard set  (3Ф V + I)')
+            menu.addSeparator()
+            all_act  = menu.addAction('Check all channels in bay')
+            none_act = menu.addAction('Uncheck all channels in bay')
+            chosen = menu.exec(global_pos)
+            if chosen is std_act:
+                self._select_standard_set(file_id, bay_name)
+            elif chosen is all_act:
+                self._set_bay_check(file_id, bay_name, Qt.CheckState.Checked)
+            elif chosen is none_act:
+                self._set_bay_check(file_id, bay_name, Qt.CheckState.Unchecked)
             return
 
-        key = (file_id, ch_id)
-        curr_stack, curr_side = self._stack_assign.get(key, (4, 'left'))
-
-        menu       = QMenu(self)
-        left_menu  = menu.addMenu('→ Left Axis')
-        right_menu = menu.addMenu('→ Right Axis')
-
-        left_actions:  dict[int, object] = {}
-        right_actions: dict[int, object] = {}
-        for sidx, sname in STACK_NAMES.items():
-            la = left_menu.addAction(sname)
-            la.setCheckable(True)
-            la.setChecked(curr_stack == sidx and curr_side == 'left')
-            left_actions[sidx] = la
-
-            ra = right_menu.addAction(sname)
-            ra.setCheckable(True)
-            ra.setChecked(curr_stack == sidx and curr_side == 'right')
-            right_actions[sidx] = ra
-
-        chosen = menu.exec(global_pos)
-        if chosen is None:
+        # Group nodes: no menu
+        if kind in ('agroup', 'dgroup'):
             return
 
-        for sidx, act in left_actions.items():
-            if chosen is act:
-                self._stack_assign[key] = (sidx, 'left')
-                self._refresh_tree_label(item, file_id, ch_id)
-                self._rebuild_canvas()
+        # ── Analogue channel — stack reassignment + scatter toggle ────────────
+        if kind == 'ach':
+            _, file_id, ch_id = data
+            key = (file_id, ch_id)
+            curr_stack, curr_side = self._stack_assign.get(key, (4, 'left'))
+            loaded_ch = self._files.get(file_id)
+
+            menu       = QMenu(self)
+
+            # Scatter / line display toggle
+            scatter_act = menu.addAction('Display as Scatter')
+            scatter_act.setCheckable(True)
+            scatter_act.setChecked(
+                loaded_ch is not None and ch_id in loaded_ch.scatter_ids
+            )
+            menu.addSeparator()
+
+            left_menu  = menu.addMenu('→ Left Axis')
+            right_menu = menu.addMenu('→ Right Axis')
+
+            left_actions:  dict[int, object] = {}
+            right_actions: dict[int, object] = {}
+            for sidx, sname in STACK_NAMES.items():
+                la = left_menu.addAction(sname)
+                la.setCheckable(True)
+                la.setChecked(curr_stack == sidx and curr_side == 'left')
+                left_actions[sidx] = la
+
+                ra = right_menu.addAction(sname)
+                ra.setCheckable(True)
+                ra.setChecked(curr_stack == sidx and curr_side == 'right')
+                right_actions[sidx] = ra
+
+            chosen = menu.exec(global_pos)
+            if chosen is None:
                 return
-        for sidx, act in right_actions.items():
-            if chosen is act:
-                self._stack_assign[key] = (sidx, 'right')
-                self._refresh_tree_label(item, file_id, ch_id)
-                self._rebuild_canvas()
+            if chosen is scatter_act:
+                if loaded_ch is not None:
+                    if ch_id in loaded_ch.scatter_ids:
+                        loaded_ch.scatter_ids.discard(ch_id)
+                    else:
+                        loaded_ch.scatter_ids.add(ch_id)
+                    self._rebuild_canvas()
                 return
+            for sidx, act in left_actions.items():
+                if chosen is act:
+                    self._stack_assign[key] = (sidx, 'left')
+                    self._refresh_tree_label(item, file_id, ch_id)
+                    self._rebuild_canvas()
+                    return
+            for sidx, act in right_actions.items():
+                if chosen is act:
+                    self._stack_assign[key] = (sidx, 'right')
+                    self._refresh_tree_label(item, file_id, ch_id)
+                    self._rebuild_canvas()
+                    return
+
+    # ── Bay selection helpers ──────────────────────────────────────────────────
+
+    def _select_standard_set(self, file_id: str, bay_name: str) -> None:
+        """Check only the standard 3-phase V + I channels for one bay.
+
+        Checks all V_PHASE/V_LINE/V_RESIDUAL/I_PHASE/I_EARTH analogue channels
+        in the bay and unchecks everything else in that bay.
+
+        Args:
+            file_id:  The file this bay belongs to.
+            bay_name: Bay label string.
+        """
+        loaded = self._files.get(file_id)
+        bay_item = self._find_bay_item(file_id, bay_name)
+        if loaded is None or bay_item is None:
+            return
+
+        ch_map = {c.channel_id: c for c in loaded.record.analogue_channels}
+
+        self._in_tree_change = True
+        try:
+            self._tree.blockSignals(True)
+            for i in range(bay_item.childCount()):
+                grp = bay_item.child(i)
+                grp_data = grp.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+                if not (isinstance(grp_data, tuple) and grp_data[0] == 'agroup'):
+                    continue
+                for j in range(grp.childCount()):
+                    ch_item = grp.child(j)
+                    ch_data = ch_item.data(TREE_COL_NAME, Qt.ItemDataRole.UserRole)
+                    if not (isinstance(ch_data, tuple) and ch_data[0] == 'ach'):
+                        continue
+                    ch = ch_map.get(ch_data[2])
+                    target_state = (
+                        Qt.CheckState.Checked
+                        if ch and ch.signal_role in _STANDARD_SET_ROLES
+                        else Qt.CheckState.Unchecked
+                    )
+                    ch_item.setCheckState(TREE_COL_NAME, target_state)
+                self._recalculate_tristate(grp)
+            self._recalculate_tristate(bay_item)
+            if bay_item.parent():
+                self._recalculate_tristate(bay_item.parent())
+            self._tree.blockSignals(False)
+        finally:
+            self._in_tree_change = False
+
+        self._sync_selected_ids(loaded)
+        self._rebuild_canvas()
+
+    def _set_bay_check(
+        self,
+        file_id:  str,
+        bay_name: str,
+        state:    Qt.CheckState,
+    ) -> None:
+        """Check or uncheck all channels in a bay.
+
+        Args:
+            file_id:  The file this bay belongs to.
+            bay_name: Bay label string.
+            state:    Target check state.
+        """
+        loaded   = self._files.get(file_id)
+        bay_item = self._find_bay_item(file_id, bay_name)
+        if loaded is None or bay_item is None:
+            return
+
+        self._in_tree_change = True
+        try:
+            self._tree.blockSignals(True)
+            self._propagate_check_down(bay_item, state)
+            bay_item.setCheckState(TREE_COL_NAME, state)
+            self._update_ancestors(bay_item)
+            self._tree.blockSignals(False)
+        finally:
+            self._in_tree_change = False
+
+        self._sync_selected_ids(loaded)
+        self._rebuild_canvas()
 
     # ── Start-time anchor (mechanism 2) ───────────────────────────────────────
 
@@ -1399,7 +1882,7 @@ class UnifiedCanvasWidget(QWidget):
         _, side = self._stack_assign.get((file_id, ch_id), (4, 'left'))
         side_tag = '[R]' if side == 'right' else '[L]'
         self._tree.blockSignals(True)
-        item.setText(TREE_COL_NAME, f'  {side_tag} {ch.name}  [{ch.unit or "—"}]')
+        item.setText(TREE_COL_NAME, f'{side_tag} {ch.name}  [{ch.unit or "—"}]')
         self._tree.blockSignals(False)
 
     def _on_mode_toggled(
@@ -1480,16 +1963,17 @@ class UnifiedCanvasWidget(QWidget):
     def _rebuild_canvas(self) -> None:
         """Clear and rebuild all stacks from scratch.
 
-        Called on structural changes: file add/remove, channel checkbox toggle,
-        stack assignment change.  Offset changes and mode toggles use the
-        lighter _update_curves() path instead.
+        Each active stack lives in its own PlotWidget inside self._splitter,
+        giving the user native drag-to-resize handles between stacks.
+        The digital events strip uses a _DigitalViewBox so mouse-wheel
+        scrolls through channels instead of zooming.
+
+        Called on structural changes: file add/remove, checkbox toggle,
+        stack assignment change.  Offset / mode changes use _update_curves().
         """
-        # Break all X-links before destroying the scene.  PyQtGraph does not
-        # disconnect these itself and a pending resize event after clear() will
-        # call screenGeometry() on the already-deleted C++ ViewBox objects.
-        # vb2 items are added directly to the scene (not to the GLW layout),
-        # so glw.clear() does NOT remove them — must be removed explicitly or
-        # they persist as ghost ViewBoxes with stale curves still visible.
+        # ── 1. Disconnect all X-links and remove secondary ViewBoxes ─────────
+        # Must happen BEFORE the PlotWidgets are removed from the splitter,
+        # otherwise pending resize events reach already-deleted C++ objects.
         for vb2 in self._stack_vb2s.values():
             try:
                 vb2.setXLink(None)
@@ -1507,12 +1991,21 @@ class UnifiedCanvasWidget(QWidget):
             except RuntimeError:
                 pass
 
-        self._glw.clear()
+        # ── 2. Remove all PlotWidgets from the splitter ───────────────────────
+        while self._splitter.count() > 0:
+            w = self._splitter.widget(0)
+            w.setParent(None)   # detach; Python GC will clean up
+            w.deleteLater()
+
+        self._stack_widgets.clear()
         self._stack_plots.clear()
         self._stack_vb2s.clear()
         self._cursor1_lines.clear()
         self._cursor2_lines.clear()
         self._curves.clear()
+        self._digital_curves.clear()
+        self._digital_row.clear()
+        self._time_axes.clear()
         self._ref_plot = None
 
         active = sorted(self._get_active_stacks())
@@ -1525,14 +2018,93 @@ class UnifiedCanvasWidget(QWidget):
         for row_idx, stack_idx in enumerate(active):
             is_last = row_idx == len(active) - 1
 
-            plot: pg.PlotItem = self._glw.addPlot(row=row_idx, col=0)
-            plot.setMinimumHeight(120)
+            # ── Digital events strip ──────────────────────────────────────────
+            if stack_idx == STACK_DIGITAL:
+                n_digital = sum(
+                    len(f.selected_digital_ids) for f in self._files.values()
+                )
+                # _DigitalViewBox: wheel pans Y; X is controlled by X-link
+                dig_vb   = _DigitalViewBox()
+                dig_t_ax = _TimeAxis(orientation='bottom')
+                dig_t_ax.set_cycles_mode(self._xaxis_cycles, self._get_nominal_freq())
+                dig_pw   = pg.PlotWidget(
+                    background=CANVAS_BG,
+                    viewBox=dig_vb,
+                    axisItems={'bottom': dig_t_ax},
+                )
+                self._time_axes[STACK_DIGITAL] = dig_t_ax
+                dig_plot: pg.PlotItem = dig_pw.getPlotItem()
+
+                # Height: show up to 8 rows initially; splitter lets user grow
+                visible_rows = min(n_digital, 8)
+                dig_pw.setMinimumHeight(50)
+                self._splitter.addWidget(dig_pw)
+                self._splitter.setCollapsible(row_idx, False)
+
+                dig_plot.showGrid(x=True, y=False, alpha=0.15)
+                dig_plot.setMenuEnabled(False)
+                dig_vb.setMenuEnabled(False)
+                dig_vb.setMouseEnabled(x=False, y=True)
+                _t_lbl = 'Time (cycles)' if self._xaxis_cycles else 'Time (s)'
+                dig_plot.setLabel('bottom', _t_lbl)
+                dig_plot.setLabel('left', 'Events')
+                dig_plot.hideAxis('right')
+                dig_plot.setYRange(
+                    -0.3,
+                    max(1.0, float(visible_rows)) - 0.3,
+                    padding=0,
+                )
+
+                if ref_plot is None:
+                    ref_plot = dig_plot
+                else:
+                    dig_plot.setXLink(ref_plot)
+
+                c1d = pg.InfiniteLine(
+                    pos=0.0, angle=90, movable=True,
+                    pen=pg.mkPen(CURSOR1_COLOUR, width=1, style=Qt.PenStyle.DashLine),
+                )
+                c1d.setZValue(100)
+                c1d.sigDragged.connect(self._on_cursor_dragged)
+                if self._cursor1_enabled:
+                    dig_plot.addItem(c1d)
+                self._cursor1_lines[STACK_DIGITAL] = c1d
+
+                c2d = pg.InfiniteLine(
+                    pos=0.0, angle=90, movable=True,
+                    pen=pg.mkPen(CURSOR2_COLOUR, width=1, style=Qt.PenStyle.DashLine),
+                )
+                c2d.setZValue(99)
+                c2d.sigDragged.connect(self._on_cursor_dragged)
+                if self._cursor2_enabled:
+                    dig_plot.addItem(c2d)
+                self._cursor2_lines[STACK_DIGITAL] = c2d
+
+                dig_pw.scene().sigMouseClicked.connect(
+                    lambda ev, p=dig_plot: self._on_canvas_clicked(ev, p)
+                )
+                self._stack_widgets[STACK_DIGITAL] = dig_pw
+                self._stack_plots[STACK_DIGITAL]   = dig_plot
+                # No vb2 for digital strip
+                continue
+
+            # ── Analogue stack ────────────────────────────────────────────────
+            t_ax = _TimeAxis(orientation='bottom')
+            t_ax.set_cycles_mode(self._xaxis_cycles, self._get_nominal_freq())
+            pw   = pg.PlotWidget(background=CANVAS_BG, axisItems={'bottom': t_ax})
+            self._time_axes[stack_idx] = t_ax
+            plot: pg.PlotItem = pw.getPlotItem()
+            pw.setMinimumHeight(100)
+            self._splitter.addWidget(pw)
+            self._splitter.setCollapsible(row_idx, False)
+
             plot.showGrid(x=True, y=True, alpha=0.15)
             plot.setMenuEnabled(False)
             plot.getViewBox().setMenuEnabled(False)
 
+            _t_lbl = 'Time (cycles)' if self._xaxis_cycles else 'Time (s)'
             if is_last:
-                plot.setLabel('bottom', 'Time (s)')
+                plot.setLabel('bottom', _t_lbl)
             else:
                 plot.hideAxis('bottom')
 
@@ -1564,7 +2136,6 @@ class UnifiedCanvasWidget(QWidget):
             else:
                 plot.setXLink(ref_plot)
 
-            # Cursor 1 (gold) — z=100
             c1 = pg.InfiniteLine(
                 pos=0.0, angle=90, movable=True,
                 pen=pg.mkPen(CURSOR1_COLOUR, width=1, style=Qt.PenStyle.DashLine),
@@ -1579,7 +2150,6 @@ class UnifiedCanvasWidget(QWidget):
                 plot.addItem(c1)
             self._cursor1_lines[stack_idx] = c1
 
-            # Cursor 2 (cyan) — z=99
             c2 = pg.InfiniteLine(
                 pos=0.0, angle=90, movable=True,
                 pen=pg.mkPen(CURSOR2_COLOUR, width=1, style=Qt.PenStyle.DashLine),
@@ -1594,15 +2164,29 @@ class UnifiedCanvasWidget(QWidget):
                 plot.addItem(c2)
             self._cursor2_lines[stack_idx] = c2
 
-            self._stack_plots[stack_idx] = plot
-            self._stack_vb2s[stack_idx]  = vb2
+            pw.scene().sigMouseClicked.connect(
+                lambda ev, p=plot: self._on_canvas_clicked(ev, p)
+            )
+            self._stack_widgets[stack_idx] = pw
+            self._stack_plots[stack_idx]   = plot
+            self._stack_vb2s[stack_idx]    = vb2
 
         self._ref_plot = ref_plot
+
+        # Set equal initial heights; user can resize via splitter handles
+        n = self._splitter.count()
+        if n > 0:
+            self._splitter.setSizes([200] * n)
+
         self._plot_all_channels()
         self._update_readout()
+        self._readout.raise_()   # keep overlay on top after widget rebuild
 
     def _get_active_stacks(self) -> set[int]:
         """Return stack indices that have at least one checked channel.
+
+        Analogue channels contribute their assigned stack index.
+        Any selected digital channel adds STACK_DIGITAL (always last).
 
         Returns:
             Set of active stack_idx values.
@@ -1614,6 +2198,8 @@ class UnifiedCanvasWidget(QWidget):
                     (loaded.file_id, ch_id), (4, 'left')
                 )
                 active.add(stack_idx)
+            if loaded.selected_digital_ids:
+                active.add(STACK_DIGITAL)
         return active
 
     def _plot_all_channels(self) -> None:
@@ -1643,12 +2229,21 @@ class UnifiedCanvasWidget(QWidget):
                     continue
 
                 colour = getattr(ch, 'colour', None) or '#AAAAAA'
-                curve = pg.PlotDataItem(
-                    t_data,
-                    y_data,
-                    pen=pg.mkPen(colour, width=1),
-                    name=f'{loaded.path.stem}/{ch.name}',
-                )
+                if ch.channel_id in loaded.scatter_ids:
+                    curve = pg.PlotDataItem(
+                        t_data, y_data,
+                        pen=None,
+                        symbol='o', symbolSize=3,
+                        symbolBrush=pg.mkBrush(colour),
+                        symbolPen=None,
+                        name=f'{loaded.path.stem}/{ch.name}',
+                    )
+                else:
+                    curve = pg.PlotDataItem(
+                        t_data, y_data,
+                        pen=pg.mkPen(colour, width=1),
+                        name=f'{loaded.path.stem}/{ch.name}',
+                    )
 
                 if side == 'right':
                     self._stack_vb2s[stack_idx].addItem(curve)
@@ -1668,6 +2263,70 @@ class UnifiedCanvasWidget(QWidget):
         if self._pu_mode and 0 in self._stack_plots:
             _yr = AppSettings.get('calculation.pu_yrange', 2.0)
             self._stack_plots[0].setYRange(-_yr, _yr, padding=0)
+
+        # ── Digital events strip ──────────────────────────────────────────────
+        if STACK_DIGITAL not in self._stack_plots:
+            return
+
+        dig_plot = self._stack_plots[STACK_DIGITAL]
+        channel_row = 0
+        tick_labels: list[tuple[float, str]] = []
+
+        for loaded in self._files.values():
+            dch_map = {c.channel_id: c for c in loaded.record.digital_channels}
+            for dch_id in sorted(loaded.selected_digital_ids):
+                dch = dch_map.get(dch_id)
+                if dch is None:
+                    continue
+                t_data, y_data = self._digital_xy(loaded, dch, ref_epoch, channel_row)
+                if t_data is None or len(t_data) == 0:
+                    channel_row += 1
+                    continue
+
+                colour = getattr(dch, 'colour', '#AAAAAA') or '#AAAAAA'
+                curve = pg.PlotDataItem(
+                    t_data, y_data,
+                    pen=pg.mkPen(colour, width=1.5),
+                    fillLevel=float(channel_row),
+                    brush=pg.mkBrush(colour + '55'),
+                )
+                dig_plot.addItem(curve)
+                key = (loaded.file_id, dch_id)
+                self._digital_curves[key] = curve
+                self._digital_row[key]    = channel_row
+
+                label = f'{loaded.path.stem[:6]}/{dch.name[:14]}'
+                tick_labels.append((channel_row + DIG_CH_HEIGHT / 2, label))
+                channel_row += 1
+
+        if tick_labels:
+            dig_plot.getAxis('left').setTicks([tick_labels])
+        dig_plot.setYRange(-0.3, max(1.0, float(channel_row)) - 0.3, padding=0)
+        self._update_digital_tick_font()
+
+    # ── Digital tick-font auto-size ────────────────────────────────────────────
+
+    def _update_digital_tick_font(self, *_) -> None:
+        """Fit Y-axis tick labels in the digital strip without overlap.
+
+        Computes a point size proportional to the pixel height available per
+        channel row and applies it to the left axis.  Called once after
+        plotting and again whenever the user drags a splitter handle.
+        """
+        if STACK_DIGITAL not in self._stack_plots or STACK_DIGITAL not in self._stack_widgets:
+            return
+        n_rows = max(1, len(self._digital_row))
+        dig_pw   = self._stack_widgets[STACK_DIGITAL]
+        dig_plot = self._stack_plots[STACK_DIGITAL]
+        # Usable plot area is roughly 85 % of the widget height
+        px_available = dig_pw.height() * 0.85
+        if px_available <= 10:
+            px_available = 200 * 0.85   # fallback before first layout pass
+        px_per_row = px_available / n_rows
+        pt = max(6, min(11, int(px_per_row * 0.55)))
+        font = QFont()
+        font.setPointSize(pt)
+        dig_plot.getAxis('left').setStyle(tickFont=font)
 
     # ── Curve update (no layout rebuild) ──────────────────────────────────────
 
@@ -1699,6 +2358,22 @@ class UnifiedCanvasWidget(QWidget):
             self._stack_plots[0].setYRange(-_yr, _yr, padding=0)
         elif not self._pu_mode and 0 in self._stack_plots:
             self._stack_plots[0].enableAutoRange(axis='y', enable=True)
+
+        # Update digital channel curves
+        for loaded in self._files.values():
+            dch_map = {c.channel_id: c for c in loaded.record.digital_channels}
+            for dch_id in loaded.selected_digital_ids:
+                key = (loaded.file_id, dch_id)
+                curve = self._digital_curves.get(key)
+                if curve is None:
+                    continue
+                dch = dch_map.get(dch_id)
+                if dch is None:
+                    continue
+                row = self._digital_row.get(key, 0)
+                t_data, y_data = self._digital_xy(loaded, dch, ref_epoch, row)
+                if t_data is not None and len(t_data) > 0:
+                    curve.setData(t_data, y_data)
 
     def _channel_xy(
         self,
@@ -1850,24 +2525,27 @@ class UnifiedCanvasWidget(QWidget):
                 cursor.blockSignals(False)
         self._update_readout()
 
-    def _on_canvas_clicked(self, event) -> None:
-        """Right-click anywhere on the canvas → cursor enable/disable menu.
+    def _on_canvas_clicked(self, event, plot: pg.PlotItem) -> None:
+        """Right-click within a stack PlotWidget → cursor enable/disable menu.
+
+        Each PlotWidget connects its scene's sigMouseClicked to this slot with
+        the owning PlotItem captured via lambda, so we know exactly which
+        scene the click came from without cross-scene coordinate confusion.
 
         Args:
-            event: PyQtGraph MouseClickEvent from the GLW scene.
+            event: PyQtGraph MouseClickEvent from the PlotWidget's scene.
+            plot:  The PlotItem that owns the scene that was clicked.
         """
         if event.button() != Qt.MouseButton.RightButton:
             return
-        in_any_plot = any(
-            p.getViewBox().sceneBoundingRect().contains(event.scenePos())
-            for p in self._stack_plots.values()
-        )
-        if not in_any_plot:
+        if not plot.getViewBox().sceneBoundingRect().contains(event.scenePos()):
             return
         event.accept()
 
         from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
         menu = QMenu(self)
+        fit_act = menu.addAction('Zoom to Fit')
+        menu.addSeparator()
         act1 = menu.addAction('Cursor 1  (gold)')
         act1.setCheckable(True)
         act1.setChecked(self._cursor1_enabled)
@@ -1876,7 +2554,9 @@ class UnifiedCanvasWidget(QWidget):
         act2.setChecked(self._cursor2_enabled)
 
         chosen = menu.exec(event.screenPos().toPoint())
-        if chosen is act1:
+        if chosen is fit_act:
+            self._zoom_to_fit()
+        elif chosen is act1:
             self._set_cursor_enabled(1, not self._cursor1_enabled)
         elif chosen is act2:
             self._set_cursor_enabled(2, not self._cursor2_enabled)
@@ -1910,53 +2590,37 @@ class UnifiedCanvasWidget(QWidget):
         self._update_readout()
 
     def _update_readout(self) -> None:
-        """Rebuild the readout overlay text from active cursor positions."""
-        if self._readout is None:
-            return
+        """Emit cursor positions and per-channel values to the measurement panel."""
+        _nan = float('nan')
         any_active = self._cursor1_enabled or self._cursor2_enabled
         if not any_active or not self._curves:
-            self._readout.hide()
+            self.readout_updated.emit(_nan, _nan, [])
             return
 
-        lines: list[str] = []
+        # \u2500\u2500 Cursor times \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        c1_line = next(iter(self._cursor1_lines.values()), None)
+        c2_line = next(iter(self._cursor2_lines.values()), None)
+        t_c1 = c1_line.value() if (self._cursor1_enabled and c1_line) else _nan
+        t_c2 = c2_line.value() if (self._cursor2_enabled and c2_line) else _nan
 
-        for n, cursor_lines, enabled in (
-            (1, self._cursor1_lines, self._cursor1_enabled),
-            (2, self._cursor2_lines, self._cursor2_enabled),
-        ):
-            if not enabled:
-                continue
-            cursor = next(iter(cursor_lines.values()), None)
-            if cursor is None:
-                continue
-            t = cursor.value()
-            lines.append(f'C{n}  {t:.3f} s')
-            for loaded in self._files.values():
-                for ch_id in loaded.selected_ids:
-                    key = (loaded.file_id, ch_id)
-                    if key not in self._curves:
-                        continue
-                    val = self._get_value_at_cursor(t, key)
-                    ch_map = {c.channel_id: c for c in loaded.record.analogue_channels}
-                    ch = ch_map.get(ch_id)
-                    if ch is None:
-                        continue
-                    name = f'{loaded.path.stem[:8]}/{ch.name}'
-                    short = name if len(name) <= 18 else name[:17] + '\u2026'
-                    val_str = f'{val:.4f}' if not np.isnan(val) else '---'
-                    lines.append(f'  {short:<18}  {val_str}')
+        # \u2500\u2500 Per-channel rows \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        rows: list[tuple[str, str, float, float]] = []
+        for loaded in self._files.values():
+            ch_map = {c.channel_id: c for c in loaded.record.analogue_channels}
+            for ch_id in loaded.selected_ids:
+                key = (loaded.file_id, ch_id)
+                if key not in self._curves:
+                    continue
+                ch = ch_map.get(ch_id)
+                if ch is None:
+                    continue
+                name    = f'{loaded.path.stem[:8]}/{ch.name}'
+                unit    = getattr(ch, 'unit', '') or ''
+                val_c1  = self._get_value_at_cursor(t_c1, key) if not math.isnan(t_c1) else _nan
+                val_c2  = self._get_value_at_cursor(t_c2, key) if not math.isnan(t_c2) else _nan
+                rows.append((name, unit, val_c1, val_c2))
 
-        if self._cursor1_enabled and self._cursor2_enabled:
-            c1 = next(iter(self._cursor1_lines.values()), None)
-            c2 = next(iter(self._cursor2_lines.values()), None)
-            if c1 and c2:
-                dx = abs(c2.value() - c1.value())
-                lines.append(f'\u0394X = {dx:.3f} s')
-
-        self._readout.setText('\n'.join(lines))
-        self._readout.adjustSize()
-        self._readout.show()
-        self._reposition_readout()
+        self.readout_updated.emit(t_c1, t_c2, rows)
 
     def _reposition_readout(self) -> None:
         """Position the readout overlay within the GLW widget bounds."""
@@ -2106,7 +2770,153 @@ class UnifiedCanvasWidget(QWidget):
         self._phasor_dialog.raise_()
         self._phasor_dialog.activateWindow()
 
+    # ── Digital channel XY helper ──────────────────────────────────────────────
+
+    def _digital_xy(
+        self,
+        loaded:      _LoadedFile,
+        dch:         object,
+        ref_epoch:   float,
+        channel_row: int,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Build step-function display arrays for one digital channel.
+
+        Returns decimated (t_abs, y) where y is the 0/1 state scaled to a
+        DIG_CH_HEIGHT band offset by channel_row.  A step-function is created
+        by repeating each sample so transitions are vertical.
+
+        Args:
+            loaded:      The owning _LoadedFile.
+            dch:         A DigitalChannel instance.
+            ref_epoch:   Reference POSIX epoch (earliest loaded file).
+            channel_row: Y-axis row index for this channel (0, 1, 2, …).
+
+        Returns:
+            ``(t_step, y_step)`` ready for PlotDataItem, or ``(None, None)``.
+        """
+        record   = loaded.record
+        offset_s = self._offsets.get(loaded.file_id, 0.0)
+        t_shift  = (loaded.start_epoch - ref_epoch) + offset_s
+
+        t_raw = record.time_array
+        d_raw = getattr(dch, 'data', None)
+        if d_raw is None:
+            return None, None
+        n = min(len(t_raw), len(d_raw))
+        if n == 0:
+            return None, None
+
+        t_abs = t_raw[:n].astype(np.float64) + t_shift
+        d_f64 = d_raw[:n].astype(np.float64)
+
+        # Decimate before building step data to keep point count manageable
+        if len(t_abs) > MAX_DISPLAY_PTS:
+            t_abs, d_f64 = decimate_uniform(t_abs, d_f64, MAX_DISPLAY_PTS)
+            n = len(t_abs)
+
+        # Build step function: repeat each sample so transitions are vertical
+        # Result: [t0, t1, t1, t2, t2, t3, …, tN-1]  (length 2N-1)
+        if n > 1:
+            t_step = np.empty(2 * n - 1)
+            d_step = np.empty(2 * n - 1)
+            t_step[0::2] = t_abs
+            t_step[1::2] = t_abs[1:]
+            d_step[0::2] = d_f64
+            d_step[1::2] = d_f64[:-1]
+        else:
+            t_step = t_abs
+            d_step = d_f64
+
+        y_step = d_step * DIG_CH_HEIGHT + channel_row
+        return t_step, y_step
+
+    # ── Filter box ─────────────────────────────────────────────────────────────
+
+    def _on_filter_changed(self, text: str) -> None:
+        """Show/hide tree items to match ``text`` filter (case-insensitive).
+
+        Parent nodes are shown if any descendant matches.  Matching nodes are
+        auto-expanded so results are immediately visible.
+
+        Args:
+            text: Current text from the filter QLineEdit.
+        """
+        text = text.strip().lower()
+        for i in range(self._tree.topLevelItemCount()):
+            self._apply_filter_recursive(self._tree.topLevelItem(i), text)
+
+    def _apply_filter_recursive(
+        self,
+        item: QTreeWidgetItem,
+        text: str,
+    ) -> bool:
+        """Recursively show/hide ``item`` based on ``text``.
+
+        Args:
+            item: Tree node to evaluate.
+            text: Lower-case filter string (empty = show all).
+
+        Returns:
+            True if ``item`` should be visible (matches or has matching child).
+        """
+        if not text:
+            item.setHidden(False)
+            for i in range(item.childCount()):
+                self._apply_filter_recursive(item.child(i), text)
+            return True
+
+        own_match = text in item.text(TREE_COL_NAME).lower()
+        child_visible = False
+        for i in range(item.childCount()):
+            if self._apply_filter_recursive(item.child(i), text):
+                child_visible = True
+
+        visible = own_match or child_visible
+        item.setHidden(not visible)
+        if child_visible:
+            item.setExpanded(True)
+        return visible
+
     # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _get_nominal_freq(self) -> float:
+        """Return nominal frequency from the first loaded file or AppSettings."""
+        for loaded in self._files.values():
+            freq = loaded.record.nominal_frequency
+            if freq in (50.0, 60.0):
+                return freq
+        return AppSettings.get('calculation.nominal_frequency', 50.0)
+
+    def _on_cycles_toggled(self, checked: bool) -> None:
+        """Switch X-axis tick labels between seconds and cycles without rebuild."""
+        self._xaxis_cycles = checked
+        freq   = self._get_nominal_freq()
+        t_lbl  = 'Time (cycles)' if checked else 'Time (s)'
+        for ax in self._time_axes.values():
+            ax.set_cycles_mode(checked, freq)
+        # Update axis title on every visible bottom axis
+        for plot in self._stack_plots.values():
+            if plot.getAxis('bottom').isVisible():
+                plot.setLabel('bottom', t_lbl)
+
+    def _zoom_to_fit(self) -> None:
+        """Reset X range to show the full time span of all rendered curves."""
+        if not self._stack_plots:
+            return
+        t_min, t_max = float('inf'), float('-inf')
+        for curve in self._curves.values():
+            xd = curve.xData
+            if xd is not None and len(xd) > 0:
+                t_min = min(t_min, float(xd[0]))
+                t_max = max(t_max, float(xd[-1]))
+        for curve in self._digital_curves.values():
+            xd = curve.xData
+            if xd is not None and len(xd) > 0:
+                t_min = min(t_min, float(xd[0]))
+                t_max = max(t_max, float(xd[-1]))
+        if t_min < t_max:
+            ref = next(iter(self._stack_plots.values()))
+            ref.setXRange(t_min, t_max, padding=0.02)
 
     def _get_ref_epoch(self) -> float:
         """Return the earliest start_epoch across all loaded files.

@@ -2,22 +2,23 @@
 src/ui/measurement_panel.py
 
 MeasurementPanel — right-dock panel showing cursor time readouts and
-per-channel values at cursor A and cursor B positions.
+per-channel values at cursor C1 and cursor C2 positions.
 
 Layout (top → bottom):
-  SECTION 1 — Time readouts (fixed height)
-    Cursor A time | Cursor B time | ΔT (B−A)
+  SECTION 1 — Cursor Times (fixed height)
+    Cursor C1 time | Cursor C2 time | ΔT (C2−C1)
   SECTION 2 — Channel table (scrollable QTableWidget)
-    Columns: Channel | Value at A | Value at B | Δ (B−A) | Unit
-  SECTION 3 — RMS summary placeholder (fixed height)
+    Columns: Channel | Val C1 | Val C2 | Δ | Unit
 
 Usage::
 
     panel = MeasurementPanel()
-    # Called from MainWindow whenever a cursor moves:
-    panel.update(record, t_a_display, t_b_display)
+    # Connected via signal from UnifiedCanvasWidget.readout_updated:
+    panel.update_readout(t_c1, t_c2, rows)
+    # Called from MainWindow after Preferences dialog closes:
+    panel.apply_settings()
 
-Architecture: Presentation layer (ui/) — imports engine/ and models/ (LAW 1).
+Architecture: Presentation layer (ui/) — reads core.AppSettings only (LAW 1).
 """
 
 from __future__ import annotations
@@ -38,170 +39,168 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from engine.measurements import display_to_raw_s, get_value_at_time
-from models.disturbance_record import DisturbanceRecord
+from core.app_settings import AppSettings
 
 # ── Module constants ───────────────────────────────────────────────────────────
 
-TIME_SECTION_HEIGHT: int     = 90    # px — fixed top section
-RMS_SECTION_HEIGHT: int      = 40    # px — fixed bottom section
 COL_CHANNEL: int             = 0
 COL_VAL_A: int               = 1
 COL_VAL_B: int               = 2
 COL_DELTA: int               = 3
 COL_UNIT: int                = 4
-COL_WIDTHS: tuple[int, ...]  = (120, 80, 80, 80, 50)
-COL_HEADERS: tuple[str, ...] = ('Channel', 'Value A', 'Value B', 'Δ (B−A)', 'Unit')
+COL_WIDTHS: tuple[int, ...]  = (100, 65, 65, 65, 42)
+COL_HEADERS: tuple[str, ...] = ('Channel', 'Val C1', 'Val C2', 'Δ', 'Unit')
 
 DELTA_HIGHLIGHT: str         = '#2A2A2A'   # row bg when Δ is non-zero
-BASE_ROW_BG: str             = '#1E1E1E'
-HEADER_STYLE: str            = (
-    "QHeaderView::section { background-color: #3A3A3A; color: #CCCCCC;"
-    " font-size: 8pt; border: none; padding: 2px; }"
-)
-TABLE_STYLE: str             = (
-    "QTableWidget { background-color: #1E1E1E; color: #FFFFFF;"
-    " font-size: 9pt; gridline-color: #3A3A3A; border: none; }"
-    " QTableWidget::item { padding: 2px; }"
-)
-LABEL_STYLE: str             = "color: #CCCCCC; font-size: 9pt;"
-VALUE_STYLE: str             = "color: #FFFFFF; font-size: 9pt; font-weight: bold;"
-SECTION_TITLE_STYLE: str     = (
-    "color: #AAAAAA; font-size: 8pt; font-weight: bold; padding-bottom: 2px;"
-)
-RMS_STYLE: str               = "color: #888888; font-size: 9pt;"
+FONT_PT_DEFAULT: int         = 9           # fallback if AppSettings not yet loaded
 
-DELTA_THRESHOLD: float       = 1e-6   # treat |Δ| < this as zero (float noise)
+DELTA_THRESHOLD: float       = 1e-6        # treat |Δ| < this as zero (float noise)
 
+
+# ── Style generators (parameterised by font size) ──────────────────────────────
+
+def _hdr_style(pt: int) -> str:
+    return (
+        "QHeaderView::section { background-color: #3A3A3A; color: #CCCCCC;"
+        f" font-size: {pt}pt; border: none; padding: 1px; }}"
+    )
+
+
+def _tbl_style(pt: int) -> str:
+    return (
+        "QTableWidget { background-color: #1E1E1E; color: #FFFFFF;"
+        f" font-size: {pt}pt; gridline-color: #3A3A3A; border: none; }}"
+        " QTableWidget::item { padding: 1px; }"
+    )
+
+
+def _lbl_style(pt: int) -> str:
+    return f"color: #CCCCCC; font-size: {pt}pt;"
+
+
+def _val_style(pt: int) -> str:
+    return f"color: #FFFFFF; font-size: {pt}pt; font-weight: bold;"
+
+
+def _ttl_style(pt: int) -> str:
+    return f"color: #AAAAAA; font-size: {pt}pt; font-weight: bold; padding-bottom: 1px;"
+
+
+# ── Panel ──────────────────────────────────────────────────────────────────────
 
 class MeasurementPanel(QWidget):
-    """Right-dock measurement panel for cursor A / cursor B readouts.
+    """Right-dock measurement panel for cursor C1 / cursor C2 readouts.
 
-    Displays time positions, per-channel instantaneous values, and a
-    placeholder row for the upcoming RMS-at-cursor feature (Milestone 2B).
-
-    Call ``update(record, t_a, t_b)`` whenever either cursor moves.
+    Call ``update_readout(t_c1, t_c2, rows)`` whenever either cursor moves.
+    Call ``apply_settings()`` after the Preferences dialog closes to pick up
+    a changed ``display.panel_font_size``.
     """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
-        """Initialise empty panel with three sections."""
+        """Initialise the panel with a time section and channel table."""
         super().__init__(parent)
         self.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
         )
-        # Force dark background so white/light-coloured text labels are visible
-        # inside QDockWidget, which otherwise inherits the system light palette.
         self.setStyleSheet("QWidget { background-color: #1E1E1E; color: #CCCCCC; }")
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(4)
+        # Kept for dynamic re-styling in apply_settings()
+        self._title_lbls: list[QLabel] = []
+        self._key_lbls:   list[QLabel] = []
+        self._val_lbls:   list[QLabel] = []
 
-        # Section 1 — time readouts
-        root.addWidget(self._build_time_section())
-        root.addWidget(self._make_divider())
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
-        # Section 2 — channel table
+        layout.addWidget(self._build_time_section())
+        layout.addWidget(self._make_divider())
         self._table = self._build_table()
-        root.addWidget(self._table, stretch=1)
-        root.addWidget(self._make_divider())
+        layout.addWidget(self._table, stretch=1)
 
-        # Section 3 — RMS placeholder
-        root.addWidget(self._build_rms_section())
+        self.apply_settings()
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def refresh(
+    def apply_settings(self) -> None:
+        """Re-read AppSettings and update all font-dependent styles.
+
+        Called once at construction and again whenever the user saves new
+        preferences via the Preferences dialog.
+        """
+        pt = int(AppSettings.get('display.panel_font_size', FONT_PT_DEFAULT))
+        for lbl in self._title_lbls:
+            lbl.setStyleSheet(_ttl_style(pt))
+        for lbl in self._key_lbls:
+            lbl.setStyleSheet(_lbl_style(pt))
+        for lbl in self._val_lbls:
+            lbl.setStyleSheet(_val_style(pt))
+        self._table.horizontalHeader().setStyleSheet(_hdr_style(pt))
+        self._table.setStyleSheet(_tbl_style(pt))
+
+    def update_readout(
         self,
-        record: DisturbanceRecord,
-        t_a: float,
-        t_b: float,
+        t_c1: float,
+        t_c2: float,
+        rows: list,
     ) -> None:
-        """Refresh all displayed values for the current cursor positions.
+        """Populate cursor times and channel value table.
 
         Args:
-            record: The currently loaded DisturbanceRecord.
-            t_a:    Cursor A position in display units (ms / s / min).
-            t_b:    Cursor B position in display units (ms / s / min).
+            t_c1:  Cursor C1 position in seconds, or NaN when C1 is inactive.
+            t_c2:  Cursor C2 position in seconds, or NaN when C2 is inactive.
+            rows:  List of (display_name, unit, val_c1, val_c2) tuples —
+                   one entry per selected analogue channel across all files.
         """
-        label: str = getattr(record, '_time_axis_label', 'Time (ms)')
+        def _fmt_t(t: float) -> str:
+            return f'{t:.3f} s' if not np.isnan(t) else '---'
 
-        # ── Section 1: time readouts ──────────────────────────────────────────
-        if 'ms' in label:
-            self._val_a.setText(f'{t_a:.3f} ms')
-            self._val_b.setText(f'{t_b:.3f} ms')
-            self._val_dt.setText(f'{(t_b - t_a):.3f} ms')
-        elif 'min' in label:
-            self._val_a.setText(f'{t_a:.4f} min')
-            self._val_b.setText(f'{t_b:.4f} min')
-            self._val_dt.setText(f'{(t_b - t_a):.4f} min')
+        self._val_c1.setText(_fmt_t(t_c1))
+        self._val_c2.setText(_fmt_t(t_c2))
+        if not np.isnan(t_c1) and not np.isnan(t_c2):
+            self._val_dt.setText(f'{abs(t_c2 - t_c1):.3f} s')
         else:
-            self._val_a.setText(f'{t_a:.4f} s')
-            self._val_b.setText(f'{t_b:.4f} s')
-            self._val_dt.setText(f'{(t_b - t_a):.4f} s')
+            self._val_dt.setText('---')
 
-        # ── Section 2: channel table ──────────────────────────────────────────
-        raw_a = display_to_raw_s(record, t_a)
-        raw_b = display_to_raw_s(record, t_b)
-
-        visible_channels = [
-            ch for ch in record.analogue_channels if ch.visible
-        ]
-
-        self._table.setRowCount(len(visible_channels))
-
-        for row_idx, ch in enumerate(visible_channels):
-            val_a = get_value_at_time(record, ch, raw_a)
-            val_b = get_value_at_time(record, ch, raw_b)
-            delta = val_b - val_a if not (np.isnan(val_a) or np.isnan(val_b)) else float('nan')
-
-            self._set_cell(row_idx, COL_CHANNEL, ch.name, align_left=True)
-            self._set_cell(row_idx, COL_VAL_A, self._fmt(val_a))
-            self._set_cell(row_idx, COL_VAL_B, self._fmt(val_b))
-            self._set_cell(row_idx, COL_DELTA, self._fmt(delta))
-            self._set_cell(row_idx, COL_UNIT, ch.unit or '', align_left=True)
-
-            for col in range(len(COL_WIDTHS)):
-                item = self._table.item(row_idx, col)
-                if item is not None:
-                    item.setBackground(Qt.GlobalColor.transparent)
-                    item.setData(
-                        Qt.ItemDataRole.BackgroundRole,
-                        None,
-                    )
-            self._table.setRowHeight(row_idx, 20)
-
-            if abs(delta) > DELTA_THRESHOLD and not np.isnan(delta):
+        self._table.setRowCount(len(rows))
+        for r_idx, (name, unit, val_c1, val_c2) in enumerate(rows):
+            delta = (
+                val_c2 - val_c1
+                if not (np.isnan(val_c1) or np.isnan(val_c2))
+                else float('nan')
+            )
+            self._set_cell(r_idx, COL_CHANNEL, name,          align_left=True)
+            self._set_cell(r_idx, COL_VAL_A,   self._fmt(val_c1))
+            self._set_cell(r_idx, COL_VAL_B,   self._fmt(val_c2))
+            self._set_cell(r_idx, COL_DELTA,   self._fmt(delta))
+            self._set_cell(r_idx, COL_UNIT,    unit or '',     align_left=True)
+            self._table.setRowHeight(r_idx, 16)
+            if not np.isnan(delta) and abs(delta) > DELTA_THRESHOLD:
                 for col in range(len(COL_WIDTHS)):
-                    item = self._table.item(row_idx, col)
-                    if item is not None:
+                    item = self._table.item(r_idx, col)
+                    if item:
                         item.setBackground(QColor(DELTA_HIGHLIGHT))
 
-    # ── Private — section builders ─────────────────────────────────────────────
+    # ── Private builders ───────────────────────────────────────────────────────
 
     def _build_time_section(self) -> QWidget:
-        """Build the fixed-height time readout section.
-
-        Returns:
-            QWidget containing three labelled time value pairs.
-        """
+        """Build the cursor time readout section."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
-        title = QLabel("Cursor Times")
-        title.setStyleSheet(SECTION_TITLE_STYLE)
+        title = QLabel('Cursor Times')
+        self._title_lbls.append(title)
         layout.addWidget(title)
 
-        self._val_a  = self._add_time_row(layout, "Cursor A:")
-        self._val_b  = self._add_time_row(layout, "Cursor B:")
-        self._val_dt = self._add_time_row(layout, "ΔT (B−A):")
-
+        self._val_c1 = self._add_time_row(layout, 'Cursor C1:')
+        self._val_c2 = self._add_time_row(layout, 'Cursor C2:')
+        self._val_dt = self._add_time_row(layout, 'ΔT (C2−C1):')
         return widget
 
     def _add_time_row(self, layout: QVBoxLayout, label_text: str) -> QLabel:
-        """Add a label + value pair row to a section layout.
+        """Add a label + value pair row and register both for re-styling.
 
         Args:
             layout:     Parent QVBoxLayout to add the row into.
@@ -216,70 +215,36 @@ class MeasurementPanel(QWidget):
         h.setSpacing(4)
 
         lbl = QLabel(label_text)
-        lbl.setStyleSheet(LABEL_STYLE)
-        lbl.setFixedWidth(72)
+        lbl.setFixedWidth(60)
+        self._key_lbls.append(lbl)
         h.addWidget(lbl)
 
-        val = QLabel("---")
-        val.setStyleSheet(VALUE_STYLE)
+        val = QLabel('---')
         val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._val_lbls.append(val)
         h.addWidget(val, stretch=1)
 
         layout.addWidget(row)
         return val
 
     def _build_table(self) -> QTableWidget:
-        """Build the scrollable channel value table.
-
-        Returns:
-            Configured QTableWidget.
-        """
+        """Build the scrollable channel value table."""
         table = QTableWidget(0, len(COL_WIDTHS))
         table.setHorizontalHeaderLabels(list(COL_HEADERS))
-        table.horizontalHeader().setStyleSheet(HEADER_STYLE)
-        table.setStyleSheet(TABLE_STYLE)
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-
         for col, width in enumerate(COL_WIDTHS):
             table.setColumnWidth(col, width)
-
         return table
 
-    def _build_rms_section(self) -> QWidget:
-        """Build the fixed-height RMS placeholder section.
-
-        Returns:
-            QWidget with a single placeholder label.
-        """
-        widget = QWidget()
-        widget.setFixedHeight(RMS_SECTION_HEIGHT)
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        title = QLabel("RMS at A (half-cycle):")
-        title.setStyleSheet(SECTION_TITLE_STYLE)
-        layout.addWidget(title)
-
-        placeholder = QLabel("---")
-        placeholder.setStyleSheet(RMS_STYLE)
-        layout.addWidget(placeholder)
-
-        return widget
-
-    # ── Private — helpers ──────────────────────────────────────────────────────
+    # ── Private helpers ────────────────────────────────────────────────────────
 
     @staticmethod
     def _make_divider() -> QFrame:
-        """Return a thin horizontal divider line.
-
-        Returns:
-            QFrame styled as a horizontal rule.
-        """
+        """Return a thin horizontal divider line."""
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet("color: #3A3A3A;")
@@ -288,14 +253,7 @@ class MeasurementPanel(QWidget):
 
     @staticmethod
     def _fmt(value: float) -> str:
-        """Format a float for display in the channel table.
-
-        Args:
-            value: The value to format.
-
-        Returns:
-            Formatted string, or '---' for NaN.
-        """
+        """Format a float for display in the channel table."""
         if np.isnan(value):
             return '---'
         if abs(value) >= 1000:
@@ -311,14 +269,7 @@ class MeasurementPanel(QWidget):
         text: str,
         align_left: bool = False,
     ) -> None:
-        """Set a table cell value with right-align by default.
-
-        Args:
-            row:        Row index.
-            col:        Column index.
-            text:       Display string.
-            align_left: If True, left-align; otherwise right-align.
-        """
+        """Write text into the channel table at (row, col)."""
         item = QTableWidgetItem(text)
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         if align_left:

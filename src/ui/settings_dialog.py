@@ -261,6 +261,30 @@ class _DisplayPage(QWidget):
 
         layout.addWidget(cursor_group)
 
+        # Panel font size
+        font_group = QGroupBox('Panel text')
+        font_group.setStyleSheet(
+            'QGroupBox { font-weight: bold; color: #CCCCCC; '
+            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
+            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
+        )
+        font_form = QFormLayout(font_group)
+        font_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        font_form.setVerticalSpacing(10)
+        font_form.setHorizontalSpacing(16)
+
+        self._font_spin = QSpinBox()
+        self._font_spin.setRange(7, 14)
+        self._font_spin.setSuffix('  pt')
+        self._font_spin.setValue(data.get('panel_font_size', 9))
+        self._font_spin.setToolTip(
+            'Font size for labels and values in the Measurements panel.\n'
+            'Takes effect immediately when you click Apply or OK.'
+        )
+        font_form.addRow('Measurements panel font size:', self._font_spin)
+
+        layout.addWidget(font_group)
+
         # Theme (future)
         theme_group = QGroupBox('Theme')
         theme_group.setStyleSheet(
@@ -291,6 +315,7 @@ class _DisplayPage(QWidget):
             'theme':            self._theme_combo.currentData(),
             'cursor_c1_colour': self._c1_btn.colour,
             'cursor_c2_colour': self._c2_btn.colour,
+            'panel_font_size':  self._font_spin.value(),
         }
 
 
