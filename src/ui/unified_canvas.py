@@ -44,8 +44,9 @@ from typing import Optional
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen
+from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
+    QColorDialog,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -79,6 +80,7 @@ from parsers.comtrade_parser import ComtradeParser
 from parsers.csv_parser import CsvParser
 from parsers.excel_parser import ExcelParser
 from parsers.pmu_csv_parser import PmuCsvParser, is_pmu_csv
+from ui import theme_palette
 from ui.pmu_import_dialog import PmuImportDialog, SetStartTimeDialog
 
 # ── Module constants ───────────────────────────────────────────────────────────
@@ -201,6 +203,21 @@ TREE_COL_BASE: int = 2   # base voltage kV spinbox (voltage channels only)
 # Digital events strip
 STACK_DIGITAL:   int   = 5    # stack index — always rendered last
 DIG_CH_HEIGHT:   float = 0.72 # filled band height per digital channel (0..1)
+
+# Per-channel line appearance options (label, value)
+_LINE_WIDTHS: list[tuple[str, float]] = [
+    ('Thin  (0.7 px)',  0.7),
+    ('Normal  (1 px)',  1.0),
+    ('Thick  (1.5 px)', 1.5),
+    ('Bold  (2.5 px)',  2.5),
+]
+
+_LINE_STYLES: list[tuple[str, Qt.PenStyle]] = [
+    ('Solid',    Qt.PenStyle.SolidLine),
+    ('Dashed',   Qt.PenStyle.DashLine),
+    ('Dotted',   Qt.PenStyle.DotLine),
+    ('Dash-Dot', Qt.PenStyle.DashDotLine),
+]
 
 # Roles considered for "Select standard set" on a bay
 _STANDARD_SET_ROLES: frozenset[str] = frozenset({
@@ -340,7 +357,27 @@ class _LoadedFile:
     start_epoch:          float            = 0.0
     timestamp_ok:         bool             = True
     voltage_convention:   str              = 'line_to_line'   # 'line_to_line' | 'line_to_earth'
+    group_id:             int              = -1                # canvas group assigned to this file
     tree_item:            Optional[object] = field(default=None, repr=False)
+
+
+@dataclass
+class _GroupInfo:
+    """Runtime state for one canvas group.
+
+    All files in the group share a synchronized time axis.
+    Their start_epoch values are within timestamp_grouping_threshold_h of ref_epoch.
+
+    Attributes:
+        group_id: Unique identifier (sequential integer).
+        file_ids: Ordered list of file_ids belonging to this group.
+        ref_epoch: Minimum valid start_epoch among files in this group.
+        section:  The _CanvasGroupSection widget (created lazily).
+    """
+    group_id:  int
+    file_ids:  list                        = field(default_factory=list)
+    ref_epoch: float                       = 0.0
+    section:   Optional[object]            = field(default=None, repr=False)
 
 
 # ── Per-file offset control strip ─────────────────────────────────────────────
@@ -381,10 +418,10 @@ class _OffsetRow(QWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(6)
 
-        name_lbl = QLabel(display_name)
-        name_lbl.setFixedWidth(140)
-        name_lbl.setStyleSheet('color: #CCCCCC; font-size: 8pt;')
-        layout.addWidget(name_lbl)
+        self._name_lbl = QLabel(display_name)
+        self._name_lbl.setFixedWidth(140)
+        self._name_lbl.setStyleSheet('color: #CCCCCC; font-size: 8pt;')
+        layout.addWidget(self._name_lbl)
 
         layout.addWidget(QLabel('Freq:'))
         self._freq_combo = QComboBox()
@@ -396,7 +433,8 @@ class _OffsetRow(QWidget):
         layout.addWidget(QLabel('  Offset:'))
 
         btn_minus = QPushButton('−')
-        btn_minus.setFixedWidth(24)
+        btn_minus.setFixedSize(30, 22)
+        btn_minus.setStyleSheet('font-size: 14px; font-weight: bold; padding: 0;')
         btn_minus.clicked.connect(self._step_minus)
         layout.addWidget(btn_minus)
 
@@ -408,7 +446,8 @@ class _OffsetRow(QWidget):
         layout.addWidget(self._slider)
 
         btn_plus = QPushButton('+')
-        btn_plus.setFixedWidth(24)
+        btn_plus.setFixedSize(30, 22)
+        btn_plus.setStyleSheet('font-size: 14px; font-weight: bold; padding: 0;')
         btn_plus.clicked.connect(self._step_plus)
         layout.addWidget(btn_plus)
 
@@ -427,6 +466,12 @@ class _OffsetRow(QWidget):
         layout.addWidget(self._step_spin)
 
         layout.addStretch()
+
+    def apply_theme(self) -> None:
+        """Re-style labels to match the current theme palette."""
+        p = theme_palette.current()
+        self._name_lbl.setStyleSheet(f'color: {p["text"]}; font-size: 8pt;')
+        self._offset_lbl.setStyleSheet(f'color: {p["text_dim"]}; font-size: 8pt;')
 
     @property
     def offset_s(self) -> float:
@@ -456,6 +501,137 @@ class _OffsetRow(QWidget):
     def _on_freq_changed(self, index: int) -> None:
         freq = 50.0 if index == 0 else 60.0
         self.freq_changed.emit(self._file_id, freq)
+
+
+# ── Canvas group section ───────────────────────────────────────────────────────
+
+class _CanvasGroupSection(QWidget):
+    """Container for one canvas group: header bar + stack splitter.
+
+    The stack_splitter is populated by UnifiedCanvasWidget._rebuild_group_canvas().
+    Supports detaching to a floating QDialog via the detach button in the header.
+
+    Attributes:
+        group_id:      The integer group identifier.
+        stack_splitter: QSplitter that holds the per-stack PlotWidgets.
+
+    Signals:
+        reattach_requested: Emitted after a detached dialog is closed and the
+            section has been reparented back to None.  UnifiedCanvasWidget
+            connects this to trigger a canvas rebuild that re-inserts the
+            section into the outer splitter.
+            Args: group_id (int)
+    """
+
+    reattach_requested: pyqtSignal = pyqtSignal(int)
+
+    def __init__(self, group_id: int, parent: Optional[QWidget] = None) -> None:
+        """Build the header bar and stack splitter container.
+
+        Args:
+            group_id: Integer identifier for this group.
+            parent:   Optional parent widget.
+        """
+        super().__init__(parent)
+        self.group_id = group_id
+        self._detach_dialog: Optional[QDialog] = None
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # ── Header bar ────────────────────────────────────────────────────────
+        self._header = QWidget()
+        self._header.setStyleSheet('background: #3A3A3A;')
+        h_layout = QHBoxLayout(self._header)
+        h_layout.setContentsMargins(6, 2, 6, 2)
+        h_layout.setSpacing(6)
+
+        self._label = QLabel(f'Group {group_id + 1}')
+        self._label.setStyleSheet('color: #AAAAAA; font-size: 8pt;')
+        h_layout.addWidget(self._label)
+        h_layout.addStretch()
+
+        self._detach_btn = QPushButton('⊟')
+        self._detach_btn.setFixedSize(20, 18)
+        self._detach_btn.setStyleSheet('font-size: 10pt; padding: 0;')
+        self._detach_btn.setToolTip('Detach this group to a floating window')
+        self._detach_btn.clicked.connect(self._on_detach)
+        h_layout.addWidget(self._detach_btn)
+        outer_layout.addWidget(self._header)
+
+        # ── Stack splitter (PlotWidgets added by UnifiedCanvasWidget) ─────────
+        self.stack_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.stack_splitter.setHandleWidth(5)
+        self.stack_splitter.setStyleSheet(
+            'QSplitter::handle         { background: #2A2A2A; }'
+            'QSplitter::handle:hover   { background: #4A7A4A; }'
+            'QSplitter::handle:pressed { background: #5A9A5A; }'
+        )
+        outer_layout.addWidget(self.stack_splitter, stretch=1)
+
+    def update_label(self, text: str) -> None:
+        """Update the header label text.
+
+        Args:
+            text: New label string.
+        """
+        self._label.setText(text)
+
+    def _on_detach(self) -> None:
+        """Pop this section into a floating QDialog or raise if already detached."""
+        if self._detach_dialog is not None:
+            self._detach_dialog.raise_()
+            self._detach_dialog.activateWindow()
+            return
+        dlg = QDialog(None, Qt.WindowType.Window)
+        dlg.setWindowTitle(self._label.text())
+        dlg.setMinimumSize(800, 400)
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.setContentsMargins(0, 0, 0, 0)
+        # Reparent this entire section into the dialog
+        self.setParent(dlg)
+        dlg_layout.addWidget(self)
+        self._detach_dialog = dlg
+        self._detach_btn.setText('⊞')
+        self._detach_btn.setToolTip('Re-attach to main window')
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        dlg.finished.connect(self._on_reattach)
+        dlg.show()
+
+    def _on_reattach(self) -> None:
+        """Called when the floating dialog is closed — re-parents section back.
+
+        Order is critical:
+          1. setParent(None) FIRST — extracts self from the dialog while the
+             C++ QDialog is still alive.  Only after this is it safe to release
+             _detach_dialog; otherwise releasing the last Python reference would
+             delete the C++ dialog which would delete self as a child.
+          2. Clear _detach_dialog so the Python reference (and C++ dialog) can
+             be released.
+          3. Emit reattach_requested so UnifiedCanvasWidget re-adds self to the
+             outer splitter and rebuilds the canvas.
+        """
+        self.setParent(None)          # extract from dialog while it's still alive
+        self._detach_btn.setText('⊟')
+        self._detach_btn.setToolTip('Detach this group to a floating window')
+        self._detach_dialog = None    # now safe to release — self is no longer a child
+        self.reattach_requested.emit(self.group_id)
+
+    def apply_theme(self, p: dict) -> None:
+        """Re-apply header and splitter styles for the given palette.
+
+        Args:
+            p: Theme palette dict from theme_palette.current().
+        """
+        hdr_style = f'background: {p["bg_header"]}; padding: 2px;'
+        self._header.setStyleSheet(hdr_style)
+        self._label.setStyleSheet(f'color: {p["text_dim"]}; font-size: 8pt;')
+        self.stack_splitter.setStyleSheet(
+            f'QSplitter::handle         {{ background: {p["bg_header"]}; }}'
+            f'QSplitter::handle:hover   {{ background: {p["accent"]}; }}'
+            f'QSplitter::handle:pressed {{ background: {p["accent"]}; }}'
+        )
 
 
 # ── Phasor drawing canvas ──────────────────────────────────────────────────────
@@ -699,23 +875,33 @@ class UnifiedCanvasWidget(QWidget):
         self._pu_mode: bool = False
         # (file_id, ch_id) → base voltage kV (0.0 = not set)
         self._base_kv: dict[tuple[str, int], float] = {}
+        # (file_id, ch_id) → line width px (default 1.0)
+        self._line_width: dict[tuple[str, int], float] = {}
+        # (file_id, ch_id) → Qt.PenStyle (default SolidLine)
+        self._line_style: dict[tuple[str, int], Qt.PenStyle] = {}
+
+        # Canvas groups — each group has independent stacks and X-axis
+        self._groups:        dict[int, _GroupInfo] = {}
+        self._group_counter: int = 0
 
         # Canvas state — rebuilt on structural changes
-        self._stack_widgets:  dict[int, pg.PlotWidget]   = {}
-        self._stack_plots:    dict[int, pg.PlotItem]     = {}
-        self._stack_vb2s:     dict[int, pg.ViewBox]      = {}
-        self._cursor1_lines:  dict[int, pg.InfiniteLine] = {}
-        self._cursor2_lines:  dict[int, pg.InfiniteLine] = {}
+        # Keys are (group_id, stack_idx) tuples
+        self._stack_widgets:  dict[tuple[int, int], pg.PlotWidget]   = {}
+        self._stack_plots:    dict[tuple[int, int], pg.PlotItem]     = {}
+        self._stack_vb2s:     dict[tuple[int, int], pg.ViewBox]      = {}
+        self._cursor1_lines:  dict[tuple[int, int], pg.InfiniteLine] = {}
+        self._cursor2_lines:  dict[tuple[int, int], pg.InfiniteLine] = {}
         self._cursor1_enabled: bool = True   # C1 shown by default
         self._cursor2_enabled: bool = False
         self._xaxis_cycles:   bool = False
-        self._time_axes: dict[int, _TimeAxis] = {}
+        self._time_axes: dict[tuple[int, int], _TimeAxis] = {}
         self._readout:        Optional[_DraggableLabel]  = None
         self._readout_pinned: bool = False
         self._curves:         dict[tuple[str, int], pg.PlotDataItem] = {}
         self._digital_curves: dict[tuple[str, int], pg.PlotDataItem] = {}
         self._digital_row:    dict[tuple[str, int], int]              = {}
-        self._ref_plot:       Optional[pg.PlotItem] = None
+        self._ref_plots:      dict[int, Optional[pg.PlotItem]] = {}  # group_id → ref plot
+        self._outer_splitter: Optional[QSplitter] = None
 
         # Guard flag — prevents recursive itemChanged during batch propagation
         self._in_tree_change: bool = False
@@ -736,19 +922,25 @@ class UnifiedCanvasWidget(QWidget):
 
         root.addWidget(self._build_toolbar())
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_file_panel())
-        splitter.addWidget(self._build_canvas_panel())
-        splitter.setSizes([FILE_PANEL_WIDTH, 900])
-        root.addWidget(splitter, stretch=1)
+        h_splitter = QSplitter(Qt.Orientation.Horizontal)
+        h_splitter.addWidget(self._build_file_panel())
+        h_splitter.addWidget(self._build_canvas_panel())
+        h_splitter.setSizes([FILE_PANEL_WIDTH, 900])
 
-        root.addWidget(self._build_offset_section())
+        self._v_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._v_splitter.setHandleWidth(5)
+        self._v_splitter.addWidget(h_splitter)
+        self._v_splitter.addWidget(self._build_offset_section())
+        self._v_splitter.setSizes([700, 80])
+        self._v_splitter.setCollapsible(1, False)
+        root.addWidget(self._v_splitter, stretch=1)
 
     # ── UI builders ────────────────────────────────────────────────────────────
 
     def _build_toolbar(self) -> QWidget:
         """Build the top toolbar strip."""
-        bar = QWidget()
+        self._toolbar_bar = QWidget()
+        bar = self._toolbar_bar
         bar.setStyleSheet('background: #2D2D2D;')
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -800,11 +992,11 @@ class UnifiedCanvasWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        hdr = QLabel(' Files & Channels')
-        hdr.setStyleSheet(
+        self._tree_hdr_lbl = QLabel(' Files & Channels')
+        self._tree_hdr_lbl.setStyleSheet(
             'background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;'
         )
-        layout.addWidget(hdr)
+        layout.addWidget(self._tree_hdr_lbl)
 
         self._filter_edit = QLineEdit()
         self._filter_edit.setPlaceholderText('Filter channels…')
@@ -842,40 +1034,34 @@ class UnifiedCanvasWidget(QWidget):
         return panel
 
     def _build_canvas_panel(self) -> QWidget:
-        """Build the right panel containing the stack splitter.
-
-        Each active stack lives in its own PlotWidget inside a vertical
-        QSplitter, giving the user native drag-to-resize handles between
-        stacks.  The readout overlay floats above the whole canvas area.
-        """
+        """Build the right panel — outer group splitter + floating readout overlay."""
         panel = QWidget()
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(0)
 
-        # ── Canvas container — holds splitter + floating readout overlay ──────
-        self._glw = QWidget()                    # alias kept for compat
-        self._glw.setStyleSheet(f'background: {CANVAS_BG};')
+        self._glw = QWidget()
+        self._glw.setStyleSheet(f'background: {theme_palette.current()["bg_canvas"]};')
         glw_layout = QVBoxLayout(self._glw)
         glw_layout.setContentsMargins(0, 0, 0, 0)
         glw_layout.setSpacing(0)
 
-        self._splitter = QSplitter(Qt.Orientation.Vertical)
-        self._splitter.setHandleWidth(5)
-        self._splitter.setStyleSheet(
-            'QSplitter::handle         { background: #2A2A2A; }'
+        self._outer_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._outer_splitter.setHandleWidth(8)
+        self._outer_splitter.setStyleSheet(
+            'QSplitter::handle         { background: #444444; }'
             'QSplitter::handle:hover   { background: #4A7A4A; }'
-            'QSplitter::handle:pressed { background: #5A9A5A; }'
         )
-        glw_layout.addWidget(self._splitter)
-        self._splitter.splitterMoved.connect(self._update_digital_tick_font)
+        self._outer_splitter.splitterMoved.connect(self._update_digital_tick_font)
+        glw_layout.addWidget(self._outer_splitter)
+
         panel_layout.addWidget(self._glw, stretch=1)
 
-        # ── Draggable readout overlay — floats over the container ─────────────
+        # Draggable readout overlay (floats over the whole canvas area)
         self._readout = _DraggableLabel(self._glw)
         self._readout.setStyleSheet(
-            'background-color: rgba(255,255,255,210);'
-            'color: #111111;'
+            'background-color: rgba(15,15,35,220);'
+            'color: #EEEEEE;'
             'font-family: Monospace;'
             'font-size: 8pt;'
             'padding: 6px 8px;'
@@ -890,7 +1076,6 @@ class UnifiedCanvasWidget(QWidget):
         self._readout.hide()
         self._readout.raise_()
 
-        # Reposition overlay when container is resized
         self._glw.installEventFilter(self)
 
         return panel
@@ -902,15 +1087,14 @@ class UnifiedCanvasWidget(QWidget):
         section_layout.setContentsMargins(0, 0, 0, 0)
         section_layout.setSpacing(0)
 
-        hdr = QLabel(' Time Offset Controls')
-        hdr.setStyleSheet(
+        self._offset_hdr_lbl = QLabel(' Time Offset Controls')
+        self._offset_hdr_lbl.setStyleSheet(
             'background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;'
         )
-        section_layout.addWidget(hdr)
+        section_layout.addWidget(self._offset_hdr_lbl)
 
         self._offset_scroll = QScrollArea()
         self._offset_scroll.setWidgetResizable(True)
-        self._offset_scroll.setMaximumHeight(120)
         self._offset_scroll.setStyleSheet('background: #222222;')
         self._offset_container = QWidget()
         self._offset_layout = QVBoxLayout(self._offset_container)
@@ -935,6 +1119,38 @@ class UnifiedCanvasWidget(QWidget):
     def open_file_dialog(self) -> None:
         """Public entry-point so File > Open in the main menu delegates here."""
         self._on_add_file()
+
+    def apply_theme(self) -> None:
+        """Re-apply all local stylesheets using the current theme palette.
+
+        Called by MainWindow._open_preferences() after the user saves new
+        theme settings so chrome colours update without restarting.
+        The waveform canvas background remains dark regardless of theme.
+        """
+        p = theme_palette.current()
+        hdr_style = f'background: {p["bg_header"]}; color: {p["text_dim"]}; font-size: 8pt; padding: 3px;'
+        self._toolbar_bar.setStyleSheet(f'background: {p["bg_toolbar"]};')
+        self._tree_hdr_lbl.setStyleSheet(hdr_style)
+        self._offset_hdr_lbl.setStyleSheet(hdr_style)
+        self._filter_edit.setStyleSheet(
+            f'background: {p["bg_input"]}; color: {p["text"]}; font-size: 8pt;'
+            f' border: none; border-bottom: 1px solid {p["border_dim"]}; padding: 3px 6px;'
+        )
+        self._tree.setStyleSheet(f'background: {p["bg_item"]}; color: {p["text"]}; font-size: 8pt;')
+        self._offset_scroll.setStyleSheet(f'background: {p["bg_scroll"]};')
+        self._v_splitter.setStyleSheet(
+            f'QSplitter::handle {{ background: {p["border_dim"]}; }}'
+            f'QSplitter::handle:hover {{ background: {p["accent"]}; }}'
+        )
+        # Update waveform canvas area
+        self._glw.setStyleSheet(f'background: {p["bg_canvas"]};')
+        for pw in self._stack_widgets.values():
+            pw.setBackground(p['bg_canvas'])
+        # Update all live offset rows
+        for i in range(self._offset_layout.count()):
+            widget = self._offset_layout.itemAt(i).widget()
+            if isinstance(widget, _OffsetRow):
+                widget.apply_theme()
 
     def _on_add_file(self) -> None:
         """Open file dialog and dispatch parsing to the background thread."""
@@ -1025,6 +1241,19 @@ class UnifiedCanvasWidget(QWidget):
                 loaded.start_epoch = start_epoch_from_datetime(dlg.anchor_utc)
                 loaded.timestamp_ok = True
 
+        # ── Handle missing timestamp ──────────────────────────────────────────
+        # Files with no valid epoch (e.g. COMTRADE with missing start_time)
+        # land with epoch <= 86400.  Ask the user before grouping so the file
+        # ends up in the right canvas group.
+        if loaded.start_epoch <= 86400 and (report is None or not report.has_blockers):
+            dlg = SetStartTimeDialog(loaded.start_epoch, loaded.path.stem, self)
+            dlg.setWindowTitle('File has no timestamp — set start time')
+            if dlg.exec() and dlg.anchor_utc is not None:
+                loaded.start_epoch = start_epoch_from_datetime(dlg.anchor_utc)
+                loaded.timestamp_ok = True
+            else:
+                loaded.timestamp_ok = False
+
         # ── Integrate into state ──────────────────────────────────────────────
         self._files[loaded.file_id] = loaded
         self._offsets[loaded.file_id] = 0.0
@@ -1036,6 +1265,7 @@ class UnifiedCanvasWidget(QWidget):
             self._mode_locked[key]   = locked
             self._stack_assign[key]  = self._default_stack(ch.signal_role)
 
+        self._assign_file_to_group(loaded)
         self._add_tree_item(loaded)
         self._add_offset_row(loaded)
         self._rebuild_canvas()
@@ -1079,6 +1309,7 @@ class UnifiedCanvasWidget(QWidget):
         if file_id is None:
             return
 
+        self._remove_file_from_group(file_id)
         loaded = self._files.pop(file_id, None)
         if loaded:
             for ch in loaded.record.analogue_channels:
@@ -1088,6 +1319,8 @@ class UnifiedCanvasWidget(QWidget):
                 self._stack_assign.pop(key, None)
                 self._rms_cache.pop(key, None)
                 self._base_kv.pop(key, None)
+                self._line_width.pop(key, None)
+                self._line_style.pop(key, None)
             for dch in loaded.record.digital_channels:
                 key = (file_id, dch.channel_id)
                 self._digital_curves.pop(key, None)
@@ -1248,6 +1481,7 @@ class UnifiedCanvasWidget(QWidget):
                     )
                     ch_item.setFlags(ch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     ch_item.setCheckState(TREE_COL_NAME, Qt.CheckState.Unchecked)
+                    ch_item.setForeground(TREE_COL_NAME, QBrush(QColor(ch.colour)))
                     agroup.addChild(ch_item)
 
                     btn = QPushButton()
@@ -1561,6 +1795,21 @@ class UnifiedCanvasWidget(QWidget):
             ll_act.setChecked(loaded_file.voltage_convention == 'line_to_line')
             le_act.setChecked(loaded_file.voltage_convention == 'line_to_earth')
 
+            menu.addSeparator()
+            move_menu = menu.addMenu('Move to Group…')
+            move_acts: dict[int, object] = {}
+            curr_gid = loaded_file.group_id
+            for gid, ginfo in sorted(self._groups.items()):
+                if gid == curr_gid:
+                    continue
+                n = len(ginfo.file_ids)
+                lbl = f'Group {gid + 1}  ({n} file{"s" if n != 1 else ""})'
+                act = move_menu.addAction(lbl)
+                move_acts[gid] = act
+            new_grp_act = move_menu.addAction('New group (separate canvas)')
+            if not move_acts and len(self._groups) <= 1:
+                move_menu.setEnabled(False)
+
             chosen = menu.exec(global_pos)
             if chosen is set_time_act:
                 self._show_set_start_time_dialog(file_id)
@@ -1568,7 +1817,13 @@ class UnifiedCanvasWidget(QWidget):
                 self._set_voltage_convention(file_id, 'line_to_line')
             elif chosen is le_act:
                 self._set_voltage_convention(file_id, 'line_to_earth')
+            elif chosen is new_grp_act:
+                self._move_file_to_group(file_id, -1)
             else:
+                for tgt_gid, act in move_acts.items():
+                    if chosen is act:
+                        self._move_file_to_group(file_id, tgt_gid)
+                        break
                 for ref_id, act in align_acts.items():
                     if chosen is act:
                         self._do_auto_align(file_id, ref_id)
@@ -1614,6 +1869,31 @@ class UnifiedCanvasWidget(QWidget):
             scatter_act.setChecked(
                 loaded_ch is not None and ch_id in loaded_ch.scatter_ids
             )
+
+            colour_act = menu.addAction('Change Color…')
+
+            is_scatter = loaded_ch is not None and ch_id in loaded_ch.scatter_ids
+
+            width_menu = menu.addMenu('Line Width')
+            width_menu.setEnabled(not is_scatter)
+            width_actions: dict[float, object] = {}
+            curr_width = self._line_width.get(key, 1.0)
+            for lbl, w in _LINE_WIDTHS:
+                wa = width_menu.addAction(lbl)
+                wa.setCheckable(True)
+                wa.setChecked(abs(curr_width - w) < 0.01)
+                width_actions[w] = wa
+
+            style_menu = menu.addMenu('Line Style')
+            style_menu.setEnabled(not is_scatter)
+            style_actions: dict[Qt.PenStyle, object] = {}
+            curr_style = self._line_style.get(key, Qt.PenStyle.SolidLine)
+            for lbl, s in _LINE_STYLES:
+                sa = style_menu.addAction(lbl)
+                sa.setCheckable(True)
+                sa.setChecked(curr_style == s)
+                style_actions[s] = sa
+
             menu.addSeparator()
 
             left_menu  = menu.addMenu('→ Left Axis')
@@ -1643,6 +1923,26 @@ class UnifiedCanvasWidget(QWidget):
                         loaded_ch.scatter_ids.add(ch_id)
                     self._rebuild_canvas()
                 return
+            if chosen is colour_act:
+                if loaded_ch is not None:
+                    ch_map = {c.channel_id: c for c in loaded_ch.record.analogue_channels}
+                    ch = ch_map.get(ch_id)
+                    current_c = QColor(ch.colour if ch else '#AAAAAA')
+                    new_c = QColorDialog.getColor(
+                        current_c, self,
+                        f'Channel Color — {ch.name if ch else str(ch_id)}',
+                    )
+                    if new_c.isValid():
+                        self._on_channel_colour_changed(file_id, ch_id, item, new_c.name())
+                return
+            for w, act in width_actions.items():
+                if chosen is act:
+                    self._on_channel_line_changed(file_id, ch_id, width=w)
+                    return
+            for s, act in style_actions.items():
+                if chosen is act:
+                    self._on_channel_line_changed(file_id, ch_id, style=s)
+                    return
             for sidx, act in left_actions.items():
                 if chosen is act:
                     self._stack_assign[key] = (sidx, 'left')
@@ -1655,6 +1955,90 @@ class UnifiedCanvasWidget(QWidget):
                     self._refresh_tree_label(item, file_id, ch_id)
                     self._rebuild_canvas()
                     return
+
+    # ── Channel colour ─────────────────────────────────────────────────────────
+
+    def _on_channel_colour_changed(
+        self,
+        file_id: str,
+        ch_id:   int,
+        item:    QTreeWidgetItem,
+        colour:  str,
+    ) -> None:
+        """Apply a new display colour to one analogue channel.
+
+        Updates the AnalogueChannel object in place, repaints the tree item
+        foreground, and updates the live curve pen/brush without a full canvas
+        rebuild.
+
+        Args:
+            file_id: The _LoadedFile owning the channel.
+            ch_id:   The channel_id to recolour.
+            item:    The QTreeWidgetItem to update the foreground on.
+            colour:  Hex colour string (e.g. '#FF4444').
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return
+        ch_map = {c.channel_id: c for c in loaded.record.analogue_channels}
+        ch = ch_map.get(ch_id)
+        if ch is None:
+            return
+
+        ch.colour = colour
+
+        self._tree.blockSignals(True)
+        item.setForeground(TREE_COL_NAME, QBrush(QColor(colour)))
+        self._tree.blockSignals(False)
+
+        key   = (file_id, ch_id)
+        curve = self._curves.get(key)
+        if curve is not None:
+            if ch_id in loaded.scatter_ids:
+                curve.setSymbolBrush(pg.mkBrush(colour))
+            else:
+                lw = self._line_width.get(key, 1.0)
+                ls = self._line_style.get(key, Qt.PenStyle.SolidLine)
+                curve.setPen(pg.mkPen(colour, width=lw, style=ls))
+
+    def _on_channel_line_changed(
+        self,
+        file_id: str,
+        ch_id:   int,
+        width:   Optional[float]      = None,
+        style:   Optional[Qt.PenStyle] = None,
+    ) -> None:
+        """Update line width or style for one analogue channel.
+
+        Stores the new setting and updates the live curve pen without a full
+        canvas rebuild.  Has no effect on scatter-mode channels (no line).
+
+        Args:
+            file_id: The _LoadedFile owning the channel.
+            ch_id:   The channel_id to update.
+            width:   New line width in pixels, or None to keep current.
+            style:   New Qt.PenStyle, or None to keep current.
+        """
+        key = (file_id, ch_id)
+        if width is not None:
+            self._line_width[key] = width
+        if style is not None:
+            self._line_style[key] = style
+
+        loaded = self._files.get(file_id)
+        if loaded is None or ch_id in loaded.scatter_ids:
+            return
+
+        curve = self._curves.get(key)
+        if curve is None:
+            return
+
+        ch_map = {c.channel_id: c for c in loaded.record.analogue_channels}
+        ch     = ch_map.get(ch_id)
+        colour = ch.colour if ch else '#AAAAAA'
+        lw     = self._line_width.get(key, 1.0)
+        ls     = self._line_style.get(key, Qt.PenStyle.SolidLine)
+        curve.setPen(pg.mkPen(colour, width=lw, style=ls))
 
     # ── Bay selection helpers ──────────────────────────────────────────────────
 
@@ -1966,22 +2350,293 @@ class UnifiedCanvasWidget(QWidget):
             for ch in loaded.record.analogue_channels:
                 self._rms_cache.pop((file_id, ch.channel_id), None)
 
+    # ── File grouping ──────────────────────────────────────────────────────────
+
+    def _get_grouping_threshold_s(self) -> float:
+        """Return the grouping threshold in seconds from AppSettings."""
+        h = AppSettings.get('calculation.timestamp_grouping_threshold_h', 1.0)
+        return float(h) * 3600.0
+
+    def _find_matching_group(self, epoch: float) -> Optional[int]:
+        """Return the group_id whose ref_epoch is within threshold of epoch, or None.
+
+        If epoch is invalid (<=86400, i.e. less than one day past POSIX epoch),
+        always returns None so the file gets its own group.
+
+        Args:
+            epoch: POSIX UTC epoch of the file to place.
+
+        Returns:
+            group_id if a matching group exists, else None.
+        """
+        if epoch <= 86400:
+            return None
+        threshold = self._get_grouping_threshold_s()
+        best_gid: Optional[int] = None
+        best_diff = float('inf')
+        for gid, ginfo in self._groups.items():
+            if ginfo.ref_epoch <= 86400:
+                continue
+            diff = abs(epoch - ginfo.ref_epoch)
+            if diff <= threshold and diff < best_diff:
+                best_diff = diff
+                best_gid = gid
+        return best_gid
+
+    def _create_group(self, ref_epoch: float) -> int:
+        """Create a new _GroupInfo and its _CanvasGroupSection, return group_id.
+
+        Args:
+            ref_epoch: Reference POSIX epoch for the new group.
+
+        Returns:
+            New group_id integer.
+        """
+        gid = self._group_counter
+        self._group_counter += 1
+
+        section = _CanvasGroupSection(gid)
+        section.apply_theme(theme_palette.current())
+        section.reattach_requested.connect(self._on_section_reattach)
+        self._outer_splitter.addWidget(section)
+
+        ginfo = _GroupInfo(group_id=gid, file_ids=[], ref_epoch=ref_epoch, section=section)
+        self._groups[gid] = ginfo
+        self._ref_plots[gid] = None
+        return gid
+
+    def _on_section_reattach(self, group_id: int) -> None:
+        """Re-insert a section that was detached and then closed back into the outer splitter.
+
+        Connected to _CanvasGroupSection.reattach_requested.  Adds the section
+        back to the outer splitter (preserving group order) then rebuilds the
+        canvas so curves are re-populated.
+
+        Args:
+            group_id: The group whose section should be re-attached.
+        """
+        ginfo = self._groups.get(group_id)
+        if ginfo is None or ginfo.section is None:
+            return
+        # Re-insert in order: remove then re-add all sections sorted by group_id.
+        # Simpler than tracking exact index — there are typically very few groups.
+        for gid_sorted in sorted(self._groups.keys()):
+            g = self._groups[gid_sorted]
+            if g.section is not None and g.section._detach_dialog is None:
+                if g.section.parent() is None:
+                    self._outer_splitter.addWidget(g.section)
+        self._rebuild_canvas()
+
+    def _assign_file_to_group(self, loaded: _LoadedFile) -> None:
+        """Place loaded into an existing group or create a new one.
+
+        Updates group's ref_epoch to the minimum valid epoch among its members.
+
+        Args:
+            loaded: The _LoadedFile whose group_id to set.
+        """
+        epoch = loaded.start_epoch
+        gid = self._find_matching_group(epoch)
+        if gid is None:
+            gid = self._create_group(epoch if epoch > 86400 else 0.0)
+        loaded.group_id = gid
+        ginfo = self._groups[gid]
+        if loaded.file_id not in ginfo.file_ids:
+            ginfo.file_ids.append(loaded.file_id)
+        valid_epochs = [
+            self._files[fid].start_epoch
+            for fid in ginfo.file_ids
+            if fid in self._files and self._files[fid].start_epoch > 86400
+        ]
+        if valid_epochs:
+            ginfo.ref_epoch = min(valid_epochs)
+        self._update_group_label(gid)
+
+    def _update_group_label(self, group_id: int) -> None:
+        """Refresh the header label on a group section with timestamp info.
+
+        Args:
+            group_id: The group to update.
+        """
+        import datetime as _dt  # noqa: PLC0415
+        ginfo = self._groups.get(group_id)
+        if ginfo is None or ginfo.section is None:
+            return
+        n_files = len(ginfo.file_ids)
+        if ginfo.ref_epoch > 86400:
+            try:
+                dt = _dt.datetime.utcfromtimestamp(ginfo.ref_epoch)
+                ts_str = dt.strftime('%Y-%m-%d  %H:%M:%S UTC')
+            except Exception:
+                ts_str = f'{ginfo.ref_epoch:.0f}'
+        else:
+            ts_str = '(no timestamp)'
+        label = f'Group {group_id + 1}   —   {ts_str}   ({n_files} file{"s" if n_files != 1 else ""})'
+        ginfo.section.update_label(label)
+
+    def _remove_file_from_group(self, file_id: str) -> None:
+        """Remove a file from its group; delete the group section if it becomes empty.
+
+        Args:
+            file_id: The file_id to remove.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return
+        gid = loaded.group_id
+        ginfo = self._groups.get(gid)
+        if ginfo is None:
+            return
+        if file_id in ginfo.file_ids:
+            ginfo.file_ids.remove(file_id)
+        if not ginfo.file_ids:
+            # Last file in group — remove the group section entirely
+            if ginfo.section is not None:
+                ginfo.section.setParent(None)
+                ginfo.section.deleteLater()
+            del self._groups[gid]
+            self._ref_plots.pop(gid, None)
+        else:
+            # Update ref_epoch for remaining files
+            valid_epochs = [
+                self._files[fid].start_epoch
+                for fid in ginfo.file_ids
+                if fid in self._files and self._files[fid].start_epoch > 86400
+            ]
+            if valid_epochs:
+                ginfo.ref_epoch = min(valid_epochs)
+            self._update_group_label(gid)
+
+    def _move_file_to_group(self, file_id: str, new_group_id: int) -> None:
+        """Move a file from its current group to an existing or new group.
+
+        Args:
+            file_id:      The file to move.
+            new_group_id: Target group_id, or -1 to create a new group.
+        """
+        loaded = self._files.get(file_id)
+        if loaded is None:
+            return
+        old_gid = loaded.group_id
+        # Remove from old group
+        old_ginfo = self._groups.get(old_gid)
+        if old_ginfo and file_id in old_ginfo.file_ids:
+            old_ginfo.file_ids.remove(file_id)
+            if not old_ginfo.file_ids:
+                if old_ginfo.section:
+                    old_ginfo.section.setParent(None)
+                    old_ginfo.section.deleteLater()
+                del self._groups[old_gid]
+                self._ref_plots.pop(old_gid, None)
+            else:
+                valid_epochs = [
+                    self._files[fid].start_epoch
+                    for fid in old_ginfo.file_ids
+                    if fid in self._files and self._files[fid].start_epoch > 86400
+                ]
+                if valid_epochs:
+                    old_ginfo.ref_epoch = min(valid_epochs)
+                self._update_group_label(old_gid)
+        # Assign to new group
+        if new_group_id == -1:
+            new_group_id = self._create_group(
+                loaded.start_epoch if loaded.start_epoch > 86400 else 0.0
+            )
+        loaded.group_id = new_group_id
+        new_ginfo = self._groups.get(new_group_id)
+        if new_ginfo and file_id not in new_ginfo.file_ids:
+            new_ginfo.file_ids.append(file_id)
+            valid_epochs = [
+                self._files[fid].start_epoch
+                for fid in new_ginfo.file_ids
+                if fid in self._files and self._files[fid].start_epoch > 86400
+            ]
+            if valid_epochs:
+                new_ginfo.ref_epoch = min(valid_epochs)
+            self._update_group_label(new_group_id)
+        self._rebuild_canvas()
+
+    def regroup_files(self) -> None:
+        """Re-assign ALL loaded files to groups using the current threshold.
+
+        Called when the user changes timestamp_grouping_threshold_h in Preferences.
+        Clears all existing groups and re-evaluates every file from scratch.
+        """
+        if not self._files:
+            return
+
+        # Remove all group section widgets
+        for ginfo in self._groups.values():
+            if ginfo.section is not None:
+                ginfo.section.setParent(None)
+                ginfo.section.deleteLater()
+        self._groups.clear()
+        self._group_counter = 0
+        self._ref_plots.clear()
+
+        # Re-assign files sorted by start_epoch so earlier files seed groups first
+        sorted_files = sorted(
+            self._files.values(),
+            key=lambda f: f.start_epoch if f.start_epoch > 86400 else float('inf'),
+        )
+        for loaded in sorted_files:
+            loaded.group_id = -1
+            self._assign_file_to_group(loaded)
+
+        self._rebuild_canvas()
+
+    def _get_group_ref_epoch(self, group_id: int) -> float:
+        """Return the earliest valid start_epoch for files in group_id.
+
+        Args:
+            group_id: The group to query.
+
+        Returns:
+            POSIX epoch float, or 0.0 if no valid epoch found.
+        """
+        ginfo = self._groups.get(group_id)
+        if ginfo is None:
+            return 0.0
+        valid = [
+            self._files[fid].start_epoch
+            for fid in ginfo.file_ids
+            if fid in self._files and self._files[fid].start_epoch > 86400
+        ]
+        return min(valid) if valid else 0.0
+
+    def _get_group_active_stacks(self, group_id: int) -> set:
+        """Return stack indices that have at least one checked channel in group_id.
+
+        Args:
+            group_id: The group to query.
+
+        Returns:
+            Set of active stack_idx values for this group.
+        """
+        active: set = set()
+        ginfo = self._groups.get(group_id)
+        if ginfo is None:
+            return active
+        for fid in ginfo.file_ids:
+            loaded = self._files.get(fid)
+            if loaded is None:
+                continue
+            for ch_id in loaded.selected_ids:
+                stack_idx, _ = self._stack_assign.get((fid, ch_id), (4, 'left'))
+                active.add(stack_idx)
+            if loaded.selected_digital_ids:
+                active.add(STACK_DIGITAL)
+        return active
+
     # ── Canvas rebuild ─────────────────────────────────────────────────────────
 
     def _rebuild_canvas(self) -> None:
-        """Clear and rebuild all stacks from scratch.
+        """Clear and rebuild all group stacks from scratch.
 
-        Each active stack lives in its own PlotWidget inside self._splitter,
-        giving the user native drag-to-resize handles between stacks.
-        The digital events strip uses a _DigitalViewBox so mouse-wheel
-        scrolls through channels instead of zooming.
-
-        Called on structural changes: file add/remove, checkbox toggle,
-        stack assignment change.  Offset / mode changes use _update_curves().
+        Iterates over all groups (sorted by group_id) and rebuilds each group's
+        _CanvasGroupSection.stack_splitter with the appropriate PlotWidgets.
         """
-        # ── 1. Disconnect all X-links and remove secondary ViewBoxes ─────────
-        # Must happen BEFORE the PlotWidgets are removed from the splitter,
-        # otherwise pending resize events reach already-deleted C++ objects.
+        # ── 1. Disconnect X-links and remove secondary ViewBoxes ─────────────
         for vb2 in self._stack_vb2s.values():
             try:
                 vb2.setXLink(None)
@@ -1999,12 +2654,20 @@ class UnifiedCanvasWidget(QWidget):
             except RuntimeError:
                 pass
 
-        # ── 2. Remove all PlotWidgets from the splitter ───────────────────────
-        while self._splitter.count() > 0:
-            w = self._splitter.widget(0)
-            w.setParent(None)   # detach; Python GC will clean up
-            w.deleteLater()
+        # ── 2. Remove all PlotWidgets from each group's stack splitter ────────
+        for ginfo in self._groups.values():
+            if ginfo.section is None:
+                continue
+            splitter = ginfo.section.stack_splitter
+            try:
+                while splitter.count() > 0:
+                    w = splitter.widget(0)
+                    w.setParent(None)
+                    w.deleteLater()
+            except RuntimeError:
+                pass
 
+        # ── 3. Clear all canvas state ─────────────────────────────────────────
         self._stack_widgets.clear()
         self._stack_plots.clear()
         self._stack_vb2s.clear()
@@ -2014,40 +2677,66 @@ class UnifiedCanvasWidget(QWidget):
         self._digital_curves.clear()
         self._digital_row.clear()
         self._time_axes.clear()
-        self._ref_plot = None
+        self._ref_plots = {gid: None for gid in self._groups}
 
-        active = sorted(self._get_active_stacks())
-        if not active:
-            self._update_readout()
+        # ── 4. Re-attach any detached sections that were closed ───────────────
+        for ginfo in self._groups.values():
+            if ginfo.section is not None and ginfo.section._detach_dialog is None:
+                if ginfo.section.parent() is None:
+                    self._outer_splitter.addWidget(ginfo.section)
+
+        # ── 5. Rebuild stacks per group ───────────────────────────────────────
+        for gid in sorted(self._groups.keys()):
+            self._rebuild_group_canvas(gid)
+
+        self._plot_all_channels()
+        self._update_readout()
+        if self._readout:
+            self._readout.raise_()
+
+    def _rebuild_group_canvas(self, group_id: int) -> None:
+        """Build the PlotWidgets for one group inside its section's stack_splitter.
+
+        Args:
+            group_id: The group to build stacks for.
+        """
+        ginfo = self._groups.get(group_id)
+        if ginfo is None or ginfo.section is None:
             return
 
+        active = sorted(self._get_group_active_stacks(group_id))
+        if not active:
+            return
+
+        splitter = ginfo.section.stack_splitter
         ref_plot: Optional[pg.PlotItem] = None
 
         for row_idx, stack_idx in enumerate(active):
             is_last = row_idx == len(active) - 1
+            gkey = (group_id, stack_idx)
 
             # ── Digital events strip ──────────────────────────────────────────
             if stack_idx == STACK_DIGITAL:
                 n_digital = sum(
-                    len(f.selected_digital_ids) for f in self._files.values()
+                    len(f.selected_digital_ids)
+                    for f in self._files.values()
+                    if f.group_id == group_id
                 )
-                # _DigitalViewBox: wheel pans Y; X is controlled by X-link
                 dig_vb   = _DigitalViewBox()
                 dig_t_ax = _TimeAxis(orientation='bottom')
                 dig_t_ax.set_cycles_mode(self._xaxis_cycles, self._get_nominal_freq())
                 dig_pw   = pg.PlotWidget(
-                    background=CANVAS_BG,
+                    background=theme_palette.current()['bg_canvas'],
                     viewBox=dig_vb,
                     axisItems={'bottom': dig_t_ax},
                 )
-                self._time_axes[STACK_DIGITAL] = dig_t_ax
+                self._time_axes[gkey] = dig_t_ax
                 dig_plot: pg.PlotItem = dig_pw.getPlotItem()
 
-                # Height: show up to 8 rows initially; splitter lets user grow
                 visible_rows = min(n_digital, 8)
                 dig_pw.setMinimumHeight(50)
-                self._splitter.addWidget(dig_pw)
-                self._splitter.setCollapsible(row_idx, False)
+                splitter.addWidget(dig_pw)
+                splitter.setCollapsible(row_idx, False)
 
                 dig_plot.showGrid(x=True, y=False, alpha=0.15)
                 dig_plot.setMenuEnabled(False)
@@ -2076,7 +2765,7 @@ class UnifiedCanvasWidget(QWidget):
                 c1d.sigDragged.connect(self._on_cursor_dragged)
                 if self._cursor1_enabled:
                     dig_plot.addItem(c1d)
-                self._cursor1_lines[STACK_DIGITAL] = c1d
+                self._cursor1_lines[gkey] = c1d
 
                 c2d = pg.InfiniteLine(
                     pos=0.0, angle=90, movable=True,
@@ -2086,25 +2775,27 @@ class UnifiedCanvasWidget(QWidget):
                 c2d.sigDragged.connect(self._on_cursor_dragged)
                 if self._cursor2_enabled:
                     dig_plot.addItem(c2d)
-                self._cursor2_lines[STACK_DIGITAL] = c2d
+                self._cursor2_lines[gkey] = c2d
 
                 dig_pw.scene().sigMouseClicked.connect(
                     lambda ev, p=dig_plot: self._on_canvas_clicked(ev, p)
                 )
-                self._stack_widgets[STACK_DIGITAL] = dig_pw
-                self._stack_plots[STACK_DIGITAL]   = dig_plot
-                # No vb2 for digital strip
+                self._stack_widgets[gkey] = dig_pw
+                self._stack_plots[gkey]   = dig_plot
                 continue
 
             # ── Analogue stack ────────────────────────────────────────────────
             t_ax = _TimeAxis(orientation='bottom')
             t_ax.set_cycles_mode(self._xaxis_cycles, self._get_nominal_freq())
-            pw   = pg.PlotWidget(background=CANVAS_BG, axisItems={'bottom': t_ax})
-            self._time_axes[stack_idx] = t_ax
+            pw   = pg.PlotWidget(
+                background=theme_palette.current()['bg_canvas'],
+                axisItems={'bottom': t_ax},
+            )
+            self._time_axes[gkey] = t_ax
             plot: pg.PlotItem = pw.getPlotItem()
             pw.setMinimumHeight(100)
-            self._splitter.addWidget(pw)
-            self._splitter.setCollapsible(row_idx, False)
+            splitter.addWidget(pw)
+            splitter.setCollapsible(row_idx, False)
 
             plot.showGrid(x=True, y=True, alpha=0.15)
             plot.setMenuEnabled(False)
@@ -2121,7 +2812,6 @@ class UnifiedCanvasWidget(QWidget):
                 left_label = 'Voltage (PU)'
             plot.setLabel('left', left_label)
 
-            # Right axis + secondary ViewBox
             plot.showAxis('right')
             right_axis = plot.getAxis('right')
             right_label = STACK_RIGHT_LABELS[stack_idx]
@@ -2156,7 +2846,7 @@ class UnifiedCanvasWidget(QWidget):
             c1.sigDragged.connect(self._on_cursor_dragged)
             if self._cursor1_enabled:
                 plot.addItem(c1)
-            self._cursor1_lines[stack_idx] = c1
+            self._cursor1_lines[gkey] = c1
 
             c2 = pg.InfiniteLine(
                 pos=0.0, angle=90, movable=True,
@@ -2170,61 +2860,48 @@ class UnifiedCanvasWidget(QWidget):
             c2.sigDragged.connect(self._on_cursor_dragged)
             if self._cursor2_enabled:
                 plot.addItem(c2)
-            self._cursor2_lines[stack_idx] = c2
+            self._cursor2_lines[gkey] = c2
 
             pw.scene().sigMouseClicked.connect(
                 lambda ev, p=plot: self._on_canvas_clicked(ev, p)
             )
-            self._stack_widgets[stack_idx] = pw
-            self._stack_plots[stack_idx]   = plot
-            self._stack_vb2s[stack_idx]    = vb2
+            self._stack_widgets[gkey] = pw
+            self._stack_plots[gkey]   = plot
+            self._stack_vb2s[gkey]    = vb2
 
-        self._ref_plot = ref_plot
+        self._ref_plots[group_id] = ref_plot
 
-        # Set equal initial heights; user can resize via splitter handles
-        n = self._splitter.count()
+        n = splitter.count()
         if n > 0:
-            self._splitter.setSizes([200] * n)
+            splitter.setSizes([200] * n)
 
-        self._plot_all_channels()
-        self._update_readout()
-        self._readout.raise_()   # keep overlay on top after widget rebuild
-
-    def _get_active_stacks(self) -> set[int]:
-        """Return stack indices that have at least one checked channel.
-
-        Analogue channels contribute their assigned stack index.
-        Any selected digital channel adds STACK_DIGITAL (always last).
-
-        Returns:
-            Set of active stack_idx values.
-        """
-        active: set[int] = set()
-        for loaded in self._files.values():
-            for ch_id in loaded.selected_ids:
-                stack_idx, _ = self._stack_assign.get(
-                    (loaded.file_id, ch_id), (4, 'left')
-                )
-                active.add(stack_idx)
-            if loaded.selected_digital_ids:
-                active.add(STACK_DIGITAL)
+    def _get_active_stacks(self) -> set:
+        """Return stack indices active across ALL groups (union)."""
+        active: set = set()
+        for gid in self._groups:
+            active |= self._get_group_active_stacks(gid)
         return active
 
     def _plot_all_channels(self) -> None:
-        """Populate all stack PlotItems and ViewBoxes with channel curves.
+        """Populate all group stacks with channel curves.
 
-        Must be called after _rebuild_canvas has created the stack PlotItems.
-        Shows the right axis for stacks that have at least one right-side channel.
-        Applies PU Y-range to Stack 0 when PU mode is active.
+        Each group uses its own ref_epoch so that files within the group
+        are time-aligned to each other.  Files in different groups have
+        independent X-axes.
         """
-        has_right: dict[int, bool] = {idx: False for idx in self._stack_plots}
-        ref_epoch = self._get_ref_epoch()
+        has_right: dict[tuple, bool] = {gkey: False for gkey in self._stack_plots}
 
         for loaded in self._files.values():
+            gid = loaded.group_id
+            if gid not in self._groups:
+                continue
+            ref_epoch = self._get_group_ref_epoch(gid)
+
             for ch_id in loaded.selected_ids:
                 key = (loaded.file_id, ch_id)
                 stack_idx, side = self._stack_assign.get(key, (4, 'left'))
-                if stack_idx not in self._stack_plots:
+                gkey = (gid, stack_idx)
+                if gkey not in self._stack_plots:
                     continue
 
                 ch_map = {c.channel_id: c for c in loaded.record.analogue_channels}
@@ -2247,94 +2924,103 @@ class UnifiedCanvasWidget(QWidget):
                         name=f'{loaded.path.stem}/{ch.name}',
                     )
                 else:
+                    lw = self._line_width.get(key, 1.0)
+                    ls = self._line_style.get(key, Qt.PenStyle.SolidLine)
                     curve = pg.PlotDataItem(
                         t_data, y_data,
-                        pen=pg.mkPen(colour, width=1),
+                        pen=pg.mkPen(colour, width=lw, style=ls),
                         name=f'{loaded.path.stem}/{ch.name}',
                     )
 
                 if side == 'right':
-                    self._stack_vb2s[stack_idx].addItem(curve)
-                    has_right[stack_idx] = True
+                    self._stack_vb2s[gkey].addItem(curve)
+                    has_right[gkey] = True
                 else:
-                    self._stack_plots[stack_idx].addItem(curve)
+                    self._stack_plots[gkey].addItem(curve)
 
                 self._curves[key] = curve
 
-        for stack_idx, has_r in has_right.items():
-            ax = self._stack_plots[stack_idx].getAxis('right')
+        for gkey, has_r in has_right.items():
+            ax = self._stack_plots[gkey].getAxis('right')
             if has_r:
                 ax.show()
             else:
                 ax.hide()
 
-        if self._pu_mode and 0 in self._stack_plots:
-            _yr = AppSettings.get('calculation.pu_yrange', 2.0)
-            self._stack_plots[0].setYRange(-_yr, _yr, padding=0)
+        if self._pu_mode:
+            for gid in self._groups:
+                gkey = (gid, 0)
+                if gkey in self._stack_plots:
+                    _yr = AppSettings.get('calculation.pu_yrange', 2.0)
+                    self._stack_plots[gkey].setYRange(-_yr, _yr, padding=0)
 
-        # ── Digital events strip ──────────────────────────────────────────────
-        if STACK_DIGITAL not in self._stack_plots:
-            return
+        # ── Digital events strip per group ────────────────────────────────────
+        for gid in sorted(self._groups.keys()):
+            gkey = (gid, STACK_DIGITAL)
+            if gkey not in self._stack_plots:
+                continue
+            ref_epoch = self._get_group_ref_epoch(gid)
+            dig_plot = self._stack_plots[gkey]
+            channel_row = 0
+            tick_labels: list[tuple[float, str]] = []
 
-        dig_plot = self._stack_plots[STACK_DIGITAL]
-        channel_row = 0
-        tick_labels: list[tuple[float, str]] = []
-
-        for loaded in self._files.values():
-            dch_map = {c.channel_id: c for c in loaded.record.digital_channels}
-            for dch_id in sorted(loaded.selected_digital_ids):
-                dch = dch_map.get(dch_id)
-                if dch is None:
+            for loaded in self._files.values():
+                if loaded.group_id != gid:
                     continue
-                t_data, y_data = self._digital_xy(loaded, dch, ref_epoch, channel_row)
-                if t_data is None or len(t_data) == 0:
+                dch_map = {c.channel_id: c for c in loaded.record.digital_channels}
+                for dch_id in sorted(loaded.selected_digital_ids):
+                    dch = dch_map.get(dch_id)
+                    if dch is None:
+                        continue
+                    t_data, y_data = self._digital_xy(loaded, dch, ref_epoch, channel_row)
+                    if t_data is None or len(t_data) == 0:
+                        channel_row += 1
+                        continue
+                    colour = getattr(dch, 'colour', '#AAAAAA') or '#AAAAAA'
+                    curve = pg.PlotDataItem(
+                        t_data, y_data,
+                        pen=pg.mkPen(colour, width=1.5),
+                        fillLevel=float(channel_row),
+                        brush=pg.mkBrush(colour + '55'),
+                    )
+                    dig_plot.addItem(curve)
+                    dkey = (loaded.file_id, dch_id)
+                    self._digital_curves[dkey] = curve
+                    self._digital_row[dkey]    = channel_row
+                    tick_labels.append(
+                        (channel_row + DIG_CH_HEIGHT / 2,
+                         f'{loaded.path.stem[:6]}/{dch.name[:14]}')
+                    )
                     channel_row += 1
-                    continue
 
-                colour = getattr(dch, 'colour', '#AAAAAA') or '#AAAAAA'
-                curve = pg.PlotDataItem(
-                    t_data, y_data,
-                    pen=pg.mkPen(colour, width=1.5),
-                    fillLevel=float(channel_row),
-                    brush=pg.mkBrush(colour + '55'),
-                )
-                dig_plot.addItem(curve)
-                key = (loaded.file_id, dch_id)
-                self._digital_curves[key] = curve
-                self._digital_row[key]    = channel_row
+            if tick_labels:
+                dig_plot.getAxis('left').setTicks([tick_labels])
+            dig_plot.setYRange(-0.3, max(1.0, float(channel_row)) - 0.3, padding=0)
 
-                label = f'{loaded.path.stem[:6]}/{dch.name[:14]}'
-                tick_labels.append((channel_row + DIG_CH_HEIGHT / 2, label))
-                channel_row += 1
-
-        if tick_labels:
-            dig_plot.getAxis('left').setTicks([tick_labels])
-        dig_plot.setYRange(-0.3, max(1.0, float(channel_row)) - 0.3, padding=0)
         self._update_digital_tick_font()
 
     # ── Digital tick-font auto-size ────────────────────────────────────────────
 
     def _update_digital_tick_font(self, *_) -> None:
-        """Fit Y-axis tick labels in the digital strip without overlap.
-
-        Computes a point size proportional to the pixel height available per
-        channel row and applies it to the left axis.  Called once after
-        plotting and again whenever the user drags a splitter handle.
-        """
-        if STACK_DIGITAL not in self._stack_plots or STACK_DIGITAL not in self._stack_widgets:
-            return
-        n_rows = max(1, len(self._digital_row))
-        dig_pw   = self._stack_widgets[STACK_DIGITAL]
-        dig_plot = self._stack_plots[STACK_DIGITAL]
-        # Usable plot area is roughly 85 % of the widget height
-        px_available = dig_pw.height() * 0.85
-        if px_available <= 10:
-            px_available = 200 * 0.85   # fallback before first layout pass
-        px_per_row = px_available / n_rows
-        pt = max(6, min(11, int(px_per_row * 0.55)))
-        font = QFont()
-        font.setPointSize(pt)
-        dig_plot.getAxis('left').setStyle(tickFont=font)
+        """Fit Y-axis tick labels in every digital strip without overlap."""
+        for gid in self._groups:
+            gkey = (gid, STACK_DIGITAL)
+            if gkey not in self._stack_plots or gkey not in self._stack_widgets:
+                continue
+            n_rows = max(1, sum(
+                1 for (fid, _) in self._digital_row
+                if fid in self._files and self._files[fid].group_id == gid
+            ))
+            dig_pw   = self._stack_widgets[gkey]
+            dig_plot = self._stack_plots[gkey]
+            px_available = dig_pw.height() * 0.85
+            if px_available <= 10:
+                px_available = 200 * 0.85
+            px_per_row = px_available / n_rows
+            pt = max(6, min(11, int(px_per_row * 0.55)))
+            font = QFont()
+            font.setPointSize(pt)
+            dig_plot.getAxis('left').setStyle(tickFont=font)
 
     # ── Curve update (no layout rebuild) ──────────────────────────────────────
 
@@ -2343,32 +3029,40 @@ class UnifiedCanvasWidget(QWidget):
 
         Called on: offset slider change, PU mode toggle, RMS result available.
         """
-        ref_epoch = self._get_ref_epoch()
-
         for loaded in self._files.values():
+            gid = loaded.group_id
+            if gid not in self._groups:
+                continue
+            ref_epoch = self._get_group_ref_epoch(gid)
+
             for ch_id in loaded.selected_ids:
                 key = (loaded.file_id, ch_id)
                 curve = self._curves.get(key)
                 if curve is None:
                     continue
-
                 ch_map = {c.channel_id: c for c in loaded.record.analogue_channels}
                 ch = ch_map.get(ch_id)
                 if ch is None:
                     continue
-
                 t_data, y_data = self._channel_xy(loaded, ch, ref_epoch)
                 if t_data is not None and len(t_data) > 0:
                     curve.setData(t_data, y_data)
 
-        if self._pu_mode and 0 in self._stack_plots:
-            _yr = AppSettings.get('calculation.pu_yrange', 2.0)
-            self._stack_plots[0].setYRange(-_yr, _yr, padding=0)
-        elif not self._pu_mode and 0 in self._stack_plots:
-            self._stack_plots[0].enableAutoRange(axis='y', enable=True)
+        if self._pu_mode:
+            for gid in self._groups:
+                gkey = (gid, 0)
+                if gkey in self._stack_plots:
+                    _yr = AppSettings.get('calculation.pu_yrange', 2.0)
+                    self._stack_plots[gkey].setYRange(-_yr, _yr, padding=0)
+        else:
+            for gid in self._groups:
+                gkey = (gid, 0)
+                if gkey in self._stack_plots:
+                    self._stack_plots[gkey].enableAutoRange(axis='y', enable=True)
 
-        # Update digital channel curves
         for loaded in self._files.values():
+            gid = loaded.group_id
+            ref_epoch = self._get_group_ref_epoch(gid)
             dch_map = {c.channel_id: c for c in loaded.record.digital_channels}
             for dch_id in loaded.selected_digital_ids:
                 key = (loaded.file_id, dch_id)
@@ -2511,7 +3205,8 @@ class UnifiedCanvasWidget(QWidget):
         if ch is None:
             return
 
-        t_data, y_data = self._channel_xy(loaded, ch, self._get_ref_epoch())
+        ref_epoch = self._get_group_ref_epoch(loaded.group_id)
+        t_data, y_data = self._channel_xy(loaded, ch, ref_epoch)
         if t_data is not None and len(t_data) > 0:
             self._curves[key].setData(t_data, y_data)
 
@@ -2550,9 +3245,18 @@ class UnifiedCanvasWidget(QWidget):
             return
         event.accept()
 
+        # Determine the group_id that this plot belongs to.
+        group_id: Optional[int] = None
+        for (gid, _sidx), p in self._stack_plots.items():
+            if p is plot:
+                group_id = gid
+                break
+
         from PyQt6.QtWidgets import QMenu  # noqa: PLC0415
         menu = QMenu(self)
-        fit_act = menu.addAction('Zoom to Fit')
+        fit_act     = menu.addAction('Zoom to Fit  (this group)')
+        fit_all_act = menu.addAction('Zoom to Fit  (all groups)')
+        fit_all_act.setEnabled(len(self._groups) > 1)
         menu.addSeparator()
         act1 = menu.addAction('Cursor 1  (gold)')
         act1.setCheckable(True)
@@ -2563,7 +3267,9 @@ class UnifiedCanvasWidget(QWidget):
 
         chosen = menu.exec(event.screenPos().toPoint())
         if chosen is fit_act:
-            self._zoom_to_fit()
+            self._zoom_to_fit(group_id)
+        elif chosen is fit_all_act:
+            self._zoom_to_fit(None)
         elif chosen is act1:
             self._set_cursor_enabled(1, not self._cursor1_enabled)
         elif chosen is act2:
@@ -2907,24 +3613,65 @@ class UnifiedCanvasWidget(QWidget):
             if plot.getAxis('bottom').isVisible():
                 plot.setLabel('bottom', t_lbl)
 
-    def _zoom_to_fit(self) -> None:
-        """Reset X range to show the full time span of all rendered curves."""
+    def _zoom_to_fit(self, group_id: Optional[int] = None) -> None:
+        """Reset X range to show the full time span of rendered curves.
+
+        Each canvas group has its own independent time axis whose X coordinates
+        are seconds relative to that group's ref_epoch.  Mixing coordinates
+        across groups would produce nonsense, so this method always fits
+        per-group.
+
+        Args:
+            group_id: The group to fit.  Pass None to fit ALL groups
+                      independently (each group is fitted to its own content).
+        """
         if not self._stack_plots:
             return
-        t_min, t_max = float('inf'), float('-inf')
-        for curve in self._curves.values():
-            xd = curve.xData
-            if xd is not None and len(xd) > 0:
-                t_min = min(t_min, float(xd[0]))
-                t_max = max(t_max, float(xd[-1]))
-        for curve in self._digital_curves.values():
-            xd = curve.xData
-            if xd is not None and len(xd) > 0:
-                t_min = min(t_min, float(xd[0]))
-                t_max = max(t_max, float(xd[-1]))
-        if t_min < t_max:
-            ref = next(iter(self._stack_plots.values()))
-            ref.setXRange(t_min, t_max, padding=0.02)
+
+        target_groups = (
+            [group_id] if group_id is not None else sorted(self._groups.keys())
+        )
+
+        for gid in target_groups:
+            ginfo = self._groups.get(gid)
+            if ginfo is None:
+                continue
+
+            # Gather file_ids that belong to this group
+            fids_in_group = set(ginfo.file_ids)
+
+            t_min, t_max = float('inf'), float('-inf')
+
+            for (fid, _ch_id), curve in self._curves.items():
+                if fid not in fids_in_group:
+                    continue
+                xd = curve.xData
+                if xd is not None and len(xd) > 0:
+                    t_min = min(t_min, float(xd[0]))
+                    t_max = max(t_max, float(xd[-1]))
+
+            for (fid, _ch_id), curve in self._digital_curves.items():
+                if fid not in fids_in_group:
+                    continue
+                xd = curve.xData
+                if xd is not None and len(xd) > 0:
+                    t_min = min(t_min, float(xd[0]))
+                    t_max = max(t_max, float(xd[-1]))
+
+            if t_min >= t_max:
+                continue
+
+            # Set range on the group's ref_plot; X-link propagates to all
+            # stacks within the same group automatically.
+            ref = self._ref_plots.get(gid)
+            if ref is None:
+                # Fallback: use the first stack plot for this group
+                for (g, _s), p in self._stack_plots.items():
+                    if g == gid:
+                        ref = p
+                        break
+            if ref is not None:
+                ref.setXRange(t_min, t_max, padding=0.02)
 
     def _get_ref_epoch(self) -> float:
         """Return the earliest start_epoch across all loaded files.

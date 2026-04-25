@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.app_settings import AppSettings
+from ui import theme_palette
 
 # ── Module constants ───────────────────────────────────────────────────────────
 
@@ -51,39 +52,38 @@ COL_UNIT: int                = 4
 COL_WIDTHS: tuple[int, ...]  = (100, 65, 65, 65, 42)
 COL_HEADERS: tuple[str, ...] = ('Channel', 'Val C1', 'Val C2', 'Δ', 'Unit')
 
-DELTA_HIGHLIGHT: str         = '#2A2A2A'   # row bg when Δ is non-zero
 FONT_PT_DEFAULT: int         = 9           # fallback if AppSettings not yet loaded
 
 DELTA_THRESHOLD: float       = 1e-6        # treat |Δ| < this as zero (float noise)
 
 
-# ── Style generators (parameterised by font size) ──────────────────────────────
+# ── Style generators (parameterised by font size + palette) ───────────────────
 
-def _hdr_style(pt: int) -> str:
+def _hdr_style(pt: int, p: dict) -> str:
     return (
-        "QHeaderView::section { background-color: #3A3A3A; color: #CCCCCC;"
+        f"QHeaderView::section {{ background-color: {p['bg_header']}; color: {p['text']};"
         f" font-size: {pt}pt; border: none; padding: 1px; }}"
     )
 
 
-def _tbl_style(pt: int) -> str:
+def _tbl_style(pt: int, p: dict) -> str:
     return (
-        "QTableWidget { background-color: #1E1E1E; color: #FFFFFF;"
-        f" font-size: {pt}pt; gridline-color: #3A3A3A; border: none; }}"
+        f"QTableWidget {{ background-color: {p['bg_panel']}; color: {p['text_bright']};"
+        f" font-size: {pt}pt; gridline-color: {p['border_dim']}; border: none; }}"
         " QTableWidget::item { padding: 1px; }"
     )
 
 
-def _lbl_style(pt: int) -> str:
-    return f"color: #CCCCCC; font-size: {pt}pt;"
+def _lbl_style(pt: int, p: dict) -> str:
+    return f"color: {p['text']}; font-size: {pt}pt;"
 
 
-def _val_style(pt: int) -> str:
-    return f"color: #FFFFFF; font-size: {pt}pt; font-weight: bold;"
+def _val_style(pt: int, p: dict) -> str:
+    return f"color: {p['text_bright']}; font-size: {pt}pt; font-weight: bold;"
 
 
-def _ttl_style(pt: int) -> str:
-    return f"color: #AAAAAA; font-size: {pt}pt; font-weight: bold; padding-bottom: 1px;"
+def _ttl_style(pt: int, p: dict) -> str:
+    return f"color: {p['text_dim']}; font-size: {pt}pt; font-weight: bold; padding-bottom: 1px;"
 
 
 # ── Panel ──────────────────────────────────────────────────────────────────────
@@ -102,8 +102,6 @@ class MeasurementPanel(QWidget):
         self.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
         )
-        self.setStyleSheet("QWidget { background-color: #1E1E1E; color: #CCCCCC; }")
-
         # Kept for dynamic re-styling in apply_settings()
         self._title_lbls: list[QLabel] = []
         self._key_lbls:   list[QLabel] = []
@@ -114,7 +112,8 @@ class MeasurementPanel(QWidget):
         layout.setSpacing(4)
 
         layout.addWidget(self._build_time_section())
-        layout.addWidget(self._make_divider())
+        self._divider = self._make_divider()
+        layout.addWidget(self._divider)
         self._table = self._build_table()
         layout.addWidget(self._table, stretch=1)
 
@@ -123,20 +122,25 @@ class MeasurementPanel(QWidget):
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def apply_settings(self) -> None:
-        """Re-read AppSettings and update all font-dependent styles.
+        """Re-read AppSettings and update all font- and theme-dependent styles.
 
         Called once at construction and again whenever the user saves new
         preferences via the Preferences dialog.
         """
         pt = int(AppSettings.get('display.panel_font_size', FONT_PT_DEFAULT))
+        p  = theme_palette.current()
+        self.setStyleSheet(
+            f"QWidget {{ background-color: {p['bg_panel']}; color: {p['text']}; }}"
+        )
         for lbl in self._title_lbls:
-            lbl.setStyleSheet(_ttl_style(pt))
+            lbl.setStyleSheet(_ttl_style(pt, p))
         for lbl in self._key_lbls:
-            lbl.setStyleSheet(_lbl_style(pt))
+            lbl.setStyleSheet(_lbl_style(pt, p))
         for lbl in self._val_lbls:
-            lbl.setStyleSheet(_val_style(pt))
-        self._table.horizontalHeader().setStyleSheet(_hdr_style(pt))
-        self._table.setStyleSheet(_tbl_style(pt))
+            lbl.setStyleSheet(_val_style(pt, p))
+        self._table.horizontalHeader().setStyleSheet(_hdr_style(pt, p))
+        self._table.setStyleSheet(_tbl_style(pt, p))
+        self._divider.setStyleSheet(f"color: {p['border_dim']};")
 
     def update_readout(
         self,
@@ -162,6 +166,7 @@ class MeasurementPanel(QWidget):
         else:
             self._val_dt.setText('---')
 
+        delta_colour = QColor(theme_palette.current()['bg_hover'])
         self._table.setRowCount(len(rows))
         for r_idx, (name, unit, val_c1, val_c2) in enumerate(rows):
             delta = (
@@ -179,7 +184,7 @@ class MeasurementPanel(QWidget):
                 for col in range(len(COL_WIDTHS)):
                     item = self._table.item(r_idx, col)
                     if item:
-                        item.setBackground(QColor(DELTA_HIGHLIGHT))
+                        item.setBackground(delta_colour)
 
     # ── Private builders ───────────────────────────────────────────────────────
 
@@ -244,10 +249,9 @@ class MeasurementPanel(QWidget):
 
     @staticmethod
     def _make_divider() -> QFrame:
-        """Return a thin horizontal divider line."""
+        """Return a thin horizontal divider line (colour set by apply_settings)."""
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color: #3A3A3A;")
         line.setFixedHeight(1)
         return line
 

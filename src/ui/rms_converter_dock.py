@@ -64,6 +64,7 @@ from PyQt6.QtWidgets import (
 
 from core.app_settings import AppSettings
 from core.thread_manager import run_in_thread
+from ui import theme_palette
 from engine.rms_calculator import compute_rms_for_record
 from engine.rms_merger import (
     DEFAULT_TOLERANCE_S,
@@ -246,10 +247,10 @@ class _OffsetRow(QWidget):
         layout.setSpacing(6)
 
         # File label
-        name_lbl = QLabel(display_name)
-        name_lbl.setFixedWidth(140)
-        name_lbl.setStyleSheet('color: #CCCCCC; font-size: 8pt;')
-        layout.addWidget(name_lbl)
+        self._name_lbl = QLabel(display_name)
+        self._name_lbl.setFixedWidth(140)
+        self._name_lbl.setStyleSheet('color: #CCCCCC; font-size: 8pt;')
+        layout.addWidget(self._name_lbl)
 
         # Frequency selector
         layout.addWidget(QLabel('Freq:'))
@@ -264,7 +265,8 @@ class _OffsetRow(QWidget):
 
         # Minus button
         btn_minus = QPushButton('−')
-        btn_minus.setFixedWidth(24)
+        btn_minus.setFixedSize(30, 22)
+        btn_minus.setStyleSheet('font-size: 14px; font-weight: bold; padding: 0;')
         btn_minus.clicked.connect(self._step_minus)
         layout.addWidget(btn_minus)
 
@@ -278,7 +280,8 @@ class _OffsetRow(QWidget):
 
         # Plus button
         btn_plus = QPushButton('+')
-        btn_plus.setFixedWidth(24)
+        btn_plus.setFixedSize(30, 22)
+        btn_plus.setStyleSheet('font-size: 14px; font-weight: bold; padding: 0;')
         btn_plus.clicked.connect(self._step_plus)
         layout.addWidget(btn_plus)
 
@@ -301,6 +304,12 @@ class _OffsetRow(QWidget):
         layout.addStretch()
 
     # ── Public ────────────────────────────────────────────────────────────────
+
+    def apply_theme(self) -> None:
+        """Re-style labels to match the current theme palette."""
+        p = theme_palette.current()
+        self._name_lbl.setStyleSheet(f'color: {p["text"]}; font-size: 8pt;')
+        self._offset_lbl.setStyleSheet(f'color: {p["text_dim"]}; font-size: 8pt;')
 
     @property
     def offset_s(self) -> float:
@@ -427,7 +436,8 @@ class RmsConverterDock(QDockWidget):
 
     def _build_toolbar(self) -> QWidget:
         """Build the top toolbar strip with file controls and tolerance selector."""
-        bar = QWidget()
+        self._top_bar = QWidget()
+        bar = self._top_bar
         bar.setStyleSheet('background: #2D2D2D;')
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -443,10 +453,10 @@ class RmsConverterDock(QDockWidget):
 
         layout.addWidget(self._make_separator())
 
-        compute_btn = QPushButton('Compute RMS')
-        compute_btn.setStyleSheet('font-weight: bold; color: #44FFAA;')
-        compute_btn.clicked.connect(self._on_compute_rms)
-        layout.addWidget(compute_btn)
+        self._compute_btn = QPushButton('Compute RMS')
+        self._compute_btn.setStyleSheet(f'font-weight: bold; color: {theme_palette.current()["accent"]};')
+        self._compute_btn.clicked.connect(self._on_compute_rms)
+        layout.addWidget(self._compute_btn)
 
         layout.addWidget(self._make_separator())
 
@@ -482,10 +492,10 @@ class RmsConverterDock(QDockWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        hdr = QLabel(' Files & Channels')
-        hdr.setStyleSheet(
+        self._tree_hdr_lbl = QLabel(' Files & Channels')
+        self._tree_hdr_lbl.setStyleSheet(
             'background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;')
-        layout.addWidget(hdr)
+        layout.addWidget(self._tree_hdr_lbl)
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(False)
@@ -569,8 +579,8 @@ class RmsConverterDock(QDockWidget):
         # problems and gives reliable semi-transparent rendering on all platforms.
         self._readout = _DraggableLabel(self._waveform)
         self._readout.setStyleSheet(
-            'background-color: rgba(255,255,255,210);'
-            'color: #111111;'
+            'background-color: rgba(15,15,35,220);'
+            'color: #EEEEEE;'
             'font-family: Monospace;'
             'font-size: 8pt;'
             'padding: 6px 8px;'
@@ -614,10 +624,10 @@ class RmsConverterDock(QDockWidget):
         layout.addWidget(v_splitter, stretch=1)
 
         # Offset strip (scrollable, one row per file)
-        offset_hdr = QLabel(' Time Offset Controls')
-        offset_hdr.setStyleSheet(
+        self._offset_hdr_lbl = QLabel(' Time Offset Controls')
+        self._offset_hdr_lbl.setStyleSheet(
             'background: #3A3A3A; color: #AAAAAA; font-size: 8pt; padding: 3px;')
-        layout.addWidget(offset_hdr)
+        layout.addWidget(self._offset_hdr_lbl)
 
         self._offset_scroll = QScrollArea()
         self._offset_scroll.setWidgetResizable(True)
@@ -635,7 +645,8 @@ class RmsConverterDock(QDockWidget):
 
     def _build_bottom_bar(self) -> QWidget:
         """Build the export bar with CSV/Excel buttons and NaN status."""
-        bar = QWidget()
+        self._bottom_bar = QWidget()
+        bar = self._bottom_bar
         bar.setStyleSheet('background: #2D2D2D;')
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -658,6 +669,34 @@ class RmsConverterDock(QDockWidget):
 
         layout.addStretch()
         return bar
+
+    # ── Theme ──────────────────────────────────────────────────────────────────
+
+    def apply_theme(self) -> None:
+        """Re-apply all local stylesheets using the current theme palette.
+
+        Called by MainWindow._open_preferences() after the user saves new
+        theme settings.  The waveform canvas background stays dark always.
+        """
+        p = theme_palette.current()
+        hdr_style = f'background: {p["bg_header"]}; color: {p["text_dim"]}; font-size: 8pt; padding: 3px;'
+        bar_style  = f'background: {p["bg_toolbar"]};'
+        self._top_bar.setStyleSheet(bar_style)
+        self._bottom_bar.setStyleSheet(bar_style)
+        self._compute_btn.setStyleSheet(f'font-weight: bold; color: {p["accent"]};')
+        self._tree_hdr_lbl.setStyleSheet(hdr_style)
+        self._offset_hdr_lbl.setStyleSheet(hdr_style)
+        self._tree.setStyleSheet(f'background: {p["bg_item"]}; color: {p["text"]}; font-size: 8pt;')
+        self._table.setStyleSheet(
+            f'QTableWidget {{ background: {p["bg_panel"]}; color: {p["text"]}; font-size: 8pt; }}'
+            f'QHeaderView::section {{ background: {p["bg_header"]}; color: {p["text"]}; }}'
+            f'QTableWidget::item:alternate {{ background: {p["bg_item"]}; }}'
+        )
+        self._offset_scroll.setStyleSheet(f'background: {p["bg_scroll"]};')
+        for i in range(self._offset_layout.count()):
+            widget = self._offset_layout.itemAt(i).widget()
+            if isinstance(widget, _OffsetRow):
+                widget.apply_theme()
 
     # ── File loading ──────────────────────────────────────────────────────────
 

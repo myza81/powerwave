@@ -6,14 +6,14 @@ Phase: Phase 2
 Milestone: Milestone 2C — Unified Canvas Tab
 Modules:
 src/ui/unified_canvas.py (NEW — multi-file multi-stack analogue canvas tab)
-src/main.py (MODIFIED — standalone Unified Canvas; waveform tab retired; Edit → Preferences)
+src/main.py (MODIFIED — standalone Unified Canvas; waveform tab retired; Edit → Preferences; Help menu)
 src/ui/rms_converter_dock.py (MODIFIED — PU mode, per-file nominal kV convention)
 src/core/app_settings.py (NEW — JSON-backed global settings singleton)
-src/ui/settings_dialog.py (NEW — two-panel modal Preferences dialog)
+src/ui/settings_dialog.py (NEW — two-panel modal Preferences dialog; About page retired)
 src/ui/measurement_panel.py (MODIFIED — simplified single-layout, dynamic font, apply_settings API)
-Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, 3 UI bugs fixed,
-        PMU time-sync implemented, global settings / per-file voltage convention implemented,
-        waveform tab retired, per-channel scatter mode implemented
+src/ui/help_dialog.py (NEW — two-panel User Guide dialog; 12 topics; F1 shortcut)
+Status: IN PROGRESS — core implemented, smoke tests passing, live UI tested, multi-group canvas
+        bugs fixed, Help menu added, User Guide implemented
 
 Unified Canvas features implemented:
 
@@ -41,6 +41,33 @@ Unified Canvas features implemented:
   Bidirectional — TREND channels can revert to line by unchecking the toggle
   Global scatter button removed; scatter is per-channel and per-file
 
+Multi-group canvas implemented (timestamp-based automatic grouping):
+- _GroupInfo dataclass: group_id, file_ids, ref_epoch, section (_CanvasGroupSection widget)
+- _LoadedFile.group_id: int = -1 (sentinel for unassigned)
+- _assign_file_to_group(): places file into existing group within threshold or creates new one
+  Called in _on_file_parsed (critical — was missing, fixed); also in regroup_files()
+- _remove_file_from_group(): cleans up group when file is removed; deletes empty groups
+- _find_matching_group(): compares epoch against existing groups; skips invalid (≤86400) epochs
+- _create_group(): creates _CanvasGroupSection widget + _GroupInfo; adds to _outer_splitter
+- _move_file_to_group(): right-click file → "Move to Group…" context submenu
+- regroup_files(): called from main.py when grouping threshold changes in Preferences
+- _get_group_ref_epoch(): returns min valid start_epoch among files in a group
+- Each group has its own ref_epoch (t=0 origin); t_shift = (file_epoch − ref_epoch) + offset_s
+- _CanvasGroupSection: group header label, toolbar, stack_splitter, detach/reattach button
+  reattach_requested = pyqtSignal(int) — emitted in _on_reattach after safe parent extraction
+- BUG FIX: _on_reattach CPython GC trap — setParent(None) must come BEFORE _detach_dialog = None
+  Setting _detach_dialog = None when it's the last Python ref immediately deletes the C++ QDialog
+  cascading to delete its Qt children including the section widget; then setParent(None) crashes.
+  Fix: extract widget from dialog first, then release dialog reference.
+- BUG FIX: re-attach to main window — added reattach_requested signal + _on_section_reattach slot;
+  slot re-inserts orphaned section into _outer_splitter and calls _rebuild_canvas()
+- BUG FIX: try/except RuntimeError guard in _rebuild_canvas step 2 (splitter.count() loop)
+  as belt-and-suspenders against stale C++ splitter references during reattach
+- _zoom_to_fit(group_id): group-scoped; right-click menu offers "this group" and "all groups";
+  uses _ref_plots[gid] as X-link anchor for setXRange; was previously mixing coordinates
+  across groups (each group has independent seconds-from-ref-epoch X axis)
+- _on_rms_done: fixed to use _get_group_ref_epoch(loaded.group_id) not global _get_ref_epoch()
+
 PMU time-sync implemented (3 mechanisms):
 - parsers/pmu_import_validator.py (NEW) — pure-logic validator, IssueKind/IssueSeverity/ParseInspectionReport
 - ui/pmu_import_dialog.py (NEW) — PmuImportDialog (import-time anchor) + SetStartTimeDialog (post-load fix)
@@ -48,20 +75,41 @@ PMU time-sync implemented (3 mechanisms):
 - unified_canvas.py: dialog wired in _on_file_parsed; right-click file → Set Start Time / Auto-align from Frequency;
   _xcorr_freq_lag() FFT cross-correlation; _LoadedFile.timestamp_ok flag
 
+Time offset behaviour (documented for users):
+- Offset slider is per-FILE, not per-channel — shifts all channels in the file together
+- Offset only aligns files within the SAME canvas group (independent X axes between groups)
+- Files with broken/missing timestamps land in separate groups (epoch ≤ 86400 → own group)
+- Workflow to align a PMU file with broken timestamps against a valid COMTRADE:
+    1. Right-click file → Set Start Time… → enter correct UTC event time
+    2. Right-click file → Move to Group… → select target group
+    3. Use Auto-align from Frequency or offset slider for fine-tuning
+- Slider range: ±(SLIDER_RANGE × step_ms) = ±30 s at default 10 ms step
+  Increase Step spinner for larger ranges (100 ms → ±300 s; 1000 ms → ±3000 s)
+
 Global Settings implemented:
 - core/app_settings.py (NEW) — AppSettings singleton; persists to ~/.powerwave_analyst/settings.json
-  Sections: calculation (nominal_frequency, rms_tolerance_ms, pu_yrange, comtrade_tz_offset_h),
-            display (theme, cursor_c1_colour, cursor_c2_colour, panel_font_size),
-            pmu (default_timezone)
+  Sections: calculation (nominal_frequency, rms_tolerance_ms, pu_yrange, comtrade_tz_offset_h,
+            timestamp_grouping_threshold_h), display (theme, cursor_c1_colour, cursor_c2_colour,
+            panel_font_size), pmu (default_timezone)
 - ui/settings_dialog.py (NEW) — two-panel modal dialog (Edit → Preferences / Ctrl+,)
-  Left nav list; right QStackedWidget with pages: Calculation, Display, PMU, About
+  Left nav list; right QStackedWidget with pages: Calculation, Display, PMU
+  About page RETIRED — moved to Help > About (QMessageBox) and Help > User Guide
   Restore Defaults button; OK / Cancel / Apply
   Display page: "Panel text" group with font-size spinbox (7–14 pt, live after Apply/OK)
-  Calculation page: "Time alignment" group with COMTRADE timezone dropdown
-- main.py: Edit menu added with Preferences action (Ctrl+,); _open_preferences() calls
-  measurement_panel.apply_settings() so font change takes effect immediately
-- PU Y-axis range now reads from AppSettings.get('calculation.pu_yrange') in both
-  unified_canvas.py and rms_converter_dock.py (was hardcoded 2.0 / 1.5)
+  Calculation page: "Time alignment" + "File grouping" groups
+- main.py: Edit menu with Preferences (Ctrl+,); threshold change triggers regroup_files()
+
+Help menu implemented:
+- ui/help_dialog.py (NEW) — HelpDialog; left QListWidget nav + right QTextBrowser
+  12 topics: Getting Started, Window Layout, Canvas Groups, Loading Files,
+  Channels & Display Modes, Time Alignment & Offset, Cursors & Measurements,
+  Phasor Display, Voltage PU Mode, RMS Converter, Preferences, Keyboard Shortcuts
+  HTML content with inline CSS (dark-themed); scrolls to top on topic change
+- main.py: Help menu added (between Tools and right edge)
+  Help > User Guide — F1 shortcut → HelpDialog
+  Help > About — QMessageBox with app summary
+- About page retired from Preferences settings_dialog.py (_AboutPage class removed,
+  nav entry removed, all three references in _setup_ui and _on_restore_defaults cleaned up)
 
 Measurement panel improvements:
 - Simplified to single flat layout (QStackedWidget with waveform page removed)
@@ -112,6 +160,8 @@ Pending / deferred:
 - PMU import profile save/recall (remember checkbox wired to UI but not yet persisted)
 - Cursor colours from AppSettings not yet applied at runtime (saved but not read back
   into pyqtgraph pen colours — deferred)
+- Offset direct text-entry spinbox (currently slider only; user must increase step for
+  large offsets — documented in User Guide)
 
 ## ── PROJECT IDENTITY ───────────────────────────────────────────────────────
 

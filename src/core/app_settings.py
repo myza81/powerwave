@@ -20,10 +20,11 @@ from typing import Any
 
 _DEFAULTS: dict[str, dict[str, Any]] = {
     'calculation': {
-        'nominal_frequency':    50,   # Hz — 50 or 60
-        'rms_tolerance_ms':     10.0, # ms — RMS merger tolerance
-        'pu_yrange':            2.0,  # pu — symmetric ±range for PU Y-axis
-        'comtrade_tz_offset_h': 0,    # UTC offset of COMTRADE timestamps (0=UTC, 8=MYT/SGT)
+        'nominal_frequency':             50,   # Hz — 50 or 60
+        'rms_tolerance_ms':              10.0, # ms — RMS merger tolerance
+        'pu_yrange':                     2.0,  # pu — symmetric ±range for PU Y-axis
+        'comtrade_tz_offset_h':          0,    # UTC offset of COMTRADE timestamps (0=UTC, 8=MYT/SGT)
+        'timestamp_grouping_threshold_h': 1.0, # h — files within this window share a canvas group
     },
     'display': {
         'theme':            'dark',

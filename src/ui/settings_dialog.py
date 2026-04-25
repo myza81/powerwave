@@ -9,7 +9,7 @@ Layout:
   │ │ Calculation  │  ┌─ Calculation ──────────────────────────┐    │  │
   │ │ Display      │  │  Default nominal frequency  [50 Hz ▼]   │   │  │
   │ │ PMU          │  │  RMS merge tolerance        [10.0] ms   │   │  │
-  │ │ About        │  │  PU mode Y-axis range       [2.0]  pu   │   │  │
+  │ │              │  │  PU mode Y-axis range       [2.0]  pu   │   │  │
   │ │              │  └────────────────────────────────────────┘    │  │
   │ └──────────────┴────────────────────────────────────────────────┘  │
   │          [Restore Defaults]        [Cancel]  [Apply]  [OK]        │
@@ -48,6 +48,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.app_settings import AppSettings
+from ui import theme_palette
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -59,7 +60,6 @@ _CATEGORY_ITEMS: list[tuple[str, str]] = [
     ('Calculation',  '⚙'),
     ('Display',      '🎨'),
     ('PMU',          '📡'),
-    ('About',        'ℹ'),
 ]
 
 _FREQ_OPTIONS:  list[int]  = [50, 60]
@@ -129,46 +129,50 @@ class _ColourButton(QWidget):
 
 # ── Settings pages ─────────────────────────────────────────────────────────────
 
-def _make_section_label(text: str) -> QLabel:
-    """Return a bold section heading label."""
+def _make_section_label(text: str, p: dict) -> QLabel:
+    """Return a bold section heading label styled for *p* (palette)."""
     lbl = QLabel(text)
-    lbl.setStyleSheet('font-weight: bold; font-size: 11pt; color: #AADDFF;')
+    lbl.setStyleSheet(
+        f'font-weight: bold; font-size: 11pt; color: {p["text_accent"]};'
+    )
     return lbl
 
 
-def _make_separator() -> QFrame:
-    """Return a horizontal separator line."""
+def _make_separator(p: dict) -> QFrame:
+    """Return a horizontal separator line styled for *p* (palette)."""
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet('color: #444;')
+    line.setStyleSheet(f'color: {p["sep_line"]};')
     return line
 
 
 class _CalculationPage(QWidget):
     """Settings page: Calculation section."""
 
-    def __init__(self, data: dict[str, Any], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        data:   dict[str, Any],
+        theme:  str = 'dark',
+        parent: QWidget | None = None,
+    ) -> None:
         """Populate fields from ``data``.
 
         Args:
             data:   The ``calculation`` section dict from AppSettings.snapshot().
+            theme:  Active theme name (``'dark'`` or ``'light'``).
             parent: Optional parent widget.
         """
         super().__init__(parent)
+        p = theme_palette.get(theme)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.setSpacing(16)
         layout.setContentsMargins(24, 20, 24, 20)
 
-        layout.addWidget(_make_section_label('Calculation'))
-        layout.addWidget(_make_separator())
+        layout.addWidget(_make_section_label('Calculation', p))
+        layout.addWidget(_make_separator(p))
 
         group = QGroupBox('Default values for new files')
-        group.setStyleSheet(
-            'QGroupBox { font-weight: bold; color: #CCCCCC; '
-            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
-        )
         form = QFormLayout(group)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setVerticalSpacing(10)
@@ -212,11 +216,6 @@ class _CalculationPage(QWidget):
 
         # ── Time alignment group ──────────────────────────────────────────────
         ta_group = QGroupBox('Time alignment')
-        ta_group.setStyleSheet(
-            'QGroupBox { font-weight: bold; color: #CCCCCC; '
-            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
-        )
         ta_form = QFormLayout(ta_group)
         ta_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         ta_form.setVerticalSpacing(10)
@@ -255,48 +254,73 @@ class _CalculationPage(QWidget):
             'substation so timestamps align correctly with PMU CSV files (UTC).'
         )
         tz_note.setWordWrap(True)
-        tz_note.setStyleSheet('color: #888; font-size: 8pt;')
+        tz_note.setStyleSheet(f'color: {p["text_dim"]}; font-size: 8pt;')
         ta_form.addRow('', tz_note)
 
         layout.addWidget(ta_group)
+
+        # ── File grouping group ───────────────────────────────────────────────
+        grp_group = QGroupBox('File grouping')
+        grp_form = QFormLayout(grp_group)
+        grp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        grp_form.setVerticalSpacing(10)
+        grp_form.setHorizontalSpacing(16)
+
+        self._grouping_spin = QDoubleSpinBox()
+        self._grouping_spin.setRange(0.1, 48.0)
+        self._grouping_spin.setDecimals(1)
+        self._grouping_spin.setSingleStep(0.5)
+        self._grouping_spin.setSuffix('  h')
+        self._grouping_spin.setValue(data.get('timestamp_grouping_threshold_h', 1.0))
+        self._grouping_spin.setToolTip(
+            'Files whose start timestamps differ by less than this value (hours)\n'
+            'are plotted together on a shared time axis.\n'
+            'Files outside this window get their own independent canvas section.'
+        )
+        grp_form.addRow('Timestamp grouping threshold:', self._grouping_spin)
+
+        layout.addWidget(grp_group)
         layout.addStretch()
 
     def collect(self) -> dict[str, Any]:
         """Return the current widget values as a settings dict."""
         return {
-            'nominal_frequency':    self._freq_combo.currentData(),
-            'rms_tolerance_ms':     self._tol_spin.value(),
-            'pu_yrange':            self._pu_spin.value(),
-            'comtrade_tz_offset_h': self._tz_combo.currentData(),
+            'nominal_frequency':              self._freq_combo.currentData(),
+            'rms_tolerance_ms':               self._tol_spin.value(),
+            'pu_yrange':                      self._pu_spin.value(),
+            'comtrade_tz_offset_h':           self._tz_combo.currentData(),
+            'timestamp_grouping_threshold_h': self._grouping_spin.value(),
         }
 
 
 class _DisplayPage(QWidget):
     """Settings page: Display section."""
 
-    def __init__(self, data: dict[str, Any], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        data:   dict[str, Any],
+        theme:  str = 'dark',
+        parent: QWidget | None = None,
+    ) -> None:
         """Populate fields from ``data``.
 
         Args:
             data:   The ``display`` section dict from AppSettings.snapshot().
+            theme:  Active theme name (``'dark'`` or ``'light'``).
             parent: Optional parent widget.
         """
         super().__init__(parent)
+        p = theme_palette.get(theme)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.setSpacing(16)
         layout.setContentsMargins(24, 20, 24, 20)
 
-        layout.addWidget(_make_section_label('Display'))
-        layout.addWidget(_make_separator())
+        layout.addWidget(_make_section_label('Display', p))
+        layout.addWidget(_make_separator(p))
 
         # Cursor colours
         cursor_group = QGroupBox('Cursor colours')
-        cursor_group.setStyleSheet(
-            'QGroupBox { font-weight: bold; color: #CCCCCC; '
-            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
-        )
         cursor_form = QFormLayout(cursor_group)
         cursor_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         cursor_form.setVerticalSpacing(10)
@@ -314,11 +338,6 @@ class _DisplayPage(QWidget):
 
         # Panel font size
         font_group = QGroupBox('Panel text')
-        font_group.setStyleSheet(
-            'QGroupBox { font-weight: bold; color: #CCCCCC; '
-            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
-        )
         font_form = QFormLayout(font_group)
         font_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         font_form.setVerticalSpacing(10)
@@ -336,25 +355,21 @@ class _DisplayPage(QWidget):
 
         layout.addWidget(font_group)
 
-        # Theme (future)
+        # Theme
         theme_group = QGroupBox('Theme')
-        theme_group.setStyleSheet(
-            'QGroupBox { font-weight: bold; color: #CCCCCC; '
-            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
-        )
         theme_form = QFormLayout(theme_group)
         theme_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         theme_form.setVerticalSpacing(10)
 
         self._theme_combo = QComboBox()
-        self._theme_combo.addItem('Dark (default)', userData='dark')
-        self._theme_combo.addItem('Light  [coming soon]', userData='light')
-        self._theme_combo.model().item(1).setEnabled(False)
+        self._theme_combo.addItem('Dark',  userData='dark')
+        self._theme_combo.addItem('Light', userData='light')
+        idx = self._theme_combo.findData(data.get('theme', 'dark'))
+        self._theme_combo.setCurrentIndex(max(0, idx))
         theme_form.addRow('Application theme:', self._theme_combo)
 
-        note = QLabel('Theme change takes effect on next application launch.')
-        note.setStyleSheet('color: #888; font-size: 8pt;')
+        note = QLabel('Theme change takes effect immediately after Apply / OK.')
+        note.setStyleSheet(f'color: {p["text_dim"]}; font-size: 8pt;')
         theme_form.addRow('', note)
 
         layout.addWidget(theme_group)
@@ -373,28 +388,30 @@ class _DisplayPage(QWidget):
 class _PmuPage(QWidget):
     """Settings page: PMU section."""
 
-    def __init__(self, data: dict[str, Any], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        data:   dict[str, Any],
+        theme:  str = 'dark',
+        parent: QWidget | None = None,
+    ) -> None:
         """Populate fields from ``data``.
 
         Args:
             data:   The ``pmu`` section dict from AppSettings.snapshot().
+            theme:  Active theme name (``'dark'`` or ``'light'``).
             parent: Optional parent widget.
         """
         super().__init__(parent)
+        p = theme_palette.get(theme)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.setSpacing(16)
         layout.setContentsMargins(24, 20, 24, 20)
 
-        layout.addWidget(_make_section_label('PMU'))
-        layout.addWidget(_make_separator())
+        layout.addWidget(_make_section_label('PMU', p))
+        layout.addWidget(_make_separator(p))
 
         group = QGroupBox('PMU CSV Import')
-        group.setStyleSheet(
-            'QGroupBox { font-weight: bold; color: #CCCCCC; '
-            'border: 1px solid #555; border-radius: 4px; margin-top: 8px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 8px; }'
-        )
         form = QFormLayout(group)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setVerticalSpacing(10)
@@ -418,7 +435,7 @@ class _PmuPage(QWidget):
             'This setting only affects the pre-populated value in the import dialog.'
         )
         tz_note.setWordWrap(True)
-        tz_note.setStyleSheet('color: #888; font-size: 8pt;')
+        tz_note.setStyleSheet(f'color: {p["text_dim"]}; font-size: 8pt;')
         form.addRow('', tz_note)
 
         layout.addWidget(group)
@@ -430,44 +447,6 @@ class _PmuPage(QWidget):
             'default_timezone': self._tz_combo.currentText(),
         }
 
-
-class _AboutPage(QWidget):
-    """Settings page: About section."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        layout.setSpacing(12)
-        layout.setContentsMargins(24, 20, 24, 20)
-
-        layout.addWidget(_make_section_label('About'))
-        layout.addWidget(_make_separator())
-
-        title = QLabel('<b>PowerWave Analyst</b>')
-        title.setStyleSheet('font-size: 16pt; color: #EEEEFF;')
-        layout.addWidget(title)
-
-        subtitle = QLabel('Power System Disturbance Record Analysis')
-        subtitle.setStyleSheet('font-size: 10pt; color: #AAAAAA;')
-        layout.addWidget(subtitle)
-
-        layout.addSpacing(8)
-
-        info_lines = [
-            ('Version',     '2C (Unified Canvas)'),
-            ('Platform',    'Windows / macOS'),
-            ('Python',      '3.11'),
-            ('UI toolkit',  'PyQt6'),
-            ('Rendering',   'PyQtGraph + OpenGL'),
-            ('Data',        '100 % offline — no network calls ever'),
-        ]
-        for label, value in info_lines:
-            row = QLabel(f'<b>{label}:</b>  {value}')
-            row.setStyleSheet('color: #CCCCCC; font-size: 9pt;')
-            layout.addWidget(row)
-
-        layout.addStretch()
 
 
 # ── Main dialog ────────────────────────────────────────────────────────────────
@@ -493,7 +472,8 @@ class SettingsDialog(QDialog):
         self._snapshot = AppSettings.snapshot()
 
         self._setup_ui()
-        self._apply_dark_style()
+        current_theme = self._snapshot.get('display', {}).get('theme', 'dark')
+        self._apply_style(current_theme)
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -502,6 +482,9 @@ class SettingsDialog(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 12)
         root.setSpacing(0)
+
+        current_theme = self._snapshot.get('display', {}).get('theme', 'dark')
+        p = theme_palette.get(current_theme)
 
         # ── Main splitter (nav | content) ─────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -513,23 +496,10 @@ class SettingsDialog(QDialog):
         self._nav.setFixedWidth(NAV_WIDTH)
         self._nav.setFrameShape(QFrame.Shape.NoFrame)
         self._nav.setStyleSheet(
-            'QListWidget {'
-            '  background: #252535;'
-            '  border-right: 1px solid #3A3A4A;'
-            '  font-size: 10pt;'
-            '}'
-            'QListWidget::item {'
-            '  padding: 10px 14px;'
-            '  color: #BBBBBB;'
-            '}'
-            'QListWidget::item:selected {'
-            '  background: #3A3A5A;'
-            '  color: #FFFFFF;'
-            '  border-left: 3px solid #6688FF;'
-            '}'
-            'QListWidget::item:hover:!selected {'
-            '  background: #2E2E3E;'
-            '}'
+            f'QListWidget {{ background: {p["bg_sidebar"]}; border-right: 1px solid {p["border_dim"]}; font-size: 10pt; }}'
+            f'QListWidget::item {{ padding: 10px 14px; color: {p["text"]}; }}'
+            f'QListWidget::item:selected {{ background: {p["bg_selected"]}; color: #FFFFFF; border-left: 3px solid {p["accent"]}; }}'
+            f'QListWidget::item:hover:!selected {{ background: {p["bg_hover"]}; }}'
         )
         for label, icon in _CATEGORY_ITEMS:
             item = QListWidgetItem(f'  {icon}  {label}')
@@ -544,19 +514,17 @@ class SettingsDialog(QDialog):
         display_data = self._snapshot.get('display', {})
         pmu_data     = self._snapshot.get('pmu', {})
 
-        self._page_calc    = _CalculationPage(calc_data)
-        self._page_display = _DisplayPage(display_data)
-        self._page_pmu     = _PmuPage(pmu_data)
-        self._page_about   = _AboutPage()
+        self._page_calc    = _CalculationPage(calc_data, theme=current_theme)
+        self._page_display = _DisplayPage(display_data, theme=current_theme)
+        self._page_pmu     = _PmuPage(pmu_data, theme=current_theme)
 
         # Wrap each page in a scroll area so it handles small windows gracefully
-        for page in (self._page_calc, self._page_display,
-                     self._page_pmu, self._page_about):
+        for page in (self._page_calc, self._page_display, self._page_pmu):
             scroll = QScrollArea()
             scroll.setWidget(page)
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setStyleSheet('background: #1E1E2E;')
+            scroll.setStyleSheet(f'background: {p["bg_dialog"]};')
             self._stack.addWidget(scroll)
 
         splitter.addWidget(self._nav)
@@ -593,28 +561,44 @@ class SettingsDialog(QDialog):
         # Select first category
         self._nav.setCurrentRow(0)
 
-    def _apply_dark_style(self) -> None:
-        """Apply a consistent dark stylesheet to the dialog."""
+    def _apply_style(self, theme: str) -> None:
+        """Apply a theme-consistent stylesheet to the dialog."""
+        p = theme_palette.get(theme)
         self.setStyleSheet(
-            'QDialog { background: #1E1E2E; }'
-            'QLabel  { color: #CCCCCC; }'
-            'QGroupBox { color: #CCCCCC; }'
-            'QComboBox, QDoubleSpinBox, QSpinBox {'
-            '  background: #2A2A3A; color: #EEEEEE;'
-            '  border: 1px solid #555; border-radius: 3px; padding: 2px 4px;'
-            '}'
-            'QComboBox::drop-down { border: none; }'
-            'QComboBox QAbstractItemView { background: #2A2A3A; color: #EEEEEE; '
-            '  selection-background-color: #3A3A6A; }'
-            'QPushButton {'
-            '  background: #2E2E4E; color: #DDDDDD;'
-            '  border: 1px solid #555; border-radius: 4px; padding: 5px 12px;'
-            '}'
-            'QPushButton:hover   { background: #3A3A5E; }'
-            'QPushButton:pressed { background: #4A4A7E; }'
-            'QScrollArea, QScrollBar { background: #1E1E2E; }'
-            'QSplitter::handle { background: #3A3A4A; }'
-            'QDialogButtonBox QPushButton { min-width: 72px; }'
+            f'QDialog {{ background: {p["bg_dialog"]}; }}'
+            f'QLabel   {{ color: {p["text"]}; }}'
+            f'QGroupBox {{ color: {p["text"]}; border: 1px solid {p["border"]}; border-radius: 4px; margin-top: 8px; padding-top: 4px; }}'
+            f'QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; color: {p["text_dim"]}; }}'
+            f'QComboBox, QDoubleSpinBox, QSpinBox {{'
+            f'  background: {p["bg_input"]}; color: {p["text_input"]};'
+            f'  border: 1px solid {p["border"]}; border-radius: 3px; padding: 2px 4px;'
+            f'}}'
+            f'QComboBox::drop-down {{ border: none; background: {p["bg_header"]}; width: 20px; }}'
+            f'QComboBox QAbstractItemView {{ background: {p["bg_sidebar"]}; color: {p["text"]}; '
+            f'  selection-background-color: {p["bg_selected"]}; border: 1px solid {p["border"]}; }}'
+            f'QSpinBox::up-button, QDoubleSpinBox::up-button,'
+            f'QSpinBox::down-button, QDoubleSpinBox::down-button {{'
+            f'  background: {p["bg_header"]}; border: 1px solid {p["border"]}; width: 16px; }}'
+            f'QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,'
+            f'QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{'
+            f'  background: {p["bg_hover"]}; }}'
+            f'QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{'
+            f'  width: 0; height: 0;'
+            f'  border-left: 4px solid transparent; border-right: 4px solid transparent;'
+            f'  border-bottom: 5px solid {p["text_bright"]}; }}'
+            f'QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{'
+            f'  width: 0; height: 0;'
+            f'  border-left: 4px solid transparent; border-right: 4px solid transparent;'
+            f'  border-top: 5px solid {p["text_bright"]}; }}'
+            f'QPushButton {{'
+            f'  background: {p["bg_sidebar"]}; color: {p["text_bright"]};'
+            f'  border: 1px solid {p["border"]}; border-radius: 4px; padding: 5px 12px;'
+            f'}}'
+            f'QPushButton:hover   {{ background: {p["bg_hover"]}; }}'
+            f'QPushButton:pressed {{ background: {p["bg_selected"]}; color: #FFFFFF; }}'
+            f'QScrollArea, QScrollBar {{ background: {p["bg_dialog"]}; }}'
+            f'QSplitter::handle {{ background: {p["border_dim"]}; }}'
+            f'QDialogButtonBox QPushButton {{ min-width: 72px; }}'
         )
 
     # ── Slots ──────────────────────────────────────────────────────────────────
@@ -650,25 +634,26 @@ class SettingsDialog(QDialog):
         from core.app_settings import _DEFAULTS  # noqa: PLC0415
         defaults = {s: dict(v) for s, v in _DEFAULTS.items()}
 
+        current_theme = self._snapshot.get('display', {}).get('theme', 'dark')
+        p = theme_palette.get(current_theme)
+
         # Rebuild pages in-place
         idx = self._stack.currentIndex()
 
-        self._page_calc    = _CalculationPage(defaults.get('calculation', {}))
-        self._page_display = _DisplayPage(defaults.get('display', {}))
-        self._page_pmu     = _PmuPage(defaults.get('pmu', {}))
-        self._page_about   = _AboutPage()
+        self._page_calc    = _CalculationPage(defaults.get('calculation', {}), theme=current_theme)
+        self._page_display = _DisplayPage(defaults.get('display', {}), theme=current_theme)
+        self._page_pmu     = _PmuPage(defaults.get('pmu', {}), theme=current_theme)
 
         # Replace scroll-area widgets
         for stack_idx, page in enumerate((
-            self._page_calc, self._page_display,
-            self._page_pmu, self._page_about,
+            self._page_calc, self._page_display, self._page_pmu,
         )):
             old_scroll = self._stack.widget(stack_idx)
             scroll = QScrollArea()
             scroll.setWidget(page)
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setStyleSheet('background: #1E1E2E;')
+            scroll.setStyleSheet(f'background: {p["bg_dialog"]};')
             self._stack.removeWidget(old_scroll)
             old_scroll.deleteLater()
             self._stack.insertWidget(stack_idx, scroll)
