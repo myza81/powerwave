@@ -1,9 +1,0 @@
-rules:
-  - match_pattern: sysf
-    match_type: exact
-    signal_type: frequency
-    unit: Hz
-    display_group: frequency
-    confidence: 1.0
-    confirmed_by_operator: true
-    notes: SCADA alias

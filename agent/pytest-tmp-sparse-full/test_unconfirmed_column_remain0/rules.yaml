@@ -1,9 +1,0 @@
-rules:
-- match_pattern: tie-line
-  match_type: exact
-  signal_type: active_power
-  display_group: power
-  confidence: 0.7
-  confirmed_by_operator: false
-  unit: MW
-  notes: Extracted from manifest source 'csv'

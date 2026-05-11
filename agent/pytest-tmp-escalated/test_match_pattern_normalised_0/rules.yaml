@@ -1,3 +1,0 @@
-rules:
-  - match_pattern: '  SYSF  '
-    signal_type: frequency

@@ -97,3 +97,67 @@ def test_sparse_low_rate_record_uses_markers_and_neighbor_context(
     finally:
         canvas.close()
         qapp.processEvents()
+
+
+def test_sparse_low_rate_record_initial_view_shows_full_time_extent(
+    qapp: QApplication,
+) -> None:
+    from app.data.synthetic import make_high_rate_record
+    from app.models import SamplingInformation
+    from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
+
+    base = make_high_rate_record().record
+    channel = dataclasses.replace(base.analog_channels[0], name="MW", unit="MW")
+    record = dataclasses.replace(
+        base,
+        waveform_data=pd.DataFrame({
+            "time": [0.0, 60.0, 120.0],
+            "MW": [100.0, 101.0, 102.0],
+        }),
+        analog_channels=[channel],
+        sampling_info=SamplingInformation(
+            sampling_rates=[1.0 / 60.0],
+            samples_per_rate=[3],
+        ),
+    )
+
+    canvas = FlexiblePlotCanvas()
+    try:
+        canvas.set_record(record)
+        qapp.processEvents()
+
+        x_range = canvas._primary_plot.getViewBox().viewRange()[0]
+        curve = canvas._axis_manager.get_curves()["MW"]
+        x, y = curve.getData()
+
+        assert x_range[0] == pytest.approx(0.0)
+        assert x_range[1] == pytest.approx(120.0)
+        assert list(x) == [0.0, 60.0, 120.0]
+        assert list(y) == [100.0, 101.0, 102.0]
+    finally:
+        canvas.close()
+        qapp.processEvents()
+
+
+def test_high_rate_record_initial_view_remains_trigger_zoomed(
+    qapp: QApplication,
+) -> None:
+    from app.data.synthetic import make_high_rate_record
+    from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
+
+    record = make_high_rate_record().record
+    trigger_s = (
+        record.timing_info.trigger_time - record.timing_info.start_time
+    ).total_seconds()
+
+    canvas = FlexiblePlotCanvas()
+    try:
+        canvas.set_record(record)
+        qapp.processEvents()
+
+        x_start, x_end = canvas._primary_plot.getViewBox().viewRange()[0]
+        assert x_start == pytest.approx(max(0.0, trigger_s - 0.2))
+        assert x_end == pytest.approx(min(float(canvas._time_cache[-1]), trigger_s + 0.2))
+    finally:
+        canvas.close()
+        qapp.processEvents()

@@ -26,6 +26,8 @@ build/
 
 # Test & coverage
 .pytest_cache/
+agent/pytest-tmp*/
+pytest-tmp*/
 .coverage
 htmlcov/
 

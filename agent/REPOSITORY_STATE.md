@@ -408,10 +408,24 @@ Phase D4.1 Data Intelligence Layer: IMPLEMENTED 2026-05-10 — 920 tests passing
 Phase D4.1.1 COMTRADE DOS EOF + ASCII digital fix + PULU integration test: IMPLEMENTED 2026-05-10 — 34 integration tests (Session 023)
 Phase D4.1.2 Parser Test Cleanup & Baseline Stabilization: IMPLEMENTED 2026-05-10 — 1563 total passing (Session 024)
 Phase D4.2 Data Mapping Review Dialog: IMPLEMENTED 2026-05-10 — 1657 total passing (Session 025)
+Phase D4.2.1 CSV Runtime Display Fix + Repository Hygiene Verification: COMPLETE 2026-05-11
+  CSV Runtime Display Fix:
+  - CsvProvider loading was valid.
+  - Runtime invisibility caused by sparse low-rate CSV opening in COMTRADE-style trigger viewport [0.0, 0.2].
+  - FlexiblePlotCanvas updated so sparse/low-rate records open to full finite time extent.
+  - High-rate COMTRADE records still use trigger-centered zoom.
+  - Regression tests added in test_runtime_qt_widgets.py.
+  Verification:
+  - 89 focused tests passed.
+  - COMTRADE display unaffected.
+  - Manifest multi-source path passed.
+  - agent/pytest-tmp* folders removed.
+  - .gitignore now protects pytest temp artifacts.
+  - Remaining Windows temp permission issue assessed as environment/ACL issue, not repository defect.
 
 NEXT REQUIRED ACTION
 
-Phase D4.2 COMPLETE — operator-facing data review workflow implemented.
+Phase D4.2.1 COMPLETE — CSV runtime display fix and repository hygiene verification complete.
 
 Current state:
   1014 unit tests passing — all green (app/)

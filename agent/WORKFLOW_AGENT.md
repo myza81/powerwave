@@ -257,7 +257,7 @@ Produce completion report
 Explain modified files
 Explain architectural impact
 Explain remaining gaps
-Update repository tracking documents
+Pass the Mandatory Verification Gate before updating repository tracking documents
 STAGE 4 — REVIEW
 
 Handled by:
@@ -297,7 +297,7 @@ current blockers
 validated engineering status
 UPDATE REQUIREMENT
 
-After any meaningful implementation, agents SHALL update:
+After any meaningful implementation passes the Mandatory Verification Gate, agents SHALL update:
 
 HANDOFF.md
 TASKS.md
@@ -330,7 +330,10 @@ ARCHITECTURE REVIEW FLOW
 
 Implementation workflow becomes:
 
-Claude/Codex Implementation
+Claude/Claude Code Implementation
+Codex may implement explicitly scoped fixes only
+        ↓
+Mandatory Verification Gate
         ↓
 Update:
 - HANDOFF.md
@@ -342,6 +345,20 @@ Human reviews/pastes state
 ChatGPT architecture review
         ↓
 Next directive generation
+MANDATORY VERIFICATION GATE
+
+No implementation is considered complete until:
+
+1. Codex reviews structure
+2. Codex runs regression checks
+3. Codex validates repository hygiene
+4. Codex validates no unintended files/folders introduced
+5. Codex validates architectural boundary compliance
+
+Only after PASS:
+
+- HANDOFF.md updated
+- REPOSITORY_STATE.md updated
 ENGINEERING RULES
 RULE 1 — NO ARCHITECTURAL DRIFT
 
@@ -355,6 +372,12 @@ add unnecessary abstractions
 Without approval from:
 
 ChatGPT architecture direction
+RULE 1A — AGENT DIRECTORY IMMUTABILITY
+
+agent/ directory is immutable except:
+
+- *.md
+- explicitly approved agent assets
 RULE 2 — PERFORMANCE IS MANDATORY
 
 Avoid:

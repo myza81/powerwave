@@ -1,3 +1,0 @@
-rules:
-  - source_pattern: src
-    date_format: 'D/M/YYYY'

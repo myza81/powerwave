@@ -1,8 +1,0 @@
-rules:
-  - match_pattern: load_mw
-    match_type: keyword
-    signal_type: active_power
-    unit: MW
-    display_group: power
-    confidence: 1.0
-    confirmed_by_operator: true

@@ -1,5 +1,0 @@
-rules:
-  - source_pattern: pulu_scada_export
-    date_format: 'M/D/YYYY'
-    ambiguous_resolution: 'M/D/YYYY'
-    confirmed_by_operator: true

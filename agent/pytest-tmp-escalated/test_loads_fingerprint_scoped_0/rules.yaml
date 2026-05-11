@@ -1,6 +1,0 @@
-rules:
-  - match_pattern: freq
-    signal_type: frequency
-    source_fingerprint:
-      export_type: csv
-      station: PULU

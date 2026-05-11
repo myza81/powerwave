@@ -1,6 +1,0 @@
-event_id: bad_type
-sources:
-  - source_id: src1
-    type: unknown_format
-    paths:
-      cfg: samples/comtrade/test.cfg

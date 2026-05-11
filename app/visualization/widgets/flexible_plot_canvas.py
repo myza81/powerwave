@@ -244,6 +244,16 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         """Centre the viewport on the trigger event ± window_s seconds."""
         if self._record is None or len(self._time_cache) == 0:
             return
+        if self._sparse_mode:
+            finite = self._time_cache[np.isfinite(self._time_cache)]
+            if len(finite) == 0:
+                return
+            self._primary_plot.setXRange(
+                float(np.min(finite)),
+                float(np.max(finite)),
+                padding=0,
+            )
+            return
         t_trig = (
             self._record.timing_info.trigger_time
             - self._record.timing_info.start_time
