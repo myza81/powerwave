@@ -157,7 +157,12 @@ class MeasurementPanel(QWidget):
                    one entry per selected analogue channel across all files.
         """
         def _fmt_t(t: float) -> str:
-            return f'{t:.3f} s' if not np.isnan(t) else '---'
+            if np.isnan(t):
+                return '---'
+            if t > 86400:
+                import datetime as _dt  # noqa: PLC0415
+                return _dt.datetime.fromtimestamp(t, _dt.UTC).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            return f'{t:.3f} s'
 
         self._val_c1.setText(_fmt_t(t_c1))
         self._val_c2.setText(_fmt_t(t_c2))

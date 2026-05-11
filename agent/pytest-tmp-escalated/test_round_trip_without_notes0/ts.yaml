@@ -1,0 +1,5 @@
+rules:
+- source_pattern: src
+  date_format: D/M/YYYY
+  ambiguous_resolution: D/M/YYYY
+  confirmed_by_operator: false

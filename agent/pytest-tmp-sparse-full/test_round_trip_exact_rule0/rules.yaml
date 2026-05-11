@@ -1,0 +1,8 @@
+rules:
+- match_pattern: sysf
+  match_type: exact
+  signal_type: frequency
+  display_group: frequency
+  confidence: 1.0
+  confirmed_by_operator: true
+  unit: Hz

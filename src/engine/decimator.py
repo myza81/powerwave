@@ -150,8 +150,9 @@ def decimate_digital(
     step    = max(1, n // max_points)
     uniform = np.arange(0, n, step)
 
-    # Union — always include first and last sample
-    keep = np.union1d(np.union1d(uniform, changes), np.array([0, n - 1]))
+    # Single unique() instead of nested union1d() — avoids two sort+dedup passes
+    all_idx = np.concatenate((uniform, changes, np.array([0, n - 1], dtype=np.intp)))
+    keep = np.unique(all_idx)
     keep = keep[keep < n]
 
     return time_array[keep], data_array[keep].astype(np.float64)

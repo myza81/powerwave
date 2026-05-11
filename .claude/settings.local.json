@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import ast; ast.parse\\(open\\('src/ui/unified_canvas.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/ui/unified_canvas.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -m pytest tests/unit/test_column_classifier.py::TestKeywordClassification::test_reactive_power_phrase tests/unit/test_manifest_loader.py::TestBuildSessionFromManifest -v --tb=long)"
     ]
   }
 }

@@ -1,0 +1,3 @@
+rules:
+  - source_pattern: src
+    date_format: 'M/D/YYYY'

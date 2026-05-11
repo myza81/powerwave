@@ -13,6 +13,7 @@ PyQt6-Qt6==6.11.0
 PyQt6_sip==13.11.1
 pyqtgraph==0.14.0
 pytest==9.0.2
+PyYAML==6.0.3
 python-dateutil==2.9.0.post0
 scipy==1.17.1
 six==1.17.0

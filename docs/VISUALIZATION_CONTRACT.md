@@ -46,40 +46,100 @@ DisturbanceRecord
         ↓
 Visualization Manager
         ↓
-FastWaveformWidget
-        ↓
-PyQtGraph Rendering Engine
+┌─────────────────────────┐  ┌──────────────────────────┐
+│  FlexiblePlotCanvas     │  │  DigitalEventTimeline     │
+│  (N-Axis analog canvas) │  │  (digital state tracks)   │
+└─────────────────────────┘  └──────────────────────────┘
+        ↓                              ↓
+PyQtGraph Rendering Engine  (shared X-axis time domain)
         ↓
 OpenGL Rendering Pipeline
-PRIMARY VISUALIZATION COMPONENT
 
-Core rendering widget:
+PRIMARY VISUALIZATION COMPONENTS
 
-FastWaveformWidget
+Analog rendering widget:
+
+FlexiblePlotCanvas
 
 Inheritance:
 
-pyqtgraph.PlotWidget
-    └── FastWaveformWidget
+pyqtgraph.GraphicsLayoutWidget
+    └── FlexiblePlotCanvas
 
-This widget becomes the foundation for:
+Analog axis manager:
 
-waveform display
-interaction
-synchronization
-cursor coordination
-FASTWAVEFORMWIDGET RESPONSIBILITIES
+MultiAxisManager (helper class, not a widget)
 
-The widget SHALL:
+Digital rendering widget (Phase 3B):
 
-render waveform channels
-support synchronized interaction
-support scalable zoom/pan
-support low-latency updates
-support viewport optimization
+DigitalEventTimeline (separate widget, below FlexiblePlotCanvas)
 
-The widget SHALL NOT:
+N-AXIS SINGLE CANVAS ARCHITECTURE
 
+Powerwave uses SIGRA-style N-Axis Single Canvas visualization for analog signals.
+
+Architecture mandates:
+
+One shared X-axis (time domain) across all parameters
+One independent ViewBox per analog parameter
+One color-coded AxisItem per parameter
+N ViewBoxes = N independent Y-axis scales
+Unlimited analog parameters on a single canvas
+
+This provides:
+
+True independent Y-axis scaling per parameter
+No fixed stacking layout (all parameters co-exist on one canvas)
+Engineering-grade multi-parameter comparison at a glance
+Shared time navigation (all parameters zoom/pan together)
+
+Axis behavior:
+
+Axes may appear on left or right canvas margins
+Axes are color-coded to match their waveform
+Axes are dynamically added and removed with parameters
+Margins grow automatically as axes are added
+
+Implementation:
+
+Primary PlotItem hosts the X-axis and first parameter
+Additional parameters use pg.ViewBox() linked via setXLink(primary_plot)
+Geometry synchronized on sigResized (see VIEWPORT_RENDERING_POLICY §16)
+Procedural axis generation — axes are not pre-allocated
+
+DIGITAL EVENT TIMELINE
+
+Digital channels (breaker status, relay trips, pickups, alarms) are rendered
+in a SEPARATE component: DigitalEventTimeline.
+
+Architecture mandates:
+
+Digital signals are NOT rendered in FlexiblePlotCanvas
+Each digital channel occupies one fixed-height horizontal track
+Binary state display: high/low with color fill
+No Y-axis, no independent scaling
+Shares the same time X-axis as FlexiblePlotCanvas (X-linked or driven)
+
+Phase scope:
+FlexiblePlotCanvas: Phase 3A
+DigitalEventTimeline: Phase 3B
+
+FLEXIBLEPLOTCANVAS RESPONSIBILITIES
+
+FlexiblePlotCanvas SHALL:
+
+render analog waveform channels
+manage N independent Y-axes (one ViewBox per parameter)
+support synchronized X-axis navigation (setXLink)
+support viewport clipping and display decimation
+host the master time cursor and trigger line
+support low-latency viewport updates
+support color-coded axes matching waveform colors
+support dynamic parameter add/remove
+
+FlexiblePlotCanvas SHALL NOT:
+
+render digital signals (DigitalEventTimeline responsibility)
 parse files
 perform heavy analytics
 contain provider logic
@@ -323,25 +383,23 @@ rendering core
 synchronization engine
 VISUALIZATION DIRECTORY STRUCTURE
 
-Recommended structure:
-
 app/visualization/
 │
 ├── widgets/
-│   ├── fast_waveform_widget.py
-│   └── digital_signal_widget.py
+│   ├── flexible_plot_canvas.py        ← Phase 3A — N-Axis analog canvas
+│   └── digital_event_timeline.py     ← Phase 3B — digital state tracks
 │
 ├── managers/
-│   ├── visualization_manager.py
-│   └── synchronization_manager.py
+│   ├── multi_axis_manager.py          ← Phase 3A — ViewBox/axis lifecycle
+│   ├── visualization_manager.py       ← Phase 3B — wires canvas + timeline
+│   └── synchronization_manager.py     ← Phase 3B — cross-widget X-sync
 │
 ├── rendering/
-│   ├── waveform_renderer.py
-│   └── downsampling.py
+│   └── downsampling.py                ← Phase 3A — decimate_for_display()
 │
 └── interaction/
-    ├── cursor_manager.py
-    └── viewport_controller.py
+    ├── cursor_manager.py              ← Phase 3B
+    └── viewport_controller.py        ← Phase 3B
 VISUALIZATION RULES
 RULE 1 — PERFORMANCE FIRST
 
@@ -389,3 +447,14 @@ engineering usability
 Build for industrial-scale waveform analysis.
 Protect rendering efficiency carefully.
 Optimize interaction continuously.
+
+IMPLEMENTATION REFERENCE
+
+For low-level rendering implementation rules (PyQtGraph initialization,
+curve lifecycle, decimation policy, cursor/trigger patterns, color scheme,
+UI-thread protection, DisturbanceRecord field access, anti-patterns):
+
+  docs/VIEWPORT_RENDERING_POLICY.md
+
+This document defines HOW to implement the contracts specified here.
+VISUALIZATION_CONTRACT.md defines WHAT. VIEWPORT_RENDERING_POLICY.md defines HOW.

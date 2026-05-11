@@ -1,0 +1,5 @@
+sources:
+  - source_id: x
+    type: comtrade
+    paths:
+      cfg: samples/comtrade/test.cfg

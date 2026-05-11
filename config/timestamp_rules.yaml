@@ -1,0 +1,21 @@
+# Powerwave Timestamp Interpretation Rules
+# ==========================================
+# Stores operator-confirmed date format resolutions for ambiguous sources.
+# Once confirmed, Powerwave reuses the interpretation for matching sources.
+#
+# Fields:
+#   source_pattern:        Source identifier (descriptive tag, case-insensitive)
+#   date_format:           Chosen format string ("M/D/YYYY" | "D/M/YYYY" | "ISO8601" etc.)
+#   ambiguous_resolution:  Same value — records why this format was chosen
+#   confirmed_by_operator: true = operator explicitly confirmed this interpretation
+#   notes:                 Free-text explanation for auditing
+#
+# Example (add rules under the 'rules' key):
+#   rules:
+#     - source_pattern: pulu_scada_export
+#       date_format: "M/D/YYYY"
+#       ambiguous_resolution: "M/D/YYYY"
+#       confirmed_by_operator: true
+#       notes: "Confirmed 2026-05-10 — matches COMTRADE event date 2026-03-06"
+#
+rules: []

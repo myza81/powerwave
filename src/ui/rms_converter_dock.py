@@ -119,6 +119,15 @@ _VOLTAGE_ROLES: frozenset[str] = frozenset({
 # Phase-to-phase roles: divide by V_base (not V_base/√3)
 _LINE_VOLTAGE_ROLES: frozenset[str] = frozenset({
     SignalRole.V_LINE,
+    SignalRole.V1_PMU,
+})
+
+_PER_UNIT_UNITS: frozenset[str] = frozenset({
+    'PU',
+    'P.U.',
+    'P/U',
+    'PER UNIT',
+    'PER-UNIT',
 })
 
 _FILE_FILTER = (
@@ -209,7 +218,7 @@ class _LoadedFile:
     selected_ids:       set[int]                                    = field(default_factory=set)
     rms_results:        dict[int, tuple[np.ndarray, np.ndarray]]    = field(default_factory=dict)
     start_epoch:        float                                       = 0.0
-    voltage_convention: str                                         = 'line_to_line'   # 'line_to_line' | 'line_to_earth'
+    voltage_convention: str                                         = 'auto'   # 'auto' | 'line_to_line' | 'line_to_earth'
     tree_item:          Optional[QTreeWidgetItem]                   = field(default=None, repr=False)
 
 
@@ -792,7 +801,7 @@ class RmsConverterDock(QDockWidget):
         Args:
             loaded: The _LoadedFile to add to the tree.
         """
-        conv_badge = '[L-L]' if loaded.voltage_convention == 'line_to_line' else '[L-E]'
+        conv_badge = self._voltage_convention_badge(loaded.voltage_convention)
         file_item = QTreeWidgetItem([f'📄 {loaded.path.stem}  {conv_badge}'])
         file_item.setData(
             TREE_COL_NAME, Qt.ItemDataRole.UserRole, loaded.file_id)
@@ -895,15 +904,20 @@ class RmsConverterDock(QDockWidget):
 
             menu = QMenu(self)
             conv_menu = menu.addMenu('Voltage Convention (channel value format)')
-            ll_act = conv_menu.addAction('Channel values are Line-to-Line  (default)')
+            auto_act = conv_menu.addAction('Auto by channel role  (default)')
+            ll_act = conv_menu.addAction('Channel values are Line-to-Line')
             le_act = conv_menu.addAction('Channel values are Line-to-Earth  (phase-to-earth)')
+            auto_act.setCheckable(True)
             ll_act.setCheckable(True)
             le_act.setCheckable(True)
+            auto_act.setChecked(loaded_file.voltage_convention == 'auto')
             ll_act.setChecked(loaded_file.voltage_convention == 'line_to_line')
             le_act.setChecked(loaded_file.voltage_convention == 'line_to_earth')
 
             chosen = menu.exec(global_pos)
-            if chosen is ll_act:
+            if chosen is auto_act:
+                self._set_voltage_convention(file_id, 'auto')
+            elif chosen is ll_act:
                 self._set_voltage_convention(file_id, 'line_to_line')
             elif chosen is le_act:
                 self._set_voltage_convention(file_id, 'line_to_earth')
@@ -1645,18 +1659,31 @@ class RmsConverterDock(QDockWidget):
         ch = ch_map.get(ch_id)
         return ch is not None and ch.signal_role in _VOLTAGE_ROLES
 
+    @staticmethod
+    def _voltage_convention_badge(convention: str) -> str:
+        if convention == 'line_to_line':
+            return '[L-L]'
+        if convention == 'line_to_earth':
+            return '[L-E]'
+        return '[AUTO]'
+
+    @staticmethod
+    def _is_per_unit_channel(ch: object) -> bool:
+        unit = str(getattr(ch, 'unit', '') or '').strip().upper()
+        return unit in _PER_UNIT_UNITS
+
     def _set_voltage_convention(self, file_id: str, convention: str) -> None:
         """Set the base-kV input convention for a file and refresh.
 
         Args:
             file_id:    The _LoadedFile to update.
-            convention: ``'line_to_line'`` or ``'line_to_earth'``.
+            convention: ``'auto'``, ``'line_to_line'`` or ``'line_to_earth'``.
         """
         loaded = self._files.get(file_id)
         if loaded is None:
             return
         loaded.voltage_convention = convention
-        badge = '[L-L]' if convention == 'line_to_line' else '[L-E]'
+        badge = self._voltage_convention_badge(convention)
         if loaded.tree_item is not None:
             self._tree.blockSignals(True)
             loaded.tree_item.setText(
@@ -1684,9 +1711,6 @@ class RmsConverterDock(QDockWidget):
             file_id: The _LoadedFile.file_id.
             ch_id:   The analogue channel_id.
         """
-        base = self._base_kv.get((file_id, ch_id), 0.0)
-        if base <= 0.0:
-            return 0.0
         loaded = self._files.get(file_id)
         if loaded is None:
             return 0.0
@@ -1694,8 +1718,15 @@ class RmsConverterDock(QDockWidget):
         ch = ch_map.get(ch_id)
         if ch is None or ch.signal_role not in _VOLTAGE_ROLES:
             return 0.0
+        if self._is_per_unit_channel(ch):
+            return 1.0
+        base = self._base_kv.get((file_id, ch_id), 0.0)
+        if base <= 0.0:
+            return 0.0
         if loaded.voltage_convention == 'line_to_earth':
             return base / SQRT3   # channel is L-E; derive phase base from L-L input
+        if loaded.voltage_convention == 'auto' and ch.signal_role not in _LINE_VOLTAGE_ROLES:
+            return base / SQRT3
         return base               # channel is L-L (default); use L-L base directly
 
     # ── Helpers ───────────────────────────────────────────────────────────────

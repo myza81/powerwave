@@ -1,0 +1,34 @@
+rules:
+  - match_pattern: sysf
+    match_type: exact
+    signal_type: frequency
+    unit: Hz
+    display_group: frequency
+    confidence: 1.0
+    confirmed_by_operator: true
+    notes: "SCADA export alias for system frequency"
+
+  - match_pattern: p_total
+    match_type: exact
+    signal_type: active_power
+    unit: MW
+    display_group: power
+    confidence: 1.0
+    confirmed_by_operator: true
+    notes: "SCADA active power column alias"
+
+  - match_pattern: act_pwr
+    match_type: exact
+    signal_type: active_power
+    unit: MW
+    display_group: power
+    confidence: 1.0
+    confirmed_by_operator: true
+
+  - match_pattern: grid_hz
+    match_type: exact
+    signal_type: frequency
+    unit: Hz
+    display_group: frequency
+    confidence: 1.0
+    confirmed_by_operator: true

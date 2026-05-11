@@ -123,7 +123,18 @@ _VOLTAGE_ROLES: frozenset[str] = frozenset({
     SignalRole.SEQ_RMS,
 })
 
-_LINE_VOLTAGE_ROLES: frozenset[str] = frozenset({SignalRole.V_LINE})
+_LINE_VOLTAGE_ROLES: frozenset[str] = frozenset({
+    SignalRole.V_LINE,
+    SignalRole.V1_PMU,
+})
+
+_PER_UNIT_UNITS: frozenset[str] = frozenset({
+    'PU',
+    'P.U.',
+    'P/U',
+    'PER UNIT',
+    'PER-UNIT',
+})
 
 _CURRENT_ROLES: frozenset[str] = frozenset({
     SignalRole.I_PHASE,
@@ -311,6 +322,13 @@ class _TimeAxis(pg.AxisItem):
         super().__init__(orientation, **kwargs)
         self._cycles_mode:  bool  = False
         self._nominal_freq: float = 50.0
+        self._ref_epoch:    float = 0.0
+
+    def set_time_reference(self, ref_epoch: float) -> None:
+        """Set POSIX epoch for x=0 so ticks can show actual UTC time."""
+        self._ref_epoch = ref_epoch if ref_epoch > 86400 else 0.0
+        self.picture = None
+        self.update()
 
     def set_cycles_mode(self, enabled: bool, nominal_freq: float = 50.0) -> None:
         """Switch between seconds and cycles display and redraw."""
@@ -321,6 +339,8 @@ class _TimeAxis(pg.AxisItem):
 
     def tickStrings(self, values, scale, spacing) -> list[str]:  # type: ignore[override]
         if not self._cycles_mode:
+            if self._ref_epoch > 0.0:
+                return [self._format_epoch_tick(self._ref_epoch + float(v), spacing) for v in values]
             return super().tickStrings(values, scale, spacing)
         freq = self._nominal_freq
         cyc  = [v * freq for v in values]
@@ -328,6 +348,17 @@ class _TimeAxis(pg.AxisItem):
         if spacing * freq >= 0.99:
             return [f'{v:.0f}' for v in cyc]
         return [f'{v:.1f}' for v in cyc]
+
+    @staticmethod
+    def _format_epoch_tick(epoch_s: float, spacing_s: float) -> str:
+        import datetime as _dt  # noqa: PLC0415
+
+        dt = _dt.datetime.fromtimestamp(epoch_s, _dt.UTC)
+        if spacing_s >= 86400:
+            return dt.strftime('%Y-%m-%d')
+        if spacing_s >= 1.0:
+            return dt.strftime('%H:%M:%S')
+        return dt.strftime('%H:%M:%S.%f')[:-3]
 
 
 # ── Internal state dataclass ───────────────────────────────────────────────────
@@ -356,7 +387,7 @@ class _LoadedFile:
     scatter_ids:          set[int]         = field(default_factory=set)
     start_epoch:          float            = 0.0
     timestamp_ok:         bool             = True
-    voltage_convention:   str              = 'line_to_line'   # 'line_to_line' | 'line_to_earth'
+    voltage_convention:   str              = 'auto'            # 'auto' | 'line_to_line' | 'line_to_earth'
     group_id:             int              = -1                # canvas group assigned to this file
     tree_item:            Optional[object] = field(default=None, repr=False)
 
@@ -1399,7 +1430,7 @@ class UnifiedCanvasWidget(QWidget):
         Args:
             loaded: The _LoadedFile to add.
         """
-        conv_badge = '[L-L]' if loaded.voltage_convention == 'line_to_line' else '[L-E]'
+        conv_badge = self._voltage_convention_badge(loaded.voltage_convention)
         file_item = QTreeWidgetItem([f'📄 {loaded.path.stem}  {conv_badge}'])
         file_item.setData(TREE_COL_NAME, Qt.ItemDataRole.UserRole, loaded.file_id)
         file_item.setFlags(
@@ -1788,10 +1819,13 @@ class UnifiedCanvasWidget(QWidget):
 
             menu.addSeparator()
             conv_menu = menu.addMenu('Voltage Convention (channel value format)')
-            ll_act = conv_menu.addAction('Channel values are Line-to-Line  (default)')
+            auto_act = conv_menu.addAction('Auto by channel role  (default)')
+            ll_act = conv_menu.addAction('Channel values are Line-to-Line')
             le_act = conv_menu.addAction('Channel values are Line-to-Earth  (phase-to-earth)')
+            auto_act.setCheckable(True)
             ll_act.setCheckable(True)
             le_act.setCheckable(True)
+            auto_act.setChecked(loaded_file.voltage_convention == 'auto')
             ll_act.setChecked(loaded_file.voltage_convention == 'line_to_line')
             le_act.setChecked(loaded_file.voltage_convention == 'line_to_earth')
 
@@ -1813,6 +1847,8 @@ class UnifiedCanvasWidget(QWidget):
             chosen = menu.exec(global_pos)
             if chosen is set_time_act:
                 self._show_set_start_time_dialog(file_id)
+            elif chosen is auto_act:
+                self._set_voltage_convention(file_id, 'auto')
             elif chosen is ll_act:
                 self._set_voltage_convention(file_id, 'line_to_line')
             elif chosen is le_act:
@@ -2717,6 +2753,8 @@ class UnifiedCanvasWidget(QWidget):
 
             # ── Digital events strip ──────────────────────────────────────────
             if stack_idx == STACK_DIGITAL:
+                ginfo = self._groups.get(group_id)
+                ref_epoch = ginfo.ref_epoch if ginfo is not None else 0.0
                 n_digital = sum(
                     len(f.selected_digital_ids)
                     for f in self._files.values()
@@ -2724,6 +2762,7 @@ class UnifiedCanvasWidget(QWidget):
                 )
                 dig_vb   = _DigitalViewBox()
                 dig_t_ax = _TimeAxis(orientation='bottom')
+                dig_t_ax.set_time_reference(ref_epoch)
                 dig_t_ax.set_cycles_mode(self._xaxis_cycles, self._get_nominal_freq())
                 dig_pw   = pg.PlotWidget(
                     background=theme_palette.current()['bg_canvas'],
@@ -2742,7 +2781,7 @@ class UnifiedCanvasWidget(QWidget):
                 dig_plot.setMenuEnabled(False)
                 dig_vb.setMenuEnabled(False)
                 dig_vb.setMouseEnabled(x=False, y=True)
-                _t_lbl = 'Time (cycles)' if self._xaxis_cycles else 'Time (s)'
+                _t_lbl = self._time_axis_label(ref_epoch)
                 dig_plot.setLabel('bottom', _t_lbl)
                 dig_plot.setLabel('left', 'Events')
                 dig_plot.hideAxis('right')
@@ -2785,7 +2824,10 @@ class UnifiedCanvasWidget(QWidget):
                 continue
 
             # ── Analogue stack ────────────────────────────────────────────────
+            ginfo = self._groups.get(group_id)
+            ref_epoch = ginfo.ref_epoch if ginfo is not None else 0.0
             t_ax = _TimeAxis(orientation='bottom')
+            t_ax.set_time_reference(ref_epoch)
             t_ax.set_cycles_mode(self._xaxis_cycles, self._get_nominal_freq())
             pw   = pg.PlotWidget(
                 background=theme_palette.current()['bg_canvas'],
@@ -2801,7 +2843,7 @@ class UnifiedCanvasWidget(QWidget):
             plot.setMenuEnabled(False)
             plot.getViewBox().setMenuEnabled(False)
 
-            _t_lbl = 'Time (cycles)' if self._xaxis_cycles else 'Time (s)'
+            _t_lbl = self._time_axis_label(ref_epoch)
             if is_last:
                 plot.setLabel('bottom', _t_lbl)
             else:
@@ -3329,12 +3371,16 @@ class UnifiedCanvasWidget(QWidget):
                 if ch is None:
                     continue
                 name    = f'{loaded.path.stem[:8]}/{ch.name}'
-                unit    = getattr(ch, 'unit', '') or ''
+                unit    = self._display_unit_for_channel(loaded.file_id, ch)
                 val_c1  = self._get_value_at_cursor(t_c1, key) if not math.isnan(t_c1) else _nan
                 val_c2  = self._get_value_at_cursor(t_c2, key) if not math.isnan(t_c2) else _nan
                 rows.append((name, unit, val_c1, val_c2))
 
-        self.readout_updated.emit(t_c1, t_c2, rows)
+        self.readout_updated.emit(
+            self._cursor_display_time(1, t_c1),
+            self._cursor_display_time(2, t_c2),
+            rows,
+        )
 
     def _reposition_readout(self) -> None:
         """Position the readout overlay within the GLW widget bounds."""
@@ -3378,6 +3424,19 @@ class UnifiedCanvasWidget(QWidget):
         if idx > 0 and abs(x_data[idx - 1] - t) < abs(x_data[idx] - t):
             idx -= 1
         return float(y_data[idx])
+
+    def _cursor_display_time(self, cursor_num: int, t: float) -> float:
+        """Return actual UTC epoch for measurement labels when available."""
+        if math.isnan(t):
+            return t
+        lines = self._cursor1_lines if cursor_num == 1 else self._cursor2_lines
+        for gkey, line in lines.items():
+            if line is None:
+                continue
+            ginfo = self._groups.get(gkey[0])
+            if ginfo is not None and ginfo.ref_epoch > 86400:
+                return ginfo.ref_epoch + t
+        return t
 
     # ── PU mode ────────────────────────────────────────────────────────────────
 
@@ -3423,18 +3482,36 @@ class UnifiedCanvasWidget(QWidget):
         ch = ch_map.get(ch_id)
         return ch is not None and ch.signal_role in _VOLTAGE_ROLES
 
+    @staticmethod
+    def _voltage_convention_badge(convention: str) -> str:
+        if convention == 'line_to_line':
+            return '[L-L]'
+        if convention == 'line_to_earth':
+            return '[L-E]'
+        return '[AUTO]'
+
+    @staticmethod
+    def _is_per_unit_channel(ch: object) -> bool:
+        unit = str(getattr(ch, 'unit', '') or '').strip().upper()
+        return unit in _PER_UNIT_UNITS
+
+    def _display_unit_for_channel(self, file_id: str, ch: object) -> str:
+        if self._pu_mode and self._get_pu_divisor(file_id, getattr(ch, 'channel_id', -1)) > 0.0:
+            return 'pu'
+        return getattr(ch, 'unit', '') or ''
+
     def _set_voltage_convention(self, file_id: str, convention: str) -> None:
         """Set the base-kV input convention for a file and refresh.
 
         Args:
             file_id:    The _LoadedFile to update.
-            convention: ``'line_to_line'`` or ``'line_to_earth'``.
+            convention: ``'auto'``, ``'line_to_line'`` or ``'line_to_earth'``.
         """
         loaded = self._files.get(file_id)
         if loaded is None:
             return
         loaded.voltage_convention = convention
-        badge = '[L-L]' if convention == 'line_to_line' else '[L-E]'
+        badge = self._voltage_convention_badge(convention)
         if loaded.tree_item is not None:
             self._tree.blockSignals(True)
             loaded.tree_item.setText(
@@ -3460,9 +3537,6 @@ class UnifiedCanvasWidget(QWidget):
             file_id: The file this channel belongs to.
             ch_id:   The channel_id.
         """
-        base = self._base_kv.get((file_id, ch_id), 0.0)
-        if base <= 0.0:
-            return 0.0
         loaded = self._files.get(file_id)
         if loaded is None:
             return 0.0
@@ -3470,8 +3544,15 @@ class UnifiedCanvasWidget(QWidget):
         ch = ch_map.get(ch_id)
         if ch is None or ch.signal_role not in _VOLTAGE_ROLES:
             return 0.0
+        if self._is_per_unit_channel(ch):
+            return 1.0
+        base = self._base_kv.get((file_id, ch_id), 0.0)
+        if base <= 0.0:
+            return 0.0
         if loaded.voltage_convention == 'line_to_earth':
             return base / SQRT3   # channel is L-E; derive phase base from L-L input
+        if loaded.voltage_convention == 'auto' and ch.signal_role not in _LINE_VOLTAGE_ROLES:
+            return base / SQRT3
         return base               # channel is L-L (default); use L-L base directly
 
     # ── Phasor dialog ──────────────────────────────────────────────────────────
@@ -3601,16 +3682,28 @@ class UnifiedCanvasWidget(QWidget):
                 return freq
         return AppSettings.get('calculation.nominal_frequency', 50.0)
 
+    def _time_axis_label(self, ref_epoch: float) -> str:
+        if self._xaxis_cycles:
+            return 'Time (cycles)'
+        if ref_epoch > 86400:
+            return 'Time (UTC)'
+        return 'Time (s)'
+
     def _on_cycles_toggled(self, checked: bool) -> None:
         """Switch X-axis tick labels between seconds and cycles without rebuild."""
         self._xaxis_cycles = checked
         freq   = self._get_nominal_freq()
-        t_lbl  = 'Time (cycles)' if checked else 'Time (s)'
-        for ax in self._time_axes.values():
+        for gkey, ax in self._time_axes.items():
+            ginfo = self._groups.get(gkey[0])
+            ref_epoch = ginfo.ref_epoch if ginfo is not None else 0.0
+            ax.set_time_reference(ref_epoch)
             ax.set_cycles_mode(checked, freq)
         # Update axis title on every visible bottom axis
-        for plot in self._stack_plots.values():
+        for gkey, plot in self._stack_plots.items():
             if plot.getAxis('bottom').isVisible():
+                ginfo = self._groups.get(gkey[0])
+                ref_epoch = ginfo.ref_epoch if ginfo is not None else 0.0
+                t_lbl = self._time_axis_label(ref_epoch)
                 plot.setLabel('bottom', t_lbl)
 
     def _zoom_to_fit(self, group_id: Optional[int] = None) -> None:

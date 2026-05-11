@@ -1,0 +1,2 @@
+rules:
+  - date_format: 'M/D/YYYY'

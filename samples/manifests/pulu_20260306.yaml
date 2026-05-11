@@ -1,0 +1,192 @@
+event_id: pulu_20260306
+generated_at: "2026-05-10T10:49:19.603291+00:00"
+sources:
+  - source_id: comtrade_main
+    type: comtrade
+    paths:
+      cfg: samples/comtrade/pulu_20260306.cfg
+      dat: samples/comtrade/pulu_20260306.dat
+    voltage_reference: phase_ground
+    start_time: "2026-03-06T18:04:08.817733"
+    trigger_time: "2026-03-06T18:04:09.317733"
+    sampling_rates_hz:
+      - 5000.0
+    channels:
+      - KPDN1 VR
+      - KPDN1 VB
+      - KPDN1 VY
+      - KPDN1 IB
+      - KPDN1 IN
+      - KPDN1 IR
+      - KPDN1 IY
+      - KPDN2 VB
+      - KPDN2 VR
+      - KPDN2 VY
+      - KPDN2 IB
+      - KPDN2 IN
+      - KPDN2 IR
+      - KPDN2 IY
+      - SLKS VB
+      - SLKS VR
+      - SLKS VY
+      - SLKS IB
+      - SLKS IN
+      - SLKS IR
+      - SLKS IY
+      - MCRS VB
+      - MCRS VR
+      - MCRS VY
+      - MCRS IB
+      - MCRS IN
+      - MCRS IR
+      - MCRS IY
+      - SGT1 VB_HV
+      - SGT1 VR_HV
+      - SGT1 VY_HV
+      - SGT1 IB_HV
+      - SGT1 IN_HV
+      - SGT1 IR_HV
+      - SGT1 IY_HV
+      - SGT1 VB_LV
+      - SGT1 VR_LV
+      - SGT1 VY_LV
+      - SGT1 IB_LV
+      - SGT1 IN_LV
+      - SGT1 IR_LV
+      - SGT1 IY_LV
+      - OVER KPDN2 VR
+      - UNDER KPDN2 VR
+      - OVER KPDN2 VY
+      - UNDER KPDN2 VY
+      - OVER KPDN2 VB
+      - UNDER KPDN2 VB
+      - OVER KPDN2 IR
+      - OVER KPDN2 IY
+      - OVER KPDN2 IB
+      - OVER KPDN2 IN
+      - KPDN2 87L/1
+      - KPDN2 87L/1_COMMFAIL
+      - KPDN2 21ZBU/1_Z1
+      - KPDN2 87L/2
+      - KPDN2 87L/2_COMMFAIL
+      - KPDN2 21Z/2_Z2
+      - KPDN2 21Z/2_Z3
+      - KPDN2 THOL
+      - KPDN2 79AR_ATMPT
+      - KPDN2 79AR_L/O
+      - KPDN2 21ZBU_SOTF
+      - KPDN2 50BF_SEND
+      - KPDN2 50BF_REC
+      - KPDN2 CB_R OPEN
+      - KPDN2 CB_Y OPEN
+      - KPDN2 CB_B OPEN
+      - OVER SLKS VR
+      - UNDER SLKS VR
+      - OVER SLKS VY
+      - UNDER SLKS VY
+      - OVER SLKS VB
+      - UNDER SLKS VB
+      - OVER SLKS IR
+      - OVER SLKS IY
+      - OVER SLKS IB
+      - OVER SLKS IN
+      - SLKS M1 CD OPRT
+      - SLKS M1.M2 B.DIST Z1 OP
+      - SLKS M1.M2 B.DIST Z2 OP
+      - SLKS M1.M2 B.DIST Z3 OP
+      - SLKS M1 SOTF OPRT
+      - SLKS M2 CD OPRT
+      - SLKS CB_R OPEN
+      - SLKS CB_Y OPEN
+      - SLKS CB_B OPEN
+      - SLKS M2 SOTF OPRT
+      - SLKS CBF STG_1 OPRT
+      - SLKS CBF STG_2 BB1 OPRT
+      - SLKS CBF STG_2 BB2 OPRT
+      - SLKS AR ATTEMPTED
+      - SLKS AR LOCKOUT
+      - SLKS INTERTRIP RECEIVE
+      - OVER SGT1 VR_HV
+      - UNDER SGT1 VR_HV
+      - OVER SGT1 VY_HV
+      - UNDER SGT1 VY_HV
+      - OVER SGT1 VB_HV
+      - UNDER SGT1 VB_HV
+      - OVER SGT1 IR_HV
+      - OVER SGT1 IY_HV
+      - OVER SGT1 IB_HV
+      - OVER SGT1 IN_HV
+      - SGT1 TRANSFORMER BIASED_OP
+      - SGT1 CBF STG1_OP
+      - SGT1 CBF STG2 MBB1_OP
+      - SGT1 CBF STG2 RBB_OP
+      - SGT1 OVER EXCITATION STG2_OP
+      - SGT1 SPARE_6
+      - SGT1 SPARE_7
+      - SGT1 SPARE_8
+      - SGT1 SPARE_9
+      - SGT1 TRANSFORMER HIGH IMP_OP
+      - SGT1 OVERCURRENT_OP
+      - SGT1 HV CB OPEN R PHASE
+      - SGT1 HV CB OPEN Y PHASE
+      - SGT1 HV CB OPEN B PHASE
+      - SGT1 SPARE_15
+      - SGT1 SPARE_16
+      - OVER SGT1 VR_LV
+      - UNDER SGT1 VR_LV
+      - OVER SGT1 VY_LV
+      - UNDER SGT1 VY_LV
+      - OVER SGT1 VB_LV
+      - UNDER SGT1 VB_LV
+      - OVER SGT1 IR_LV
+      - OVER SGT1 IY_LV
+      - OVER SGT1 IB_LV
+      - OVER SGT1 IN_LV
+  - source_id: csv_ops
+    type: csv
+    paths:
+      csv: samples/csv/pulu_20260306.csv
+    start_time: "2026-03-06T17:25:00"
+    sampling_rates_hz:
+      - 0.016667
+    channels:
+      - Time.1
+      - System Demand
+      - "Tie-Line"
+      - Frequency
+    columns:
+      - name: Time.1
+        display_group: other
+        confidence: 0.0
+        inferred_from: unknown
+        requires_user_confirmation: true
+      - name: System Demand
+        display_group: power
+        confidence: 0.85
+        inferred_from: name_keyword
+        requires_user_confirmation: false
+        signal_type: active_power
+        unit: MW
+      - name: "Tie-Line"
+        display_group: power
+        confidence: 0.7
+        inferred_from: name_keyword
+        requires_user_confirmation: true
+        signal_type: active_power
+        unit: MW
+      - name: Frequency
+        display_group: frequency
+        confidence: 0.95
+        inferred_from: name_exact
+        requires_user_confirmation: false
+        signal_type: frequency
+        unit: Hz
+    notes:
+      - "Date format ambiguous for column 'Time'. Verify M/D/YYYY vs D/M/YYYY interpretation before use."
+      - "WARNING: 10 sample(s) are ambiguous - M/D/YYYY and D/M/YYYY produce different dates. Verify the intended timezone and locale."
+alignment:
+  reference_source: csv_ops
+  reference_start: "2026-03-06T17:25:00"
+  offsets_seconds:
+    comtrade_main: 2348.817733
+    csv_ops: 0.0

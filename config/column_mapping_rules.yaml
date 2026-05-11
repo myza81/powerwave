@@ -1,0 +1,38 @@
+# Powerwave Persistent Column Mapping Rules
+# ==========================================
+# Rules are applied BEFORE the built-in classifier.
+# A matching rule promotes confidence and sets requires_user_confirmation.
+#
+# Fields:
+#   match_pattern:         Normalised (lowercase) string to match against column name
+#   match_type:            "exact" (full name match) | "keyword" (substring match)
+#   signal_type:           Target signal type (frequency, active_power, reactive_power, etc.)
+#   unit:                  Engineering unit (Hz, MW, MVAr, kV, A) — omit to keep inferred unit
+#   display_group:         Display panel group (frequency, power, voltage_rms, current_rms, rocof, other)
+#   confidence:            Promoted confidence score (0.0–1.0)
+#   confirmed_by_operator: true = requires_user_confirmation will be set to False
+#   source_fingerprint:    Optional — scope this rule to a specific source pattern
+#     vendor, station, export_type, source_kind, column_signature (all optional)
+#   notes:                 Free-text explanation for auditing
+#
+# Example (add rules under the 'rules' key):
+#   rules:
+#     - match_pattern: sysf
+#       match_type: exact
+#       signal_type: frequency
+#       unit: Hz
+#       display_group: frequency
+#       confidence: 1.0
+#       confirmed_by_operator: true
+#       notes: "SCADA export alias for system frequency — confirmed 2026-05-10"
+#
+#     - match_pattern: p_total
+#       match_type: exact
+#       signal_type: active_power
+#       unit: MW
+#       display_group: power
+#       confidence: 1.0
+#       confirmed_by_operator: true
+#       notes: "SCADA active power column alias"
+#
+rules: []

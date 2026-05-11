@@ -1,13 +1,12 @@
 import sys
 
-from PyQt6.QtWidgets import QApplication, QMainWindow
+import pyqtgraph as pg
+from PyQt6.QtWidgets import QApplication
 
+from app.ui.main_window import PowerwaveMainWindow
 
-class PowerwaveMainWindow(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("Powerwave")
-        self.resize(1200, 800)
+# Must be called before any pg widget is instantiated (VIEWPORT_RENDERING_POLICY §1)
+pg.setConfigOptions(useOpenGL=True, antialias=False, foreground="w", background="#1E1E1E")
 
 
 def main() -> int:
