@@ -35,7 +35,7 @@ class MultiAxisManager:
         self._layout = layout
         self._axes: dict[str, _AxisEntry] = {}
         self._pending_axis: dict[str, pg.AxisItem] = {}
-        self._right_col = 2
+        self._right_col = 1
         self._primary.getViewBox().sigResized.connect(self._sync_geometries)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -57,6 +57,7 @@ class MultiAxisManager:
             self._primary.setLabel("left", name, units=unit)
             left_ax: pg.AxisItem = self._primary.getAxis("left")
             left_ax.setPen(pg.mkPen(color))
+            left_ax.setTextPen(pg.mkPen(color))
             self._pending_axis[name] = left_ax
             return self._primary.getViewBox()
 

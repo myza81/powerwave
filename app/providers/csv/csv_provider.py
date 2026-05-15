@@ -17,6 +17,15 @@ from app.models import (
 )
 from app.providers.base.base_provider import BaseProvider
 from app.providers.base.exceptions import ProviderLoadError
+from app.data.column_classifier import (
+    classify_csv_column,
+    numeric_column_disposition,
+    DISPOSITION_ANALOG,
+    DISPOSITION_DIGITAL,
+    DISPOSITION_IGNORED,
+    DISPOSITION_REVIEW,
+)
+from app.data.intelligence import IntelligenceManager
 
 _SUPPORTED_SUFFIXES = {".csv"}
 
@@ -171,11 +180,15 @@ class CsvProvider(BaseProvider):
       VA, VB, VC, IA, IB, IC   (no time column)
 
     Columns are classified as analog (numeric) or digital (binary 0/1 with a
-    status-type name) using conservative heuristics. Units are inferred from
-    column names. No resampling, no analytics, no src/ imports.
+    status-type name) using robust disposition heuristics. Units are inferred
+    from column names or intelligence matching.
     """
 
     provider_name: str = "csv"
+
+    def __init__(self, intelligence_manager: IntelligenceManager | None = None) -> None:
+        """Initialize with an optional IntelligenceManager for D4.3 rules."""
+        self._mgr = intelligence_manager or IntelligenceManager()
 
     def can_load(self, path: Path) -> bool:
         return path.suffix.lower() in _SUPPORTED_SUFFIXES
@@ -197,18 +210,35 @@ class CsvProvider(BaseProvider):
         if df.empty:
             raise ProviderLoadError(f"CSV file '{path}' contains no data rows")
 
-        time_col = _detect_time_column(list(df.columns))
+        time_candidates = [c for c in df.columns if _is_time_like_column(c)]
+        time_col = None
+        ignored_cols = set()
 
-        try:
-            time_array, start_time, sample_rate = _build_time_array(df, time_col, path)
-        except ProviderLoadError:
-            raise
-        except Exception as exc:
-            raise ProviderLoadError(
-                f"Failed to build time array from '{path}': {exc}"
-            ) from exc
+        if len(time_candidates) == 1:
+            time_col = time_candidates[0]
+        elif len(time_candidates) > 1:
+            # Phase D4.3: resolve duplicate time columns
+            candidates = self._mgr.score_timestamp_candidates(
+                time_candidates, df, source_pattern=self.provider_name
+            )
+            if candidates:
+                time_col = candidates[0].column_name
+                for c in candidates[1:]:
+                    ignored_cols.add(c.column_name)
 
-        waveform_cols = [c for c in df.columns if not _is_time_like_column(c)]
+        if time_col is not None:
+            try:
+                time_array, start_time, sample_rate = _build_time_array(df, time_col, path)
+            except ProviderLoadError:
+                raise
+            except Exception as exc:
+                raise ProviderLoadError(
+                    f"Failed to build time array from '{path}': {exc}"
+                ) from exc
+        else:
+            time_array, start_time, sample_rate = _build_time_array(df, None, path)
+
+        waveform_cols = [c for c in df.columns if c != time_col]
 
         analog_channels: list[AnalogChannel] = []
         digital_channels: list[DigitalChannel] = []
@@ -218,8 +248,30 @@ class CsvProvider(BaseProvider):
 
         for col_name in waveform_cols:
             series: pd.Series = df[col_name]
+            
+            try:
+                numeric = pd.to_numeric(series, errors="coerce")
+                valid_vals = numeric.dropna().tolist()
+            except (ValueError, TypeError):
+                valid_vals = []
+                numeric = series  # Will be all NaN if not numeric
 
-            if _is_digital_column(series, col_name):
+            # 1. Base classification using IntelligenceManager (synonyms, keywords)
+            cls, _ = self._mgr.classify_column(col_name, valid_vals)
+            
+            # 2. Determine disposition
+            is_dig = _is_digital_column(series, col_name)
+            ignore_reason = "duplicate_timestamp_artifact" if col_name in ignored_cols else None
+            
+            disp, reason = numeric_column_disposition(
+                cls, is_digital=is_dig, ignore_reason=ignore_reason
+            )
+
+            # 3. Apply disposition
+            if disp == DISPOSITION_IGNORED:
+                continue
+
+            if disp == DISPOSITION_DIGITAL:
                 vals = series.fillna(0).astype(float).astype(np.int8).to_numpy()
                 digital_channels.append(
                     DigitalChannel(name=col_name, index=digital_idx, normal_state=0)
@@ -227,7 +279,7 @@ class CsvProvider(BaseProvider):
                 col_data[col_name] = vals
                 digital_idx += 1
             else:
-                numeric: pd.Series = pd.to_numeric(series, errors="coerce")  # type: ignore[assignment]
+                # Analog or Review (both handled as analog channels)
                 if numeric.isna().all():
                     warnings.warn(
                         f"Column '{col_name}' in '{path}' cannot be parsed as "
@@ -235,10 +287,14 @@ class CsvProvider(BaseProvider):
                     )
                     continue
                 vals = numeric.to_numpy(dtype=np.float64)
+                
+                # Unit fallback if intelligence couldn't infer it
+                unit = cls.unit if cls.unit else _infer_unit(col_name)
+                
                 analog_channels.append(
                     AnalogChannel(
                         name=col_name,
-                        unit=_infer_unit(col_name),
+                        unit=unit,
                         index=analog_idx,
                     )
                 )

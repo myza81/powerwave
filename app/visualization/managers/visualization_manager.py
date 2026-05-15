@@ -267,16 +267,21 @@ class VisualizationManager:
         self._timeline.link_x_to(self._canvas._primary_plot)
         self._x_linked = True
 
-    def set_record(self, record: DisturbanceRecord) -> None:
+    def set_record(
+        self,
+        record: DisturbanceRecord,
+        *,
+        axis_mode: str = "relative_seconds",
+    ) -> None:
         """Load a DisturbanceRecord into both canvas and timeline."""
         self._record = record
-        self._canvas.set_record(record)
+        self._canvas.set_record(record, axis_mode=axis_mode)
         self._timeline.set_record(record)
 
     def clear(self) -> None:
         """Clear both widgets and discard the record reference."""
         self._record = None
-        self._canvas.clear()
+        self._canvas._clear_canvas()
         self._timeline.clear()
 
     def zoom_to_trigger(self, window_s: float = 0.2) -> None:
@@ -313,6 +318,8 @@ class VisualizationManager:
         record: DisturbanceRecord,
         signal_metadata: dict | None = None,
         canvas_factory=None,
+        *,
+        axis_mode: str = "relative_seconds",
     ) -> dict:
         """Group channels by display group and create one canvas per non-empty group.
 
@@ -353,7 +360,7 @@ class VisualizationManager:
                 continue
             filtered = _make_filtered_record(record, channel_names)
             canvas = canvas_factory()
-            canvas.set_record(filtered)
+            canvas.set_record(filtered, axis_mode=axis_mode)
             panel_canvases[group_name] = canvas
 
         self._panel_canvases = panel_canvases
@@ -364,6 +371,8 @@ class VisualizationManager:
         self,
         session: MultiSourceSession,
         canvas_factory=None,
+        *,
+        axis_mode: str = "relative_seconds",
     ) -> dict:
         """Display a MultiSourceSession as time-aligned stacked panels.
 
@@ -417,7 +426,7 @@ class VisualizationManager:
                 filtered = _make_filtered_record(source.record, channel_names)
                 display_record = _apply_time_offset(filtered, offset)
                 canvas = canvas_factory()
-                canvas.set_record(display_record)
+                canvas.set_record(display_record, axis_mode=axis_mode)
                 panel_key = f"{source.source_id}/{group_name}"
                 panel_canvases[panel_key] = canvas
                 display_records.append(

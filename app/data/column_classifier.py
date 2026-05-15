@@ -1,11 +1,26 @@
 """Lightweight CSV column signal classifier for Powerwave.
 
-Classifies data columns by signal type using name-based heuristics and optional
-value-profile hints. Returns ColumnClassification with confidence score and a
-requires_user_confirmation flag for low-confidence results.
+Classifies data columns by signal type using name-based heuristics, synonym/fuzzy
+matching, and optional value-profile hints. Returns ColumnClassification with
+confidence score and a requires_user_confirmation flag for low-confidence results.
+
+Priority order (Phase D4.3 — first match wins):
+  1. Previously confirmed mapping rule  (applied by IntelligenceManager on top)
+  2. Manifest mapping                   (applied by IntelligenceManager on top)
+  3. Exact known keyword                (_EXACT table)
+  4. Fuzzy/synonym keyword match        (_KEYWORD + synonym library)
+  5. Value profile                      (_value_classify)
+  6. Operator review required           (confidence=0.0, inferred_from="unknown")
 
 Confidence threshold: columns below 0.80 are flagged for user confirmation.
 Classification is metadata — it does not rename or reinterpret source data.
+
+NO SILENT LOSS: every numeric column must receive an explicit disposition via
+  numeric_column_disposition(). The return type distinguishes:
+    "analog"                 — classified as analog waveform data
+    "digital"                — classified as digital (binary) channel
+    "unknown_requires_review" — confidence too low; operator review required
+    "ignored_with_reason"    — explicitly ignored with a non-empty reason string
 """
 from __future__ import annotations
 
@@ -16,6 +31,12 @@ import numpy as np
 
 # Columns below this threshold are flagged requires_user_confirmation=True.
 CONFIRMATION_THRESHOLD = 0.80
+
+# Disposition literals returned by numeric_column_disposition()
+DISPOSITION_ANALOG = "analog"
+DISPOSITION_DIGITAL = "digital"
+DISPOSITION_REVIEW = "unknown_requires_review"
+DISPOSITION_IGNORED = "ignored_with_reason"
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,3 +237,39 @@ def classify_csv_columns(
             vals = []
         result[col] = classify_csv_column(col, vals if vals else None)
     return result
+
+
+def numeric_column_disposition(
+    classification: ColumnClassification,
+    is_digital: bool = False,
+    ignore_reason: str | None = None,
+) -> tuple[str, str | None]:
+    """Map a ColumnClassification to an explicit disposition literal.
+
+    This function implements the NO-SILENT-LOSS guarantee: every numeric column
+    must be classified into exactly one of four states.
+
+    Args:
+        classification:  Result from classify_csv_column / classify_csv_columns.
+        is_digital:      True when the column was identified as a digital (0/1) channel.
+        ignore_reason:   Non-empty string when the caller explicitly wants to exclude
+                         this column from the record (e.g. duplicate timestamp artifact).
+
+    Returns:
+        (disposition, reason) where disposition is one of:
+            DISPOSITION_ANALOG    — column is an analog waveform channel
+            DISPOSITION_DIGITAL   — column is a digital (binary) status channel
+            DISPOSITION_REVIEW    — classification uncertain; operator review required
+            DISPOSITION_IGNORED   — explicitly excluded; reason explains why
+        reason is None except when disposition is DISPOSITION_IGNORED.
+    """
+    if ignore_reason:
+        return DISPOSITION_IGNORED, ignore_reason
+    if is_digital:
+        return DISPOSITION_DIGITAL, None
+    if classification.signal_type is None and classification.confidence == 0.0:
+        return DISPOSITION_REVIEW, None
+    if classification.requires_user_confirmation:
+        # confidence > 0 but below threshold — still useful as analog, just flagged
+        return DISPOSITION_ANALOG, None
+    return DISPOSITION_ANALOG, None

@@ -1,14 +1,21 @@
 """app/ui/dialogs/data_review_dialog.py
 
-Data Mapping Review Dialog — Phase D4.2.
+Data Mapping Review Dialog — Phase D4.2 / D4.3.
 
 Shows operator-facing review of:
   Section 1 — Event summary: sources, reference start, display offsets
   Section 2 — Timestamp interpretation: format, confidence, ambiguity warnings
+             Phase D4.3: ranked interpretations with confidence and reason codes
   Section 3 — Column classification table: type, unit, group, confidence, status
 
 Low-confidence and unconfirmed columns are visually highlighted.
 The operator can accept (Proceed) or reject (Cancel) before visualization starts.
+
+Phase D4.3 additions:
+  - TimestampInterpretationPanel: shows ranked interpretations when ambiguous
+  - High-confidence + no ambiguity: auto-apply (no UI shown for that column)
+  - High-confidence + ambiguity: confirmation required
+  - Low confidence: operator must choose from ranked list
 
 Usage::
 
@@ -18,19 +25,26 @@ Usage::
     summary = build_event_review_summary(session, manifest_data)
     dlg = DataReviewDialog(summary, parent=main_window)
     if dlg.exec() == QDialog.DialogCode.Accepted:
+        # access dlg.selected_timestamp_formats for confirmed choices
         # proceed to visualization
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QDialog,
     QDialogButtonBox,
+    QFrame,
+    QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
-    QScrollArea,
+    QRadioButton,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -44,6 +58,9 @@ from app.data.review_summary import (
     SourceReviewSummary,
     TimestampReviewSummary,
 )
+
+if TYPE_CHECKING:
+    from app.data.timestamp_interpreter import TimestampInterpretation, TimestampInterpretationMatrix
 
 # ─── Row colour thresholds ────────────────────────────────────────────────────
 # Colours are light-tinted backgrounds compatible with both light and dark themes.
@@ -62,6 +79,19 @@ _COL_STATUS = 6
 _N_COLS     = 7
 
 _HEADER_LABELS = ["Source", "Column", "Signal Type", "Unit", "Group", "Conf.", "Status"]
+
+_DIALOG_DEFAULT_SIZE = (940, 640)
+_DIALOG_MINIMUM_SIZE = (820, 560)
+_TABLE_ROW_HEIGHT = 22
+_TABLE_HEADER_HEIGHT = 24
+_TABLE_MIN_HEIGHT = 112
+_TABLE_MAX_HEIGHT = 260
+
+
+# ─── Timestamp interpretation thresholds (Phase D4.3) ────────────────────────
+_AUTO_APPLY_THRESHOLD = 0.85    # confidence ≥ this: auto-apply if unambiguous
+_CONFIRM_THRESHOLD = 0.60       # confidence ≥ this: show with pre-selection
+# Below _CONFIRM_THRESHOLD → operator must explicitly choose
 
 
 def _row_colour(row: ColumnReviewRow) -> QColor | None:
@@ -115,15 +145,15 @@ def _make_kv_row(key: str, value: str, warn: bool = False) -> QWidget:
     """Return a horizontal widget with a bold key label and a value label."""
     row = QWidget()
     h = QHBoxLayout(row)
-    h.setContentsMargins(0, 1, 0, 1)
-    h.setSpacing(8)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(6)
     key_lbl = _make_bold_label(key)
-    key_lbl.setFixedWidth(160)
+    key_lbl.setFixedWidth(132)
     key_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     val_lbl = QLabel(value)
     val_lbl.setWordWrap(True)
     if warn:
-        val_lbl.setStyleSheet("color: #856404; background: #fff3cd; padding: 2px 4px;")
+        val_lbl.setStyleSheet("color: #856404; background: #fff3cd; padding: 1px 4px;")
     h.addWidget(key_lbl)
     h.addWidget(val_lbl, 1)
     return row
@@ -134,7 +164,7 @@ def _make_warning_label(text: str) -> QLabel:
     lbl.setWordWrap(True)
     lbl.setStyleSheet(
         "color: #856404; background: #fff3cd; "
-        "padding: 4px 6px; border: 1px solid #ffc107; border-radius: 3px;"
+        "padding: 3px 5px; border: 1px solid #ffc107; border-radius: 3px;"
     )
     return lbl
 
@@ -150,24 +180,41 @@ class DataReviewDialog(QDialog):
     Presents event summary, timestamp interpretation, and column classification
     review in three clearly delineated sections. Operator can Proceed or Cancel.
 
+    Phase D4.3 additions:
+      - Timestamp interpretation matrices may be passed via *ts_matrices*.
+        When present, ambiguous columns show a ranked-interpretation panel.
+      - selected_timestamp_formats: dict[source_id → dict[column_name → format_string]]
+        Populated after the dialog is accepted; callers read this to apply formats.
+
     Args:
-        summary: EventReviewSummary from build_event_review_summary().
-        parent:  Optional parent QWidget.
+        summary:     EventReviewSummary from build_event_review_summary().
+        ts_matrices: Optional map of {source_id → {col_name → TimestampInterpretationMatrix}}.
+        parent:      Optional parent QWidget.
     """
 
-    def __init__(self, summary: EventReviewSummary, parent=None) -> None:
+    def __init__(
+        self,
+        summary: EventReviewSummary,
+        ts_matrices: dict | None = None,    # dict[str, dict[str, TimestampInterpretationMatrix]]
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._summary = summary
+        self._ts_matrices: dict = ts_matrices or {}
+        # Stores operator-selected format strings: {source_id: {col_name: format_str}}
+        self.selected_timestamp_formats: dict[str, dict[str, str]] = {}
+        # Radio-button groups keyed by (source_id, col_name) for later harvest
+        self._radio_groups: dict[tuple[str, str], QButtonGroup] = {}
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         self.setWindowTitle(f"Data Review — {self._summary.event_id}")
-        self.setMinimumWidth(820)
-        self.resize(920, 680)
+        self.setMinimumSize(*_DIALOG_MINIMUM_SIZE)
+        self.resize(*_DIALOG_DEFAULT_SIZE)
 
         root = QVBoxLayout(self)
-        root.setSpacing(10)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
 
         # ── Section 1: Event Summary ──────────────────────────────────────────
         root.addWidget(self._build_event_section())
@@ -176,6 +223,11 @@ class DataReviewDialog(QDialog):
         ts_widget = self._build_timestamp_section()
         if ts_widget is not None:
             root.addWidget(ts_widget)
+
+        # ── Section 2b: Ranked Timestamp Interpretation (Phase D4.3) ─────────
+        ts_interp_widget = self._build_ts_interpretation_section()
+        if ts_interp_widget is not None:
+            root.addWidget(ts_interp_widget)
 
         # ── Section 3: Column Classification ─────────────────────────────────
         root.addWidget(self._build_column_section(), 1)
@@ -197,11 +249,46 @@ class DataReviewDialog(QDialog):
         cancel_btn = buttons.addButton(
             "Cancel", QDialogButtonBox.ButtonRole.RejectRole
         )
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         # Make Proceed the default
         proceed_btn.setDefault(True)
         root.addWidget(buttons)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """Center the dialog on first show without constraining manual resize."""
+        super().showEvent(event)
+        if getattr(self, "_centered_once", False):
+            return
+        self._centered_once = True
+
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            target = parent.frameGeometry().center()
+        else:
+            screen = self.screen()
+            if screen is None:
+                return
+            target = screen.availableGeometry().center()
+
+        frame = self.frameGeometry()
+        frame.moveCenter(target)
+        self.move(frame.topLeft())
+
+    def _on_accept(self) -> None:
+        """Harvest all radio-button selections before closing."""
+        self._harvest_ts_selections()
+        self.accept()
+
+    def _harvest_ts_selections(self) -> None:
+        """Read selected radio buttons and populate selected_timestamp_formats."""
+        for (source_id, col_name), group in self._radio_groups.items():
+            checked = group.checkedButton()
+            if checked is not None:
+                fmt = checked.property("format_string")
+                if fmt:
+                    self.selected_timestamp_formats.setdefault(source_id, {})
+                    self.selected_timestamp_formats[source_id][col_name] = fmt
 
     # ─────────────────────────────────────────────────────────────────────────
     # Section builders
@@ -209,20 +296,33 @@ class DataReviewDialog(QDialog):
 
     def _build_event_section(self) -> QGroupBox:
         box = QGroupBox("Event Summary")
-        vbox = QVBoxLayout(box)
-        vbox.setSpacing(2)
+        grid = QGridLayout(box)
+        grid.setContentsMargins(8, 6, 8, 6)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
+        grid.setColumnMinimumWidth(0, 136)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+
+        def add_row(row: int, col: int, key: str, value: str) -> None:
+            key_lbl = _make_bold_label(key)
+            key_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            val_lbl = QLabel(value)
+            val_lbl.setWordWrap(True)
+            grid.addWidget(key_lbl, row, col)
+            grid.addWidget(val_lbl, row, col + 1)
 
         s = self._summary
-        vbox.addWidget(_make_kv_row("Event ID:", s.event_id))
 
         # Reference start
         ref_str = s.reference_start.isoformat(sep=" ") if s.reference_start else "—"
-        vbox.addWidget(_make_kv_row("Reference Start:", ref_str))
+        add_row(0, 0, "Event ID:", s.event_id)
+        add_row(0, 2, "Reference Start:", ref_str)
 
         # Per-source summary rows
-        for src in s.sources:
+        for idx, src in enumerate(s.sources, start=1):
             src_text = self._fmt_source_row(src)
-            vbox.addWidget(_make_kv_row(f"  {src.source_id} ({src.provider_type}):", src_text))
+            add_row(idx, 0, f"{src.source_id} ({src.provider_type}):", src_text)
 
         return box
 
@@ -251,7 +351,8 @@ class DataReviewDialog(QDialog):
 
         box = QGroupBox("Timestamp Interpretation")
         vbox = QVBoxLayout(box)
-        vbox.setSpacing(4)
+        vbox.setContentsMargins(8, 6, 8, 6)
+        vbox.setSpacing(2)
 
         for src in self._summary.sources:
             ts = src.timestamp_summary
@@ -272,9 +373,155 @@ class DataReviewDialog(QDialog):
 
         return box
 
+    def _build_ts_interpretation_section(self) -> QGroupBox | None:
+        """Phase D4.3: ranked timestamp interpretation panel.
+
+        Only shown when ts_matrices were provided and at least one column has
+        ambiguous or low-confidence timestamp interpretations.
+
+        Rules:
+          confidence >= 0.85 and not ambiguous  → auto-apply (not shown)
+          confidence >= 0.60 or ambiguous        → show with pre-selected recommendation
+          confidence < 0.60                      → show; operator must choose explicitly
+        """
+        if not self._ts_matrices:
+            return None
+
+        # Collect entries that require operator interaction
+        panels: list[QWidget] = []
+
+        for source_id, col_matrices in self._ts_matrices.items():
+            for col_name, matrix in col_matrices.items():
+                if matrix.recommended is None:
+                    continue
+
+                rec = matrix.recommended
+                auto_apply = (
+                    rec.confidence >= _AUTO_APPLY_THRESHOLD
+                    and not matrix.is_ambiguous
+                )
+                if auto_apply:
+                    # Auto-applied — pre-populate without showing
+                    self.selected_timestamp_formats.setdefault(source_id, {})
+                    self.selected_timestamp_formats[source_id][col_name] = rec.format_string
+                    continue
+
+                panel = self._build_single_ts_interp_panel(source_id, col_name, matrix)
+                panels.append(panel)
+
+        if not panels:
+            return None
+
+        box = QGroupBox("Timestamp Format Selection — Operator Confirmation Required")
+        vbox = QVBoxLayout(box)
+        vbox.setContentsMargins(8, 6, 8, 6)
+        vbox.setSpacing(3)
+
+        intro = QLabel(
+            "The following timestamp column(s) have ambiguous date formats. "
+            "Please confirm the correct interpretation before proceeding."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #856404; padding: 1px 0;")
+        vbox.addWidget(intro)
+
+        for panel in panels:
+            # Separator line between panels
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            vbox.addWidget(line)
+            vbox.addWidget(panel)
+
+        return box
+
+    def _build_single_ts_interp_panel(
+        self,
+        source_id: str,
+        col_name: str,
+        matrix,   # TimestampInterpretationMatrix
+    ) -> QWidget:
+        """Build the ranked-interpretation panel for one timestamp column."""
+        container = QWidget()
+        vbox = QVBoxLayout(container)
+        vbox.setContentsMargins(2, 2, 2, 2)
+        vbox.setSpacing(2)
+
+        rec = matrix.recommended
+
+        # Header
+        need_choice = rec is not None and rec.confidence < _CONFIRM_THRESHOLD
+        header_text = (
+            f"Column: <b>{col_name}</b>  |  Source: {source_id}"
+        )
+        if matrix.is_ambiguous:
+            header_text += "  ⚠ Ambiguous date format"
+        elif need_choice:
+            header_text += "  ⚠ Low confidence — please confirm"
+
+        header = QLabel(header_text)
+        header.setTextFormat(Qt.TextFormat.RichText)
+        header.setWordWrap(True)
+        vbox.addWidget(header)
+
+        # Sample value preview
+        if matrix.sample_values:
+            sample_text = ", ".join(matrix.sample_values[:3])
+            vbox.addWidget(QLabel(f"  Sample values: <i>{sample_text}</i>"))
+
+        # Radio group
+        group = QButtonGroup(container)
+        self._radio_groups[(source_id, col_name)] = group
+
+        # Show top-N interpretations (max 5)
+        top_n = matrix.interpretations[:5]
+        for i, interp in enumerate(top_n):
+            radio = self._make_interp_radio(interp, is_recommended=(i == 0))
+            radio.setProperty("format_string", interp.format_string)
+            group.addButton(radio)
+            vbox.addWidget(radio)
+            # Pre-select recommended when confidence is sufficient
+            if i == 0 and rec is not None and rec.confidence >= _CONFIRM_THRESHOLD:
+                radio.setChecked(True)
+
+        return container
+
+    def _make_interp_radio(
+        self,
+        interp,   # TimestampInterpretation
+        is_recommended: bool = False,
+    ) -> QRadioButton:
+        """Build one radio button representing a timestamp interpretation."""
+        conf_pct = f"{interp.confidence:.0%}"
+        label = interp.format_label
+
+        if is_recommended:
+            prefix = "[Recommended] "
+            style = "font-weight: bold;"
+        else:
+            prefix = "[Alternative]  "
+            style = ""
+
+        # Show sample parsed value if available
+        sample_str = ""
+        if interp.parsed_samples:
+            sample_str = f"  →  {interp.parsed_samples[0].strftime('%Y-%m-%d %H:%M:%S')}"
+
+        # Reason codes (truncated for display)
+        reasons = ", ".join(interp.reason_codes[:3]) if interp.reason_codes else ""
+        reason_str = f"  ({reasons})" if reasons else ""
+
+        text = f"{prefix}{label}{sample_str}   Confidence: {conf_pct}{reason_str}"
+        radio = QRadioButton(text)
+        if style:
+            radio.setStyleSheet(style)
+        return radio
+
     def _build_column_section(self) -> QGroupBox:
         box = QGroupBox("Column Classification")
         vbox = QVBoxLayout(box)
+        vbox.setContentsMargins(8, 6, 8, 6)
+        vbox.setSpacing(4)
 
         # Collect all rows across sources; skip COMTRADE sources with zero rows
         has_any_rows = any(src.column_rows for src in self._summary.sources)
@@ -288,12 +535,23 @@ class DataReviewDialog(QDialog):
         table = QTableWidget()
         table.setColumnCount(_N_COLS)
         table.setHorizontalHeaderLabels(_HEADER_LABELS)
-        table.horizontalHeader().setStretchLastSection(True)
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(42)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header.setFixedHeight(_TABLE_HEADER_HEIGHT)
+        for col in range(_N_COLS):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(_COL_NAME, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(_COL_STATUS, QHeaderView.ResizeMode.Stretch)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setAlternatingRowColors(False)
-        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        table.setWordWrap(False)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(_TABLE_ROW_HEIGHT)
+        table.verticalHeader().setMinimumSectionSize(18)
 
         # Populate rows — sources with no column_rows show a summary line
         all_rows: list[tuple[str, ColumnReviewRow | None, str | None]] = []
@@ -311,19 +569,22 @@ class DataReviewDialog(QDialog):
 
         table.setRowCount(len(all_rows))
         for r_idx, (source_id, row, summary_text) in enumerate(all_rows):
+            table.setRowHeight(r_idx, _TABLE_ROW_HEIGHT)
             if row is not None:
                 self._populate_table_row(table, r_idx, source_id, row)
             else:
                 self._populate_summary_row(table, r_idx, source_id, summary_text or "")
 
         table.resizeColumnsToContents()
-
-        # Wrap in scroll area so the dialog doesn't expand unboundedly
-        scroll = QScrollArea()
-        scroll.setWidget(table)
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumHeight(200)
-        vbox.addWidget(scroll)
+        table_height = (
+            _TABLE_HEADER_HEIGHT
+            + (len(all_rows) * _TABLE_ROW_HEIGHT)
+            + table.frameWidth() * 2
+            + 6
+        )
+        table.setMinimumHeight(max(_TABLE_MIN_HEIGHT, min(table_height, _TABLE_MAX_HEIGHT)))
+        table.setMaximumHeight(_TABLE_MAX_HEIGHT)
+        vbox.addWidget(table)
 
         # Legend
         legend = self._build_legend()
@@ -375,8 +636,8 @@ class DataReviewDialog(QDialog):
     def _build_legend(self) -> QWidget:
         legend = QWidget()
         h = QHBoxLayout(legend)
-        h.setContentsMargins(0, 2, 0, 0)
-        h.setSpacing(16)
+        h.setContentsMargins(0, 1, 0, 0)
+        h.setSpacing(10)
         h.addWidget(QLabel("Legend:"))
         for colour, label in (
             (_COLOUR_CONFIRMED, "✓ Confirmed"),

@@ -94,9 +94,9 @@ powerwave/
 │   │   ├── channel_grouper.py             ← group_channels_for_display (Phase D1 COMPLETE)
 │   │                                     metadata-driven > name heuristics grouping
 │   │                                     7 display groups: voltage_raw/current_raw/power/frequency/rocof/digital/other
-│   ├── dialogs/
+│   ├── ui/dialogs/
 │   │   ├── __init__.py                ← exports DataReviewDialog
-│   │   └── data_review_dialog.py      ← DataReviewDialog(QDialog) — Phase D4.2 NEW
+│   │   └── data_review_dialog.py      ← app/ui/dialogs/data_review_dialog.py; DataReviewDialog(QDialog) — Phase D4.2 NEW
 │   │                                     3-section review: event summary, timestamp, column classification
 │   │                                     Colour-coded confidence highlighting; Proceed/Cancel gate
 │   └── interaction/ __init__.py stub
@@ -359,7 +359,7 @@ Phase D3.1 COMPLETE + SignalMetadata electrical reference extension + real sampl
 CURRENT TEST STATUS
 Unit Tests — app/ (via .venv/Scripts/python.exe -m pytest tests/unit/)
 
-1014 tests PASSING (unit) (86 COMTRADE + 65 CSV + 68 Excel + 26 model + 40 provider + 28 downsampling + 39 digital_transforms + 32 visualization_manager + 19 main_window_workflow + 22 visualization_grouped_display + 15 main_window_synthetic + 12 time_alignment + 16 basic_conversions + 32 synthetic_disturbance + 11 visualization_grouping + 18 multi_source_session + 19 display_alignment + 17 display_multi_source + 13 main_window_multi_source + 31 inspect_comtrade + 27 inspect_csv_timeseries + 24 build_event_manifest + 47 column_classifier + 41 manifest_loader + 34 manifest_session_integration + 34 source_fingerprints + 33 mapping_rules + 17 timestamp_rules + 20 intelligence_manager + 14 intelligence_integration + 45 review_summary + 27 data_review_dialog + 22 manifest_review_workflow)
+1211 tests PASSING (unit) — all app/unit tests green through Phase D4.4.1 stabilization, including direct CSV/Excel intelligence, timestamp rebasing, axis display policy, runtime Qt widgets, grouped display, and visualization manager regressions.
 
 34 tests PASSING (integration) (34 test_pulu_manifest_pipeline — real sample files required; skips if absent)
 
@@ -423,23 +423,79 @@ Phase D4.2.1 CSV Runtime Display Fix + Repository Hygiene Verification: COMPLETE
   - .gitignore now protects pytest temp artifacts.
   - Remaining Windows temp permission issue assessed as environment/ACL issue, not repository defect.
 
+Phase D4.3 Robust CSV/Excel Mapping + Timestamp Interpretation: IMPLEMENTED 2026-05-11
+  Highlights:
+  - Editable column classification persistence implemented.
+  - Timestamp Interpretation Matrix implemented.
+  - Duplicate timestamp column handling implemented.
+  - Ambiguous timestamp ranking + operator confirmation implemented.
+  - Persistent timestamp rules implemented.
+  - Source fingerprint-assisted reuse implemented.
+  - Fuzzy synonym mapping improved with regex word boundaries.
+  - Numeric seconds timestamp support verified and fixed during Codex audit.
+  - CSV runtime plotting verified: System Demand, Tie-Line, Frequency all render correctly.
+  - Timestamp-derived x-axis verified.
+  - Manifest-assisted timestamp interpretation verified.
+  - COMTRADE rendering unaffected.
+
+Phase D4.4.1 Stabilization & Operational Refinement: COMPLETE 2026-05-11
+  Key points:
+  - Operator-selected timestamp interpretation is now applied.
+  - Timestamp rebasing returns a new DisturbanceRecord.
+  - waveform_data["time"] remains elapsed seconds.
+  - CSV/Excel direct open uses absolute datetime axis.
+  - COMTRADE direct open uses relative seconds axis.
+  - Direct PULU CSV verified:
+    power: System Demand, Tie-Line
+    frequency: Frequency
+  - COMTRADE verified:
+    42 analog curves
+    trigger-centered viewport
+    relative labels
+  - Full unit suite: 1211 passed.
+  - PULU manifest integration: 34 passed.
+  - Correct DataReviewDialog path for future prompts: app/ui/dialogs/data_review_dialog.py, not app/dialogs/data_review_dialog.py.
+
+Phase D4.4.2 Visualization Scaling & Panel Stabilization: COMPLETE 2026-05-11
+  Key points:
+  - Direct PULU CSV open verified in real app.main path.
+  - Power panel: System Demand + Tie-Line.
+  - Frequency panel: Frequency.
+  - Independent ViewBoxes used for large magnitude differences.
+  - Frequency y-range correctly auto-fits.
+  - CSV viewport opens full extent 0.0-3840.0.
+  - CSV x-axis shows absolute timestamp ticks.
+  - COMTRADE regression passed:
+    42 analog curves
+    88 digital channels
+    relative x-axis
+    trigger-centered viewport
+    OpenGL disabled by default
+  - Manifest regression passed:
+    34 integration tests passed
+  - Caveat:
+    Windows pytest temp ACL prevents clean full-suite shutdown in this environment.
+
 NEXT REQUIRED ACTION
 
-Phase D4.2.1 COMPLETE — CSV runtime display fix and repository hygiene verification complete.
+Phase D4.4.2 COMPLETE - visualization scaling and panel stabilization verified.
 
 Current state:
-  1014 unit tests passing — all green (app/)
+  1252 unit tests reported by implementation; local verification reached test execution but Windows pytest temp ACL prevented clean full-suite shutdown
   34 integration tests passing — real PULU data validated
   609 legacy tests passing — all green (src/)
-  Total: 1657 passing, 12 skipped
+  Total baseline remains green except for local Windows pytest temp ACL shutdown caveat
   samples/comtrade/pulu_20260306.cfg + .dat (PULU substation, 2026-03-06 fault, 5kHz, 42A + 88D + 32693 samples)
   samples/csv/pulu_20260306.csv (1-min system demand/frequency data — date format is M/D/YYYY)
   samples/manifests/pulu_20260306.yaml (alignment offset: CSV starts 39 min before COMTRADE; full column classification)
   app/data/intelligence/ — SourceFingerprint, MappingRule, TimestampRule, ConfidencePromotion, IntelligenceManager
+  app/data/direct_load_intelligence.py — direct CSV/Excel intelligence adapter, timestamp rebasing, direct-open diagnostics
+  app/data/timestamp_interpreter.py — Timestamp Interpretation Matrix with ambiguous date, epoch, Excel serial, and numeric seconds support
+  app/visualization/axis/datetime_axis.py — relative-seconds / absolute-datetime axis display policy
   config/ — column_mapping_rules.yaml, timestamp_rules.yaml, source_fingerprints.yaml (all empty, annotated)
   comtrade_provider.py: DOS EOF (\x1a) stripping + ASCII digital column fix (was using n_dwords, now uses n_digital)
 
 Next candidate actions (requires ChatGPT architecture direction):
   Option A — SynchronizationManager for multi-panel cursor coordination (Phase 3D)
   Option B — Analytics foundation: RMS overlay on raw waveform (Phase 5)
-  Option C — Editable column classification: save confirmed mapping from dialog → persistent rule (Phase D4.3)
+  Option C — Operator review workflow hardening and rule management UX (Phase D4.5 candidate)

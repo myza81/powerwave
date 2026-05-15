@@ -451,7 +451,7 @@ class TestUnitInference:
     def test_mvar_unit(self, tmp_path: Path) -> None:
         r = self._load(tmp_path, "time,MVAR", "0.0,50.0")
         ch = next(c for c in r.analog_channels if c.name == "MVAR")
-        assert ch.unit == "MVar"
+        assert ch.unit == "MVAr"
 
     def test_unknown_unit(self, tmp_path: Path) -> None:
         r = self._load(tmp_path, "time,RPM", "0.0,1500.0")

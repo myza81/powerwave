@@ -20,6 +20,58 @@ from app.data.intelligence.models import (
 
 DEFAULT_MAPPING_RULES_PATH = Path("config") / "column_mapping_rules.yaml"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Built-in synonym / variant library (Phase D4.3)
+# ─────────────────────────────────────────────────────────────────────────────
+# Maps normalised variant strings → (signal_type, unit, display_group, confidence)
+# These encode domain knowledge about common abbreviations and inconsistent labels
+# found in real operational CSV exports.
+#
+# Lower confidence than "name_exact" rules so operator-confirmed rules take priority.
+#
+# match_type "fuzzy" in MappingRule triggers lookup here.
+
+_SYNONYM_MAP: dict[str, tuple[str, str, str, float]] = {
+    # Frequency variants
+    "freq":              ("frequency",    "Hz",   "frequency", 0.90),
+    "frequency":         ("frequency",    "Hz",   "frequency", 0.95),
+    "sys freq":          ("frequency",    "Hz",   "frequency", 0.90),
+    "system frequency":  ("frequency",    "Hz",   "frequency", 0.95),
+    "sysfreq":           ("frequency",    "Hz",   "frequency", 0.88),
+    "f":                 ("frequency",    "Hz",   "frequency", 0.72),
+    "hz":                ("frequency",    "Hz",   "frequency", 0.88),
+    # Active power / demand variants
+    "system demand":     ("active_power", "MW",   "power",     0.88),
+    "sys demand":        ("active_power", "MW",   "power",     0.88),
+    "sysdem":            ("active_power", "MW",   "power",     0.85),
+    "total demand":      ("active_power", "MW",   "power",     0.88),
+    "total load":        ("active_power", "MW",   "power",     0.85),
+    "load mw":           ("active_power", "MW",   "power",     0.90),
+    "mw":                ("active_power", "MW",   "power",     0.95),
+    "active power":      ("active_power", "MW",   "power",     0.90),
+    "real power":        ("active_power", "MW",   "power",     0.90),
+    "p":                 ("active_power", "MW",   "power",     0.72),
+    # Tie-line / interchange
+    "tie-line":          ("active_power", "MW",   "power",     0.72),
+    "tieline":           ("active_power", "MW",   "power",     0.70),
+    "tie line":          ("active_power", "MW",   "power",     0.72),
+    "interchange":       ("active_power", "MW",   "power",     0.72),
+    "export":            ("active_power", "MW",   "power",     0.68),
+    "import":            ("active_power", "MW",   "power",     0.68),
+    # Reactive power
+    "reactive power":    ("reactive_power", "MVAr", "power",  0.90),
+    "mvar":              ("reactive_power", "MVAr", "power",  0.95),
+    "q":                 ("reactive_power", "MVAr", "power",  0.72),
+    # Voltage
+    "voltage":           ("voltage_rms",  "kV",   "voltage_rms", 0.80),
+    "kv":                ("voltage_rms",  "kV",   "voltage_rms", 0.90),
+    "bus voltage":       ("voltage_rms",  "pu",   "voltage_rms", 0.88),
+    # ROCOF
+    "rocof":             ("rocof",         "Hz/s", "rocof",     0.95),
+    "df/dt":             ("rocof",         "Hz/s", "rocof",     0.92),
+    "dfdt":              ("rocof",         "Hz/s", "rocof",     0.92),
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load / save
@@ -159,6 +211,9 @@ def _pattern_matches(norm: str, rule: MappingRule) -> bool:
         return norm == rule.match_pattern
     if rule.match_type == "keyword":
         return rule.match_pattern in norm
+    if rule.match_type == "fuzzy":
+        # fuzzy: try substring containment in both directions
+        return rule.match_pattern in norm or norm in rule.match_pattern
     return False
 
 
@@ -197,3 +252,44 @@ def apply_rule_to_classification(
         notes=classification.notes,
     )
     return updated, audit
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Synonym / variant lookup (Phase D4.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+import re
+
+def classify_by_synonym(
+    column_name: str,
+) -> tuple[str, str, str, float] | None:
+    """Return (signal_type, unit, display_group, confidence) from the built-in
+    synonym map, or None if no synonym matches.
+
+    Matching is exact on the normalised (lower-stripped) name first, then
+    substring — longest-match substring wins to avoid false positives.
+    Substring matching strictly enforces word boundaries to avoid 'p' in 'rpm'.
+    """
+    norm = column_name.strip().lower()
+
+    # Exact match first
+    if norm in _SYNONYM_MAP:
+        return _SYNONYM_MAP[norm]
+
+    # Substring: prefer longest key that appears as a whole word in name
+    best_key: str | None = None
+    for key in _SYNONYM_MAP:
+        # Use word boundaries so 'p' doesn't match inside 'rpm',
+        # but handle special characters carefully.
+        # \b doesn't work well with non-alphanumerics like '-', '/', so we fallback
+        # to strict containment for those if they are long enough, or just use regex.
+        pattern = rf'(?:\b|_){re.escape(key)}(?:\b|_)' if key.isalnum() else re.escape(key)
+        if key in norm and (not key.isalnum() or re.search(pattern, norm)):
+            if best_key is None or len(key) > len(best_key):
+                best_key = key
+                
+    if best_key is not None:
+        return _SYNONYM_MAP[best_key]
+
+    return None

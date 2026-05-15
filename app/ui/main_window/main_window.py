@@ -6,9 +6,17 @@ Supports two display modes:
 
 File loading runs on a QRunnable background thread.
 Grouped synthetic load runs on the UI thread (fast, <100 ms).
+
+Phase D4.4 additions:
+  Direct CSV/Excel opens run IntelligenceManager classification on the worker
+  thread, route through display_grouped_record(), and show DataReviewDialog
+  when timestamp interpretation is ambiguous or any column needs confirmation.
+  COMTRADE direct-opens preserve the existing set_record() path.
 """
 from __future__ import annotations
 
+import dataclasses
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QRunnable, QThreadPool, QObject, pyqtSignal, QTimer
@@ -20,6 +28,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 
+from app.data.intelligence import IntelligenceManager
 from app.models import DisturbanceRecord
 from app.providers import ProviderManager, ComtradeProvider, CsvProvider, ExcelProvider
 from app.visualization.managers.visualization_manager import VisualizationManager
@@ -32,6 +41,33 @@ _FILE_FILTER = (
 )
 _MANIFEST_FILTER = "Event Manifests (*.yaml *.yml);;All Files (*)"
 _SAMPLE_MANIFEST = Path("samples") / "manifests" / "pulu_20260306.yaml"
+
+_CSV_EXCEL_SUFFIXES = frozenset({".csv", ".xlsx", ".xls"})
+
+
+def _provider_type_from_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in (".cfg", ".comtrade"):
+        return "comtrade"
+    if suffix in (".xlsx", ".xls"):
+        return "excel"
+    if suffix == ".csv":
+        return "csv"
+    return suffix.lstrip(".") or "unknown"
+
+
+def _record_source_path(record: DisturbanceRecord) -> Path:
+    try:
+        source_file = record.metadata.source_file
+    except AttributeError:
+        source_file = ""
+    return Path(str(source_file or ""))
+
+
+def _is_csv_excel_record(record: DisturbanceRecord) -> bool:
+    path = _record_source_path(record)
+    provider_type = str(getattr(record.metadata, "provider_type", "") or "").lower()
+    return provider_type in {"csv", "excel"} or path.suffix.lower() in _CSV_EXCEL_SUFFIXES
 
 
 def _make_source_record(
@@ -67,6 +103,19 @@ _PANEL_ORDER = [
 ]
 
 
+def _log_direct_open_mapping(filename: str, signal_metadata: dict) -> None:
+    """Diagnostic log of channel → display group for a direct CSV/Excel open."""
+    groups = {name: m.display_group for name, m in signal_metadata.items()}
+    print(f"[D4.4] {filename}: {groups}", file=sys.stderr)
+
+
+
+
+def _log_runtime_route(message: str) -> None:
+    """Write concise runtime routing evidence for direct-open reconciliation."""
+    print(f"[D4.4.3 route] {message}", file=sys.stderr)
+
+
 def _build_provider_manager() -> ProviderManager:
     """Create a ProviderManager with all standard providers registered."""
     manager = ProviderManager()
@@ -92,25 +141,74 @@ def _format_load_status(record: DisturbanceRecord) -> str:
 
 
 class _WorkerSignals(QObject):
-    """Cross-thread signals for _LoadWorker."""
+    """Cross-thread signals for load workers."""
 
-    finished: pyqtSignal = pyqtSignal(object)  # emits DisturbanceRecord
+    finished: pyqtSignal = pyqtSignal(object)  # emits _DirectOpenResult
     error: pyqtSignal = pyqtSignal(str)         # emits error message
 
 
-class _LoadWorker(QRunnable):
-    """Loads a file on a background thread via QThreadPool."""
+@dataclasses.dataclass
+class _DirectOpenResult:
+    """Rich result from _IntelligentLoadWorker for any direct file open."""
 
-    def __init__(self, provider_manager: ProviderManager, path: Path) -> None:
+    record: DisturbanceRecord
+    path: Path
+    provider_type: str          # "comtrade", "csv", "excel"
+    signal_metadata: dict       # dict[str, SignalMetadata] — empty for COMTRADE
+    ts_ambiguous: bool
+    ts_matrices: dict           # {col_name: TimestampInterpretationMatrix}
+
+
+class _IntelligentLoadWorker(QRunnable):
+    """Loads a file and runs D4.3 intelligence classification for CSV/Excel.
+
+    For COMTRADE files, signal_metadata is empty and ambiguity flags are False.
+    For CSV/Excel, IntelligenceManager classifies each channel and detects
+    whether the timestamp column interpretation is ambiguous.
+    """
+
+    def __init__(
+        self,
+        provider_manager: ProviderManager,
+        path: Path,
+        intelligence_manager: IntelligenceManager,
+    ) -> None:
         super().__init__()
         self._manager = provider_manager
         self._path = path
+        self._intelligence = intelligence_manager
         self.signals = _WorkerSignals()
 
     def run(self) -> None:
         try:
             record = self._manager.load(self._path)
-            self.signals.finished.emit(record)
+            suffix = self._path.suffix.lower()
+            provider_type = _provider_type_from_path(self._path)
+
+            if suffix in _CSV_EXCEL_SUFFIXES:
+                from app.data.direct_load_intelligence import (
+                    build_signal_metadata,
+                    detect_timestamp_ambiguity,
+                )
+                signal_metadata = build_signal_metadata(
+                    record, self._intelligence, self._path.stem, provider_type
+                )
+                ts_ambiguous, ts_matrices = detect_timestamp_ambiguity(
+                    self._path, record
+                )
+            else:
+                signal_metadata = {}
+                ts_ambiguous = False
+                ts_matrices = {}
+
+            self.signals.finished.emit(_DirectOpenResult(
+                record=record,
+                path=self._path,
+                provider_type=provider_type,
+                signal_metadata=signal_metadata,
+                ts_ambiguous=ts_ambiguous,
+                ts_matrices=ts_matrices,
+            ))
         except Exception as exc:  # noqa: BLE001
             self.signals.error.emit(str(exc))
 
@@ -142,6 +240,7 @@ class PowerwaveMainWindow(QMainWindow):
         self.resize(1400, 900)
 
         self._provider_manager = _build_provider_manager()
+        self._intelligence_manager = IntelligenceManager()
         self._canvas = FlexiblePlotCanvas()
         self._timeline = DigitalEventTimeline()
         self._vis_manager = VisualizationManager(self._canvas, self._timeline)
@@ -173,6 +272,7 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _restore_standard_layout(self) -> None:
         """Restore the two-pane standard layout (canvas + timeline)."""
+        self._timeline.show()
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self._canvas)
         splitter.addWidget(self._timeline)
@@ -192,6 +292,11 @@ class PowerwaveMainWindow(QMainWindow):
         Panels are inserted in _PANEL_ORDER; any unrecognised groups follow.
         X-axis linking is deferred via QTimer.singleShot(0) so PyQtGraph
         scenes are fully initialised before setXLink is called.
+
+        Each panel canvas is given a minimum height (180 px) so the QSplitter
+        cannot collapse any panel to zero.  Initial splitter sizes are set
+        explicitly so all panels share space equally on first show — without
+        this the splitter may give the top panel all available space.
         """
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -204,15 +309,27 @@ class PowerwaveMainWindow(QMainWindow):
         self._panel_canvases = {}
         for i, key in enumerate(ordered_keys):
             canvas = panel_canvases[key]
+            canvas.setMinimumHeight(180)
             splitter.addWidget(canvas)
             splitter.setStretchFactor(i, 1)
             self._panel_canvases[key] = canvas
 
         self._grouped_timeline = None
         if record.digital_channels:
+            self._timeline.show()
+            self._timeline.setMinimumHeight(80)
             splitter.addWidget(self._timeline)
             splitter.setStretchFactor(len(ordered_keys), 1)
             self._grouped_timeline = self._timeline
+        else:
+            self._timeline.clear()
+            self._timeline.hide()
+
+        # Seed equal initial sizes so the splitter distributes space evenly
+        # before any window resize.  Each panel gets 300 px; Qt will scale
+        # proportionally to the real window height on the first paint event.
+        n_panels = len(ordered_keys) + (1 if record.digital_channels else 0)
+        splitter.setSizes([300] * n_panels)
 
         self.setCentralWidget(splitter)
         QTimer.singleShot(0, self._link_panel_x_axes)
@@ -222,6 +339,13 @@ class PowerwaveMainWindow(QMainWindow):
 
         Called via QTimer.singleShot(0) from _rebuild_grouped_layout to ensure
         PyQtGraph items are parented into a visible scene before setXLink.
+
+        After linking, each follower is explicitly normalized to the master's
+        exact data range.  PyQtGraph's linkedViewChanged() maps ranges via screen
+        pixel widths; panels with different secondary axis counts have different
+        primary-ViewBox widths, so the initial linked range is asymmetrically
+        stretched.  normalize_viewport() overrides that with a uniform data range
+        and re-pins Y ranges for sparse records.
         """
         if not self._panel_canvases:
             return
@@ -231,6 +355,15 @@ class PowerwaveMainWindow(QMainWindow):
             follower._primary_plot.setXLink(master._primary_plot)
         if self._grouped_timeline is not None:
             self._grouped_timeline.link_x_to(master._primary_plot)
+
+        t_start, t_end = master._primary_plot.getViewBox().viewRange()[0]
+        for canvas in canvases[1:]:
+            canvas.normalize_viewport(t_start, t_end)
+        # Re-pin Y ranges on ALL canvases after X-linking — setXLink may trigger
+        # auto-range or linkedViewChanged which can override previously pinned ranges.
+        for canvas in canvases:
+            if canvas._sparse_mode:
+                canvas._force_y_ranges()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Menu
@@ -273,19 +406,161 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _load_file(self, path: Path) -> None:
         self.statusBar().showMessage(f"Loading: {path.name} …")
-        worker = _LoadWorker(self._provider_manager, path)
+        worker = _IntelligentLoadWorker(
+            self._provider_manager, path, self._intelligence_manager
+        )
         worker.signals.finished.connect(self._on_record_loaded)
         worker.signals.error.connect(self._on_load_error)
         QThreadPool.globalInstance().start(worker)
 
-    def _on_record_loaded(self, record: DisturbanceRecord) -> None:
-        # Return to standard layout if grouped display was active
+    def _on_record_loaded(self, result: object) -> None:
+        if isinstance(result, _DirectOpenResult):
+            _log_runtime_route(
+                f"_on_record_loaded rich result provider={result.provider_type} "
+                f"path={result.path}"
+            )
+            if result.provider_type in ("csv", "excel"):
+                self._handle_direct_csv_excel(result)
+            else:
+                # COMTRADE — preserve existing set_record() behavior
+                record = result.record
+                _log_runtime_route("COMTRADE direct open -> standard set_record")
+                if self._panel_canvases:
+                    self._restore_standard_layout()
+                self._vis_manager.set_record(record)
+                self.statusBar().showMessage(_format_load_status(record))
+                title = (
+                    record.metadata.station_name
+                    or Path(record.metadata.source_file).name
+                )
+                self.setWindowTitle(f"Powerwave — {title}")
+        elif isinstance(result, DisturbanceRecord):
+            # Fallback for any legacy path that still emits a plain record
+            if _is_csv_excel_record(result):
+                _log_runtime_route(
+                    "legacy DisturbanceRecord CSV/Excel result -> grouped route"
+                )
+                self._handle_legacy_csv_excel_record(result)
+                return
+            _log_runtime_route("legacy DisturbanceRecord non-CSV result -> standard set_record")
+            if self._panel_canvases:
+                self._restore_standard_layout()
+            self._vis_manager.set_record(result)
+            self.statusBar().showMessage(_format_load_status(result))
+            title = result.metadata.station_name or Path(result.metadata.source_file).name
+            self.setWindowTitle(f"Powerwave — {title}")
+
+    def _handle_legacy_csv_excel_record(self, record: DisturbanceRecord) -> None:
+        """Route plain CSV/Excel records through the D4.4 grouped policy."""
+        from app.data.direct_load_intelligence import (
+            build_signal_metadata,
+            detect_timestamp_ambiguity,
+        )
+
+        path = _record_source_path(record)
+        provider_type = _provider_type_from_path(path)
+        if provider_type not in {"csv", "excel"}:
+            provider_type = str(record.metadata.provider_type or "csv").lower()
+        source_id = path.stem or "csv_source"
+        signal_metadata = build_signal_metadata(
+            record, self._intelligence_manager, source_id, provider_type
+        )
+        ts_ambiguous, ts_matrices = detect_timestamp_ambiguity(path, record)
+        self._handle_direct_csv_excel(_DirectOpenResult(
+            record=record,
+            path=path,
+            provider_type=provider_type,
+            signal_metadata=signal_metadata,
+            ts_ambiguous=ts_ambiguous,
+            ts_matrices=ts_matrices,
+        ))
+
+    def _handle_direct_csv_excel(self, result: _DirectOpenResult) -> None:
+        """Display a directly-opened CSV/Excel file with intelligence-driven grouping.
+
+        Shows DataReviewDialog when the timestamp interpretation is ambiguous or
+        any column requires operator confirmation. Auto-applies for clean data.
+        Applies the operator-selected timestamp format to rebase start_time before
+        visualization, and renders with absolute datetime axis labels.
+        """
+        from PyQt6.QtWidgets import QDialog
+        from app.data.direct_load_intelligence import (
+            apply_selected_timestamp_format,
+            build_direct_open_diagnostics,
+            log_direct_open_diagnostics,
+        )
+        from app.data.multi_source_session import MultiSourceSession, SourceRecord
+        from app.data.review_summary import build_event_review_summary
+        from app.ui.dialogs.data_review_dialog import DataReviewDialog
+
+        record = result.record
+        source_id = result.path.stem or "csv_source"
+        signal_metadata: dict = result.signal_metadata
+        selected_formats: dict[str, str] = {}
+        _log_runtime_route(
+            f"_handle_direct_csv_excel executing provider={result.provider_type} "
+            f"path={result.path}"
+        )
+
+        needs_review = result.ts_ambiguous or any(
+            m.requires_user_confirmation for m in signal_metadata.values()
+        )
+
+        if needs_review:
+            source = SourceRecord(
+                source_id=source_id,
+                provider_type=result.provider_type,
+                record=record,
+                signal_metadata=signal_metadata,
+                original_start_time=record.timing_info.start_time,
+                sampling_rates=list(record.sampling_info.sampling_rates),
+            )
+            session = MultiSourceSession()
+            session.add_source(source)
+            summary = build_event_review_summary(session)
+            ts_matrices = {source_id: result.ts_matrices} if result.ts_matrices else {}
+            dlg = DataReviewDialog(summary, ts_matrices=ts_matrices, parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self.statusBar().showMessage("Load cancelled.")
+                return
+            selected_formats = dlg.selected_timestamp_formats.get(source_id, {})
+
+        # Apply operator-selected timestamp format (rebases start_time only)
+        if selected_formats:
+            record = apply_selected_timestamp_format(
+                record, result.ts_matrices, selected_formats
+            )
+
+        axis_mode = "absolute_datetime"
+
+        diag = build_direct_open_diagnostics(
+            source_path=str(result.path),
+            provider_type=result.provider_type,
+            signal_metadata=signal_metadata,
+            ts_matrices=result.ts_matrices,
+            selected_formats=selected_formats,
+            axis_mode=axis_mode,
+        )
+        log_direct_open_diagnostics(diag)
+
         if self._panel_canvases:
             self._restore_standard_layout()
-        self._vis_manager.set_record(record)
+
+        panel_canvases = self._vis_manager.display_grouped_record(
+            record, signal_metadata or None, axis_mode=axis_mode
+        )
+        _log_runtime_route(
+            f"display_grouped_record returned panels={list(panel_canvases.keys())}"
+        )
+        if not panel_canvases:
+            raise RuntimeError(
+                "CSV/Excel direct open produced no grouped panels; refusing "
+                "to fall back to the standard analog/digital splitter."
+            )
+        self._rebuild_grouped_layout(panel_canvases, record)
+
         self.statusBar().showMessage(_format_load_status(record))
-        title = record.metadata.station_name or Path(record.metadata.source_file).name
-        self.setWindowTitle(f"Powerwave — {title}")
+        self.setWindowTitle(f"Powerwave — {source_id}")
 
     def _on_load_error(self, message: str) -> None:
         self.statusBar().showMessage(f"Error: {message}")

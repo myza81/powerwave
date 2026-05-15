@@ -15,6 +15,7 @@ from app.data.intelligence.models import (
     ConfidencePromotion,
     MappingRule,
     SourceFingerprint,
+    TimestampColumnCandidate,
     TimestampRule,
 )
 from app.data.intelligence.fingerprints import (
@@ -24,12 +25,14 @@ from app.data.intelligence.fingerprints import (
 )
 from app.data.intelligence.mapping_rules import (
     apply_rule_to_classification,
+    classify_by_synonym,
     find_matching_rule,
     load_mapping_rules,
     save_mapping_rules,
 )
 from app.data.intelligence.timestamp_rules import (
     find_matching_timestamp_rule,
+    find_matching_timestamp_rule_for_column,
     load_timestamp_rules,
     save_timestamp_rules,
 )
@@ -39,15 +42,18 @@ __all__ = [
     "ConfidencePromotion",
     "MappingRule",
     "SourceFingerprint",
+    "TimestampColumnCandidate",
     "TimestampRule",
     "build_fingerprint_from_columns",
     "build_fingerprint_from_record",
     "fingerprints_match",
     "apply_rule_to_classification",
+    "classify_by_synonym",
     "find_matching_rule",
     "load_mapping_rules",
     "save_mapping_rules",
     "find_matching_timestamp_rule",
+    "find_matching_timestamp_rule_for_column",
     "load_timestamp_rules",
     "save_timestamp_rules",
 ]

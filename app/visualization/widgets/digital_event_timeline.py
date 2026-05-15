@@ -41,7 +41,7 @@ class DigitalEventTimeline(pg.PlotWidget):
     and zooming stay synchronized.  Trigger line and movable cursor are
     provided for Phase 3B integration.
 
-    pg.setConfigOptions(useOpenGL=True, ...) must be called in app/main.py
+    pg.setConfigOptions(...) must be called in app/main.py
     before this widget is instantiated — NOT in this constructor.
     """
 

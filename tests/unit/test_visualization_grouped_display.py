@@ -171,7 +171,7 @@ class TestDisplayGroupedRecord:
 
         def factory() -> MagicMock:
             m = MagicMock()
-            m.set_record.side_effect = lambda r: received_records.append(r)
+            m.set_record.side_effect = lambda r, **kw: received_records.append(r)
             return m
 
         mgr.display_grouped_record(result.record, result.signal_metadata, canvas_factory=factory)
@@ -214,5 +214,5 @@ class TestDisplayGroupedRecord:
         )
         record2 = MagicMock()
         mgr.set_record(record2)
-        canvas.set_record.assert_called_once_with(record2)
+        canvas.set_record.assert_called_once_with(record2, axis_mode="relative_seconds")
         timeline.set_record.assert_called_once_with(record2)

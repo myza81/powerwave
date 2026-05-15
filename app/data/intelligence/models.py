@@ -3,6 +3,10 @@
 These frozen dataclasses carry rule definitions and audit trails.
 They are never stored inside DisturbanceRecord or SignalMetadata —
 those remain locked data contracts.
+
+Phase D4.3 additions:
+  TimestampColumnCandidate — scoring result for duplicate timestamp column evaluation
+  TimestampRule            — extended with timestamp_column, timezone, column_fingerprint
 """
 from __future__ import annotations
 
@@ -60,12 +64,21 @@ class TimestampRule:
 
     Once an operator confirms how an ambiguous date column should be parsed,
     that interpretation is stored here for future reuse by similar sources.
+
+    Phase D4.3 additions:
+      timestamp_column:    Optional name of the specific timestamp column this rule applies to.
+                           When set, only that column is matched within the source.
+      timezone:            Optional IANA timezone string (e.g. "Asia/Kuala_Lumpur").
+      column_fingerprint:  Optional column-set signature for tighter source matching.
     """
 
     source_pattern: str           # descriptive tag or fingerprint key (case-insensitive)
     date_format: str              # chosen format: "M/D/YYYY" | "D/M/YYYY" | "ISO8601" …
     ambiguous_resolution: str     # same value — records the resolution rationale
     confirmed_by_operator: bool
+    timestamp_column: str | None = None     # optional: column name within the source
+    timezone: str | None = None             # optional: IANA timezone string
+    column_fingerprint: str | None = None   # optional: column-set SHA-256 prefix
     notes: str | None = None
 
 
@@ -82,3 +95,32 @@ class ConfidencePromotion:
     original_inferred_from: str
     promoted_inferred_from: str       # always "persistent_mapping_rule"
     rule_match_pattern: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TimestampColumnCandidate:
+    """Scoring result for one duplicate-timestamp column candidate.
+
+    Used during duplicate-column resolution to rank which of several
+    time-like columns (e.g. "Time", "Time.1") is the best timestamp source.
+
+    Scoring factors mirror the D4.3 specification:
+      parse_success_rate: fraction of values that parsed cleanly
+      is_monotonic:       True when parsed series is monotonically increasing
+      finite_ratio:       fraction of values that are finite (non-NaN/Inf)
+      missing_ratio:      fraction of rows that are null/empty
+      interval_score:     regularity of time steps (0=irregular, 1=uniform)
+      overlap_score:      normalised overlap with COMTRADE/manifest event window
+      confirmed_by_rule:  True when a persistent operator rule designated this col
+    """
+
+    column_name: str
+    parse_success_rate: float       # 0.0 – 1.0
+    is_monotonic: bool
+    finite_ratio: float             # 0.0 – 1.0
+    missing_ratio: float            # 0.0 – 1.0 (lower is better)
+    interval_score: float           # 0.0 – 1.0 (higher = more uniform)
+    overlap_score: float            # 0.0 – 1.0 (higher = closer to event window)
+    confirmed_by_rule: bool         # from persistent TimestampRule
+    total_score: float              # weighted aggregate of all factors
+    rejection_reason: str | None = None   # set when candidate should be skipped

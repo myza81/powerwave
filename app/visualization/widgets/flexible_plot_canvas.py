@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
 from app.models import AnalogChannel, DisturbanceRecord
+from app.visualization.axis.datetime_axis import (
+    AXIS_MODE_ABSOLUTE,
+    AXIS_MODE_RELATIVE,
+    DatetimeAxisItem,
+)
 from app.visualization.managers.multi_axis_manager import MultiAxisManager
 from app.visualization.rendering.downsampling import decimate_for_display
 
@@ -96,7 +101,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
     Digital channels are NOT rendered here — they belong to DigitalEventTimeline
     (Phase 3B). See VIEWPORT_RENDERING_POLICY §17 and VISUALIZATION_CONTRACT.md.
 
-    pg.setConfigOptions(useOpenGL=True, ...) must be called in app/main.py before
+    pg.setConfigOptions(...) must be called in app/main.py before
     this widget is instantiated — NOT in this constructor.
     """
 
@@ -117,28 +122,52 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._data_cache: dict[str, np.ndarray] = {}
         self._sparse_mode = False
 
+        self._resize_pending = False
         self._cursor: pg.InfiniteLine | None = None
         self._trigger_line: pg.InfiniteLine | None = None
 
-        self._primary_plot: pg.PlotItem = self.addPlot(row=0, col=0)
+        self._datetime_axis = DatetimeAxisItem(orientation="bottom")
+        self._primary_plot: pg.PlotItem = self.addPlot(
+            row=0, col=0, axisItems={"bottom": self._datetime_axis}
+        )
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
-        self._primary_plot.setLabel("bottom", "Time", units="s")
+        self._primary_plot.setLabel("bottom", "Time")
 
         self._axis_manager = MultiAxisManager(self._primary_plot, self)
 
         self._primary_plot.getViewBox().sigXRangeChanged.connect(
             self._on_x_range_changed
         )
+        # Refresh viewport (data + Y ranges) once the canvas is first shown
+        # and sized in a real layout.  sigResized fires after _sync_geometries
+        # so secondary ViewBox geometry is already correct by the time we run.
+        self._primary_plot.getViewBox().sigResized.connect(
+            self._on_plot_resized
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
     # ─────────────────────────────────────────────────────────────────────────
 
-    def set_record(self, record: DisturbanceRecord) -> None:
-        """Load a DisturbanceRecord. Build N-Axis layout. Zoom to trigger."""
-        self.clear()
+    def set_record(
+        self,
+        record: DisturbanceRecord,
+        *,
+        axis_mode: str = AXIS_MODE_RELATIVE,
+    ) -> None:
+        """Load a DisturbanceRecord. Build N-Axis layout. Zoom to trigger.
+
+        Args:
+            record:    The waveform record to render.
+            axis_mode: AXIS_MODE_RELATIVE (default) — elapsed-seconds labels;
+                       AXIS_MODE_ABSOLUTE — wall-clock datetime labels.
+        """
+        self._clear_canvas()
 
         self._record = record
+        self._datetime_axis.set_start_time(
+            record.timing_info.start_time if axis_mode == AXIS_MODE_ABSOLUTE else None
+        )
 
         # Cache numpy arrays once — avoids per-frame DataFrame access in _update_viewport
         self._time_cache = record.waveform_data["time"].to_numpy(dtype=np.float64)
@@ -165,6 +194,10 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._add_cursor()
         self.zoom_to_trigger()
         self._update_viewport()
+        # For sparse records the full dataset is always in-viewport, so pinning
+        # Y ranges from the raw data cache is both correct and stable.
+        if self._sparse_mode:
+            self._force_y_ranges()
 
     def add_parameter(
         self,
@@ -274,29 +307,41 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             self._cursor.setValue(t)
             self._cursor.blockSignals(False)
 
-    def clear(self) -> None:
-        """Remove all parameters, cursor, and trigger line. Reset to blank state."""
-        # Disconnect old manager's geometry sync before rebuilding
+    def _clear_canvas(self) -> None:
+        """Remove all parameters, cursor, and trigger line. Reset to blank state.
+
+        Named _clear_canvas (not clear) to avoid shadowing: pg.GraphicsLayoutWidget
+        .__init__ sets self.clear = self.ci.clear (GraphicsLayout.clear), which would
+        strip the PlotItem from the layout and scene if called.
+        """
+        vb = self._primary_plot.getViewBox()
+
+        # Disconnect both resize handlers before rebuilding so we can re-establish
+        # the correct firing order: _sync_geometries must fire BEFORE _on_plot_resized
+        # so that secondary ViewBox geometry is current when _update_viewport runs.
         try:
-            self._primary_plot.getViewBox().sigResized.disconnect(
-                self._axis_manager._sync_geometries
-            )
+            vb.sigResized.disconnect(self._axis_manager._sync_geometries)
+        except TypeError:
+            pass
+        try:
+            vb.sigResized.disconnect(self._on_plot_resized)
         except TypeError:
             pass
 
-        # Clear all secondary ViewBoxes/axes managed by the axis manager
         self._axis_manager.clear()
-
-        # Clear curves and InfiniteLines from the primary plot
         self._primary_plot.clear()
 
         # Restore primary plot appearance (clear() strips labels and grid)
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
-        self._primary_plot.setLabel("bottom", "Time", units="s")
+        self._primary_plot.setLabel("bottom", "Time")
+        self._datetime_axis.set_start_time(None)
 
-        # Fresh axis manager
+        # Fresh axis manager — its __init__ connects _sync_geometries FIRST
         self._axis_manager = MultiAxisManager(self._primary_plot, self)
+        # Reconnect _on_plot_resized AFTER _sync_geometries
+        vb.sigResized.connect(self._on_plot_resized)
 
+        self._resize_pending = False
         self._record = None
         self._time_cache = np.empty(0, dtype=np.float64)
         self._data_cache.clear()
@@ -335,6 +380,54 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
     ) -> None:
         t_start, t_end = x_range
         self._update_viewport(t_start, t_end)
+
+    def normalize_viewport(self, t_start: float, t_end: float) -> None:
+        """Force this canvas to the specified X range and re-pin Y ranges.
+
+        Called by the main window after inter-panel X linking to override the
+        pixel-width–based range that PyQtGraph's linkedViewChanged computes
+        when panels have different secondary axis counts.  For sparse records,
+        _force_y_ranges() is also called to prevent auto-range drift.
+        """
+        self._primary_plot.setXRange(t_start, t_end, padding=0)
+        if self._sparse_mode:
+            self._force_y_ranges()
+
+    def _on_plot_resized(self) -> None:
+        if not self._resize_pending:
+            self._resize_pending = True
+            QTimer.singleShot(0, self._deferred_resize_update)
+
+    def _deferred_resize_update(self) -> None:
+        """Runs after GraphicsView.resizeEvent() fully completes."""
+        self._resize_pending = False
+        vb = self._primary_plot.getViewBox()
+        vb._matrixNeedsUpdate = True
+        vb.updateMatrix()
+        for secondary_vb in self._axis_manager.get_viewboxes():
+            secondary_vb._matrixNeedsUpdate = True
+            secondary_vb.updateMatrix()
+        self._update_viewport()
+        if self._sparse_mode:
+            self._force_y_ranges()
+        vp = self.viewport()
+        if vp is not None:
+            vp.update()
+
+    def _force_y_ranges(self) -> None:
+        """Pin each ViewBox's Y range to its channel's full-data extent.
+
+        Used for sparse-mode records where the full dataset is always in the
+        viewport.  Computes the range from the raw data cache rather than from
+        decimated viewport data, so the range is stable regardless of when this
+        is called relative to the first viewport update.
+        """
+        for name, entry in self._axis_manager._axes.items():
+            if name not in self._data_cache:
+                continue
+            y_range = _finite_y_range(self._data_cache[name])
+            if y_range is not None:
+                entry.viewbox.setYRange(y_range[0], y_range[1], padding=0)
 
     def _update_viewport(
         self,

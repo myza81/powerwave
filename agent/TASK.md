@@ -363,6 +363,18 @@ error handling philosophy
 DisturbanceRecord construction checklist
 performance mandates
 
+Documentation Cleanup
+
+Status: NOT STARTED
+Priority: HIGH
+
+Scope:
+- Update visualization/OpenGL documentation to reflect current runtime policy:
+  - OpenGL is now DISABLED by default for stability.
+  - OpenGL can be enabled explicitly via:
+        POWERWAVE_USE_OPENGL=1
+  - Remove outdated statements claiming OpenGL is required.
+
 DOCUMENTATION TASKS (continued)
 SKILL_comtrade_parser.md Consolidation
 

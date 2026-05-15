@@ -59,7 +59,7 @@ class TestSetRecord:
         mgr, canvas, _ = _make_manager()
         record = MagicMock()
         mgr.set_record(record)
-        canvas.set_record.assert_called_once_with(record)
+        canvas.set_record.assert_called_once_with(record, axis_mode="relative_seconds")
 
     def test_timeline_set_record_called(self) -> None:
         mgr, _, timeline = _make_manager()
