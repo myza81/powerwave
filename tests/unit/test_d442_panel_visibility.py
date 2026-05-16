@@ -34,6 +34,7 @@ from app.models.channels import AnalogChannel
 from app.models.metadata import RecordingMetadata
 from app.models.timing import SamplingInformation, TimingInformation
 from app.visualization.axis.datetime_axis import AXIS_MODE_ABSOLUTE, AXIS_MODE_RELATIVE
+from app.visualization.axis_management import AxisDisplayMode
 from app.visualization.widgets.flexible_plot_canvas import (
     _finite_y_range,
     _is_sparse_timeseries,
@@ -379,9 +380,9 @@ class TestSparseViewBoxRanges:
 
 
 class TestMultiMagnitudeIndependence:
-    """System Demand (~18700 MW) and Tie-Line (~100 MW) must have non-overlapping Y ranges."""
+    """System Demand and Tie-Line remain visible with shared-axis defaults."""
 
-    def test_viewboxes_are_different_objects(self, qapp) -> None:
+    def test_viewboxes_share_power_axis_by_default(self, qapp) -> None:
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 
         record = _make_sparse_record({"System Demand": _SYSTEM_DEMAND, "Tie-Line": _TIE_LINE})
@@ -393,12 +394,13 @@ class TestMultiMagnitudeIndependence:
             curves = canvas._axis_manager.get_curves()
             sd_vb = curves["System Demand"].getViewBox()
             tl_vb = curves["Tie-Line"].getViewBox()
-            assert sd_vb is not tl_vb
+            assert sd_vb is tl_vb
+            assert canvas._axis_manager.axis_count() == 1
         finally:
             canvas.close()
             qapp.processEvents()
 
-    def test_system_demand_y_range_does_not_overlap_tie_line_range(self, qapp) -> None:
+    def test_shared_power_y_range_covers_both_mw_signals(self, qapp) -> None:
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 
         record = _make_sparse_record({"System Demand": _SYSTEM_DEMAND, "Tie-Line": _TIE_LINE})
@@ -411,17 +413,14 @@ class TestMultiMagnitudeIndependence:
             sd_lo, sd_hi = curves["System Demand"].getViewBox().viewRange()[1]
             tl_lo, tl_hi = curves["Tie-Line"].getViewBox().viewRange()[1]
 
-            # These ranges must NOT overlap: System Demand is ~18000–18800, Tie-Line is ~50–120
-            assert sd_lo > tl_hi or tl_lo > sd_hi, (
-                f"System Demand [{sd_lo:.0f}, {sd_hi:.0f}] and "
-                f"Tie-Line [{tl_lo:.0f}, {tl_hi:.0f}] unexpectedly overlap — "
-                "independent Y axes are not working"
-            )
+            assert (sd_lo, sd_hi) == (tl_lo, tl_hi)
+            assert sd_lo < min(_TIE_LINE)
+            assert sd_hi > max(_SYSTEM_DEMAND)
         finally:
             canvas.close()
             qapp.processEvents()
 
-    def test_system_demand_range_in_18000_mw_band(self, qapp) -> None:
+    def test_shared_power_range_includes_system_demand_band(self, qapp) -> None:
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 
         record = _make_sparse_record({"System Demand": _SYSTEM_DEMAND, "Tie-Line": _TIE_LINE})
@@ -432,14 +431,13 @@ class TestMultiMagnitudeIndependence:
 
             sd_vb = canvas._axis_manager.get_curves()["System Demand"].getViewBox()
             y_lo, y_hi = sd_vb.viewRange()[1]
-            # System Demand must be near 18000 MW, not near 0 or 100 MW
-            assert y_lo > 1000.0, f"System Demand lower bound {y_lo:.0f} unexpectedly low"
             assert y_hi < 25000.0, f"System Demand upper bound {y_hi:.0f} unexpectedly high"
+            assert y_hi > max(_SYSTEM_DEMAND), f"System Demand upper bound {y_hi:.0f} too low"
         finally:
             canvas.close()
             qapp.processEvents()
 
-    def test_tie_line_range_in_100_mw_band(self, qapp) -> None:
+    def test_shared_power_range_includes_tie_line_band(self, qapp) -> None:
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 
         record = _make_sparse_record({"System Demand": _SYSTEM_DEMAND, "Tie-Line": _TIE_LINE})
@@ -450,10 +448,32 @@ class TestMultiMagnitudeIndependence:
 
             tl_vb = canvas._axis_manager.get_curves()["Tie-Line"].getViewBox()
             y_lo, y_hi = tl_vb.viewRange()[1]
-            # Tie-Line must be near 50–120 MW
             assert y_lo < 200.0, f"Tie-Line lower bound {y_lo:.0f} unexpectedly high"
-            assert y_hi < 500.0, f"Tie-Line upper bound {y_hi:.0f} unexpectedly high"
-            assert y_lo > -500.0, f"Tie-Line lower bound {y_lo:.0f} unexpectedly negative"
+            assert y_lo < min(_TIE_LINE), f"Tie-Line lower bound {y_lo:.0f} too high"
+        finally:
+            canvas.close()
+            qapp.processEvents()
+
+    def test_dedicated_axis_mode_preserves_independent_mw_viewboxes(self, qapp) -> None:
+        from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
+
+        record = _make_sparse_record({"System Demand": _SYSTEM_DEMAND, "Tie-Line": _TIE_LINE})
+        canvas = FlexiblePlotCanvas(axis_display_mode=AxisDisplayMode.DEDICATED)
+        try:
+            canvas.set_record(record, axis_mode=AXIS_MODE_ABSOLUTE)
+            qapp.processEvents()
+
+            curves = canvas._axis_manager.get_curves()
+            sd_vb = curves["System Demand"].getViewBox()
+            tl_vb = curves["Tie-Line"].getViewBox()
+            assert sd_vb is not tl_vb
+
+            sd_lo, sd_hi = sd_vb.viewRange()[1]
+            tl_lo, tl_hi = tl_vb.viewRange()[1]
+            assert sd_lo > 1000.0
+            assert sd_hi < 25000.0
+            assert tl_lo > -500.0
+            assert tl_hi < 500.0
         finally:
             canvas.close()
             qapp.processEvents()

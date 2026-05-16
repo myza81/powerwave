@@ -77,9 +77,9 @@ _FREQUENCY     = [50.02, 50.02, 50.01, 49.98, 49.99,
 
 
 class TestPowerPanelYRangeDiagnosis:
-    """Confirm that System Demand and Tie-Line each have independent, correct Y ranges."""
+    """Confirm that System Demand and Tie-Line share a visible power axis by default."""
 
-    def test_system_demand_and_tie_line_use_independent_viewboxes(self, qapp) -> None:
+    def test_system_demand_and_tie_line_share_power_viewbox_by_default(self, qapp) -> None:
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 
         record = _make_sparse_record({"System Demand": _SYSTEM_DEMAND, "Tie-Line": _TIE_LINE})
@@ -92,11 +92,11 @@ class TestPowerPanelYRangeDiagnosis:
             sd_vb = curves["System Demand"].getViewBox()
             tl_vb = curves["Tie-Line"].getViewBox()
 
-            # They must use DIFFERENT ViewBoxes (independent Y axes)
-            assert sd_vb is not tl_vb, (
-                "System Demand and Tie-Line share the same ViewBox — "
-                "they cannot have independent Y ranges"
-            )
+            assert sd_vb is tl_vb
+            assert canvas._axis_manager.axis_count() == 1
+            y_lo, y_hi = sd_vb.viewRange()[1]
+            assert y_lo < min(_TIE_LINE)
+            assert y_hi > max(_SYSTEM_DEMAND)
         finally:
             canvas.close()
             qapp.processEvents()

@@ -15,6 +15,9 @@ Covers:
 """
 from __future__ import annotations
 
+from pathlib import Path
+from uuid import uuid4
+
 import pytest
 
 from app.data.intelligence import IntelligenceManager
@@ -148,8 +151,11 @@ class TestFuzzyMatchType:
 class TestIntelligenceManagerSynonymFallback:
     """IntelligenceManager.classify_column synonym integration tests."""
 
-    def setup_method(self):
-        self.mgr = IntelligenceManager()
+    @pytest.fixture(autouse=True)
+    def _isolated_rules(self):
+        self.mgr = IntelligenceManager(
+            mapping_rules_path=Path("agent") / f"test_empty_rules_{uuid4().hex}.yaml"
+        )
 
     def test_system_demand_classified(self):
         """'System Demand' must be classified as active_power via synonym."""
@@ -187,9 +193,10 @@ class TestIntelligenceManagerSynonymFallback:
         assert cls_sysdem.signal_type == "active_power"
         assert cls_sysdem.inferred_from == "synonym_match"
 
-    def test_confirmed_rule_takes_priority_over_synonym(self, tmp_path):
+    def test_confirmed_rule_takes_priority_over_synonym(self):
         """A confirmed persistent rule should override the synonym result."""
-        mgr = IntelligenceManager(mapping_rules_path=tmp_path / "rules.yaml")
+        rules_path = Path("agent") / f"test_mapping_rules_{uuid4().hex}.yaml"
+        mgr = IntelligenceManager(mapping_rules_path=rules_path)
         # Save a rule that maps "sys demand" to reactive_power (deliberately wrong, for test)
         from app.data.intelligence.mapping_rules import save_mapping_rules
         rule = MappingRule(
@@ -201,11 +208,14 @@ class TestIntelligenceManagerSynonymFallback:
             confidence=0.99,
             confirmed_by_operator=True,
         )
-        save_mapping_rules([rule], tmp_path / "rules.yaml")
-        mgr2 = IntelligenceManager(mapping_rules_path=tmp_path / "rules.yaml")
-        cls, audit = mgr2.classify_column("sys demand")
-        assert cls.signal_type == "reactive_power"  # rule wins
-        assert audit is not None  # persistent rule → audit returned
+        try:
+            save_mapping_rules([rule], rules_path)
+            mgr2 = IntelligenceManager(mapping_rules_path=rules_path)
+            cls, audit = mgr2.classify_column("sys demand")
+            assert cls.signal_type == "reactive_power"  # rule wins
+            assert audit is not None  # persistent rule -> audit returned
+        finally:
+            rules_path.unlink(missing_ok=True)
 
     def test_base_classifier_result_preserved_when_no_synonym(self):
         """Unknown column with no synonym should return base classifier result."""
