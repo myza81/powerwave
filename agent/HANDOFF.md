@@ -3278,3 +3278,102 @@ Powerwave (app/analytics/rms/):
 ### Next Recommended Step
 Phase 5C — Frequency/ROCOF analytics overlay, or incremental testing with real
 COMTRADE data against the engineering scaling layer.
+
+## 2026-05-16 — Phase 5C: Frequency & ROCOF Analytics Integration
+
+### Agent
+Claude Code (claude-sonnet-4-6)
+
+### Task
+Implement provider-neutral frequency/ROCOF analytics integration for Powerwave.
+No waveform-derived frequency estimation — display/overlay support for existing
+frequency and ROCOF channels from CSV, COMTRADE, PMU, and SCADA telemetry only.
+
+### Completed
+- Created app/analytics/frequency/frequency_models.py
+    FrequencyDisplayMode (OFF/OVERLAY/PANEL_ONLY), FrequencyChannelRole (FREQUENCY/ROCOF/UNKNOWN),
+    FrequencyChannelResult (frozen: role, reason, auto_classified, display_unit), FrequencyConfig
+- Created app/analytics/frequency/frequency_overlay.py
+    classify_frequency_role() — 5-level priority chain:
+      operator_override > measurement_kind > electrical_type > unit heuristics > name heuristics
+    is_frequency_channel(), is_rocof_channel() convenience helpers
+    ROCOF name fragments checked before frequency fragments (ROCOF is more specific)
+    Display units: FREQUENCY → "Hz", ROCOF → "Hz/s", UNKNOWN → None; never kHz/scientific
+- Created app/analytics/frequency/rocof_overlay.py
+    classify_rocof(), rocof_display_label(), rocof_axis_label()
+    frequency_display_label(), frequency_axis_label()
+    ROCOF_DISPLAY_UNIT = "Hz/s", FREQUENCY_DISPLAY_UNIT = "Hz" (constants)
+- Created app/analytics/frequency/frequency_registry.py
+    FrequencyRegistry — mutable session holder:
+      classify(), is_frequency(), is_rocof(), is_frequency_or_rocof()
+      frequency_channels(), rocof_channels() — bulk filtering from name lists
+      frequency_panel_keys() — matches "frequency"/"rocof" and "{source_id}/frequency" etc.
+      set_display_mode(), set_config(), clear_cache(), cached_roles
+- Updated app/analytics/frequency/__init__.py — full public exports
+- Updated app/ui/main_window/main_window.py
+    Import FrequencyDisplayMode, FrequencyRegistry
+    State: _frequency_registry, _frequency_display_mode_actions
+    Tools → Frequency Display menu (Panel Only / Overlay / Off, QActionGroup exclusive)
+    _on_frequency_display_mode_changed() handler + _apply_frequency_display_mode()
+    _apply_frequency_display_mode(): shows/hides panel canvases via frequency_panel_keys()
+- Created tests/unit/test_frequency_classification.py — 57 tests
+    Name heuristics (frequency + ROCOF), unknown channels, unit-based classification,
+    SignalMetadata.electrical_type + measurement_kind override, force_role operator override,
+    display unit enforcement, is_frequency_channel/is_rocof_channel helpers
+- Created tests/unit/test_frequency_display.py — 71 tests
+    FrequencyDisplayMode enum, FrequencyChannelRole enum, FrequencyChannelResult frozen,
+    FrequencyRegistry (mode, classify, cache, bulk helpers, panel keys),
+    Shared-axis grouping (frequency→Hz, ROCOF→Hz/s, never merged),
+    Frequency/ROCOF never share axis with voltage/current/power,
+    Engineering unit display (Hz, Hz/s, never kHz), display label helpers,
+    Panel title formatting for "frequency"/"rocof" groups
+- Created tests/unit/test_frequency_visualization.py — 69 tests
+    Channel grouper routes frequency/ROCOF correctly, metadata display_group override,
+    RMS ineligibility for all frequency/ROCOF channel patterns,
+    FrequencyRegistry bulk helpers with DisturbanceRecord channels,
+    FrequencyConfig 50/60 Hz, classify_rocof helper,
+    Signal visibility preserves frequency channels,
+    Display mode OFF does not affect classification,
+    Multi-source panel key detection (direct + "{source_id}/..." keys)
+
+### Files Modified
+- app/analytics/frequency/__init__.py           (replaced stub — NEW content)
+- app/analytics/frequency/frequency_models.py   (NEW)
+- app/analytics/frequency/frequency_overlay.py  (NEW)
+- app/analytics/frequency/rocof_overlay.py      (NEW)
+- app/analytics/frequency/frequency_registry.py (NEW)
+- app/ui/main_window/main_window.py             (import + state + menu + 2 handlers)
+- tests/unit/test_frequency_classification.py   (NEW)
+- tests/unit/test_frequency_display.py          (NEW)
+- tests/unit/test_frequency_visualization.py    (NEW)
+
+### Architecture Impact
+- New app/analytics/frequency/ package established; same structural pattern as app/analytics/rms/
+- No changes to FlexiblePlotCanvas, VisualizationManager, or SynchronizationManager
+- Frequency/ROCOF channels continue to render as standard analog channels inside their dedicated panels
+- axis_management.py already grouped frequency:hz and rocof:hz/s correctly — confirmed by tests
+- engineering_display.py already enforces Hz/Hz/s fixed units — confirmed by tests
+- RMS eligibility already excludes frequency/ROCOF — confirmed by tests
+- FrequencyRegistry.frequency_panel_keys() is the extension point for showing/hiding panels
+
+### Performance Impact
+- Zero per-frame cost: FrequencyRegistry is classification+metadata only; no waveform computation
+- Classification cache avoids repeated heuristic evaluation across canvas redraws
+- _apply_frequency_display_mode() calls setVisible() on panels — O(panel count), negligible
+
+### Risks / Concerns
+- FrequencyDisplayMode.OVERLAY: currently behaves identically to PANEL_ONLY (cross-panel
+  secondary-axis overlay deferred). Documented in frequency_models.py docstring.
+- No runtime Qt tests added for frequency display mode switching (no new Qt rendering paths).
+  Signal Browser visibility toggling is already tested in test_runtime_qt_widgets.py.
+- Waveform-derived frequency estimation (PLL, zero-crossing, DFT, ROCOF from waveform) is
+  explicitly NOT implemented — deferred to Phase 5D or later per specification.
+
+### Test Results
+  197 new Phase 5C tests: all passing
+  Full unit test suite: 2349 passed, 12 skipped, 0 failures
+
+### Next Recommended Step
+Phase 5D — Waveform-derived frequency estimation (zero-crossing, DFT tracking, ROCOF from
+waveform derivative), OR commit current accumulated state to git and move to Phase 6 (Harmonic
+Analysis Foundation / Phasor Hooks).

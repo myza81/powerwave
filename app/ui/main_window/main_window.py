@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
 )
 
+from app.analytics.frequency import FrequencyDisplayMode, FrequencyRegistry
 from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode, RMSWindowMode
 from app.analytics.scaling import EngineeringScalingMode, GlobalScalingConfig, ScalingRegistry
 
@@ -271,6 +272,9 @@ class PowerwaveMainWindow(QMainWindow):
         self._scaling_mode: EngineeringScalingMode = EngineeringScalingMode.RAW
         self._scaling_registry: ScalingRegistry = ScalingRegistry()
         self._scaling_mode_actions: dict[EngineeringScalingMode, object] = {}
+        # Frequency/ROCOF display state (Phase 5C)
+        self._frequency_registry: FrequencyRegistry = FrequencyRegistry()
+        self._frequency_display_mode_actions: dict[FrequencyDisplayMode, object] = {}
         self._signal_browser = SignalBrowserDock(self)
         self._signal_entry_targets: dict[str, tuple[str, str, str]] = {}
 
@@ -654,6 +658,26 @@ class PowerwaveMainWindow(QMainWindow):
         tools_menu.addAction("Scaling &Configuration…").triggered.connect(
             self._on_scaling_config
         )
+
+        tools_menu.addSeparator()
+        freq_disp_menu = tools_menu.addMenu("&Frequency Display")
+        freq_disp_group = QActionGroup(self)
+        freq_disp_group.setExclusive(True)
+
+        _freq_disp_items = [
+            ("&Panel Only (default)", FrequencyDisplayMode.PANEL_ONLY),
+            ("&Overlay",              FrequencyDisplayMode.OVERLAY),
+            ("O&ff",                  FrequencyDisplayMode.OFF),
+        ]
+        for label, fmode in _freq_disp_items:
+            action = freq_disp_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(fmode == FrequencyDisplayMode.PANEL_ONLY)
+            action.triggered.connect(
+                lambda _checked, m=fmode: self._on_frequency_display_mode_changed(m)
+            )
+            freq_disp_group.addAction(action)
+            self._frequency_display_mode_actions[fmode] = action
 
     # ─────────────────────────────────────────────────────────────────────────
     # File loading (standard path)
@@ -1118,6 +1142,34 @@ class PowerwaveMainWindow(QMainWindow):
         if self._scaling_mode != EngineeringScalingMode.RAW:
             self._apply_scaling_to_all_canvases()
         self.statusBar().showMessage("Scaling configuration updated.")
+
+    def _on_frequency_display_mode_changed(self, mode: FrequencyDisplayMode) -> None:
+        """Apply a new frequency/ROCOF panel visibility mode."""
+        self._frequency_registry.set_display_mode(mode)
+        action = self._frequency_display_mode_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)  # type: ignore[union-attr]
+        self._apply_frequency_display_mode()
+        labels = {
+            FrequencyDisplayMode.PANEL_ONLY: "Frequency: Panel Only",
+            FrequencyDisplayMode.OVERLAY:    "Frequency: Overlay",
+            FrequencyDisplayMode.OFF:        "Frequency: Off",
+        }
+        self.statusBar().showMessage(labels.get(mode, "Frequency display changed"))
+
+    def _apply_frequency_display_mode(self) -> None:
+        """Show or hide frequency/ROCOF panel canvases based on current mode."""
+        if not self._panel_canvases:
+            return
+        mode = self._frequency_registry.display_mode
+        freq_keys = self._frequency_registry.frequency_panel_keys(
+            list(self._panel_canvases.keys())
+        )
+        visible = mode != FrequencyDisplayMode.OFF
+        for key in freq_keys:
+            canvas = self._panel_canvases.get(key)
+            if canvas is not None and self._qt_widget_alive(canvas):
+                canvas.setVisible(visible)
 
     def _refresh_signal_browser(self) -> None:
         """Rebuild the dock tree from the current visualization runtime state."""

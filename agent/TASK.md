@@ -309,15 +309,37 @@ Outcome:
   Shared-axis grouping preserved via signal_type_hint (voltage:pu ≠ current:pu)
   70 new tests; 1514 total unit tests passing; 8 pre-existing failures unchanged
 
-Frequency Calculation Engine
+Frequency & ROCOF Analytics Integration
 
-Status: NOT STARTED
+Status: COMPLETED (Phase 5C)
 Priority: HIGH
+Date: 2026-05-16
 
-ROCOF Engine
+Scope:
+  app/analytics/frequency/frequency_models.py  — FrequencyDisplayMode, FrequencyChannelRole, FrequencyChannelResult, FrequencyConfig
+  app/analytics/frequency/frequency_overlay.py — classify_frequency_role (priority chain), is_frequency_channel, is_rocof_channel
+  app/analytics/frequency/rocof_overlay.py     — ROCOF-specific helpers (classify_rocof, display labels, axis labels)
+  app/analytics/frequency/frequency_registry.py — FrequencyRegistry (session-level cache + display mode + bulk helpers)
+  app/analytics/frequency/__init__.py          — public package exports
+  app/ui/main_window/main_window.py            — Tools → Frequency Display submenu + _FrequencyRegistry state
+  tests/unit/test_frequency_classification.py  ← 57 tests
+  tests/unit/test_frequency_display.py         ← 71 tests
+  tests/unit/test_frequency_visualization.py   ← 69 tests
 
-Status: NOT STARTED
-Priority: HIGH
+Outcome:
+  Provider-neutral frequency/ROCOF channel integration for CSV, COMTRADE, PMU, and SCADA telemetry.
+  Classification priority chain: operator_override > measurement_kind > electrical_type > unit > name heuristics.
+  FrequencyDisplayMode: PANEL_ONLY (default) / OVERLAY / OFF.
+  Frequency channels: shared Hz axis, never auto-scaled to kHz.
+  ROCOF channels: shared Hz/s axis, sign preserved, never merged with frequency axes.
+  Frequency/ROCOF channels are always RMS-ineligible (confirmed by test).
+  FrequencyRegistry tracks display mode; frequency_panel_keys() supports both direct and multi-source panel layouts.
+  Tools → Frequency Display menu in main window; _apply_frequency_display_mode() shows/hides panels.
+  197 new tests; 2349 total passing, 12 skipped, 0 failures.
+
+Waveform-derived frequency estimation (PLL, zero-crossing, DFT, ROCOF from waveform): NOT STARTED
+
+Harmonic Analysis Foundation
 
 Harmonic Analysis Foundation
 

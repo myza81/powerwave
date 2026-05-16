@@ -111,7 +111,16 @@ powerwave/
 │   │   ├── sliding_rms.py             ← compute_window_samples, compute_rms_overlay (O(N) cumsum)
 │   │   ├── rms_cache.py               ← RMSCache (NamedTuple key, by-reference arrays)
 │   │   └── rms_overlay.py             ← classify_rms_eligibility (priority chain)
-│   └── (frequency/, rocof/, harmonics/, phasor/ — all __init__.py stubs)
+│   ├── frequency/                 ← Frequency/ROCOF Analytics Integration (Phase 5C COMPLETE)
+│   │   ├── __init__.py            ← public exports (12 symbols)
+│   │   ├── frequency_models.py    ← FrequencyDisplayMode, FrequencyChannelRole,
+│   │   │                             FrequencyChannelResult, FrequencyConfig
+│   │   ├── frequency_overlay.py   ← classify_frequency_role (priority chain),
+│   │   │                             is_frequency_channel, is_rocof_channel
+│   │   ├── rocof_overlay.py       ← classify_rocof, rocof_display_label, rocof_axis_label,
+│   │   │                             frequency_display_label, frequency_axis_label
+│   │   └── frequency_registry.py  ← FrequencyRegistry (session cache, display mode, panel keys)
+│   └── (rocof/, harmonics/, phasor/ — all __init__.py stubs)
 │   ├── synchronization/ (cursor/, viewport/, managers/ — all __init__.py stubs)
 │   ├── data/                              ← NEW Phase D1 / extended Phase D3 + D4
 │   ├── __init__.py                    ← exports SignalMetadata, build_display_time_seconds,
@@ -317,7 +326,17 @@ Status: IMPLEMENTED (Phase D4.5A)
 
 Analytics Engine
 
-Status: PHASE 5A COMPLETE
+Status: PHASE 5C COMPLETE
+
+- `app/analytics/frequency/` — Frequency/ROCOF Integration (Phase 5C)
+  - `FrequencyDisplayMode`: OFF / OVERLAY / PANEL_ONLY (default)
+  - `FrequencyChannelRole`: FREQUENCY / ROCOF / UNKNOWN
+  - `classify_frequency_role()`: 5-level priority chain (force > measurement_kind > electrical_type > unit > name)
+  - `FrequencyRegistry`: session cache + display mode + frequency_panel_keys() for panel show/hide
+  - Fixed operational units: FREQUENCY → Hz, ROCOF → Hz/s (never auto-scaled)
+  - ROCOF never shares axis with frequency; both ineligible for RMS overlays
+  - `Tools → Frequency Display` menu in main window
+  - 197 unit tests passing
 
 - `app/analytics/rms/` — RMS Overlay Foundation
   - `RMSDisplayMode`: OFF / OVERLAY / RMS_ONLY
@@ -382,15 +401,12 @@ CURRENT DEVELOPMENT PRIORITIES
 Phase D3.1 COMPLETE + SignalMetadata electrical reference extension + real sample data added.
 
 CURRENT TEST STATUS
-Unit Tests — app/ (via .venv/Scripts/python.exe -m pytest tests/unit/)
+Unit Tests — app/ (via .venv/Scripts/python.exe -m pytest tests/ --ignore=tests/integration)
 
-2178 tests PASSING (unit) — all app/unit tests green through Phase 5B + Phase 5A.R1.
-  Includes 70 Phase 5B scaling tests (per_unit, engineering_scaling, scaling_registry, scaling_canvas).
-  Phase 5A.R1 RMS window tests added after Phase 5B (accounting for count increase from 1514 to 2178).
+2349 tests PASSING — all green through Phase 5C (Frequency/ROCOF Analytics).
+  Includes 197 Phase 5C frequency tests (classification, display, visualization).
   12 skipped (headless-environment guards).
-  8 pre-existing failures (not introduced by Phase 5B):
-    3 test_fuzzy_mapping.py (TestIntelligenceManagerSynonymFallback) — workspace changes pre-Phase 5A
-    5 test_d442_diagnostic.py / test_d442_panel_visibility.py — Qt/ViewBox deletion in headless environment
+  0 failures.
 
 34 tests PASSING (integration) (34 test_pulu_manifest_pipeline — real sample files required; skips if absent)
 
