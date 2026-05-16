@@ -6,11 +6,20 @@ See VISUALIZATION_CONTRACT.md and VIEWPORT_RENDERING_POLICY §6.3, §8, §12.
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from app.models import AnalogChannel, DisturbanceRecord
+from app.visualization.axis.datetime_axis import (
+    AXIS_MODE_ABSOLUTE,
+    AXIS_MODE_RELATIVE,
+    TimeDisplayMode,
+)
+from app.visualization.managers.synchronization_manager import SynchronizationManager
+from app.visualization.axis_management import AxisDisplayMode
+from app.visualization.engineering_display import format_panel_title
 from app.visualization.widgets.digital_event_timeline import DigitalEventTimeline
 from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 
@@ -218,6 +227,10 @@ class VisualizationManager:
         self._record: DisturbanceRecord | None = None
         self._x_linked: bool = False
         self._panel_canvases: dict = {}
+        self._sync_manager = SynchronizationManager()
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._axis_reference_time: datetime | None = None
+        self._axis_display_mode = AxisDisplayMode.SHARED
 
         # Bidirectional cursor sync — receivers use blockSignals to prevent loops
         canvas.cursor_moved.connect(self._on_canvas_cursor_moved)
@@ -249,6 +262,10 @@ class VisualizationManager:
         display_grouped_record() call. Empty until that method is called."""
         return dict(self._panel_canvases)
 
+    @property
+    def synchronization_manager(self) -> SynchronizationManager:
+        return self._sync_manager
+
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
     # ─────────────────────────────────────────────────────────────────────────
@@ -264,7 +281,7 @@ class VisualizationManager:
         zoom_to_trigger() and reset_viewport() need only act on the canvas.
         """
         # _primary_plot access is by design — see DigitalEventTimeline.link_x_to() docstring
-        self._timeline.link_x_to(self._canvas._primary_plot)
+        self.register_synchronized_panels([self._canvas], timeline=self._timeline)
         self._x_linked = True
 
     def set_record(
@@ -275,12 +292,57 @@ class VisualizationManager:
     ) -> None:
         """Load a DisturbanceRecord into both canvas and timeline."""
         self._record = record
+        self._time_axis_mode = TimeDisplayMode.coerce(axis_mode)
+        self._axis_reference_time = record.timing_info.start_time
         self._canvas.set_record(record, axis_mode=axis_mode)
-        self._timeline.set_record(record)
+        if self._time_axis_mode == TimeDisplayMode.ABSOLUTE:
+            self._timeline.set_record(
+                record,
+                axis_mode=axis_mode,
+                axis_reference_time=self._axis_reference_time,
+            )
+        else:
+            self._timeline.set_record(record)
+        if self._x_linked:
+            self.register_synchronized_panels([self._canvas], timeline=self._timeline)
+
+    def set_time_axis_mode(
+        self,
+        mode: TimeDisplayMode | str,
+        *,
+        axis_reference_time: datetime | None = None,
+    ) -> None:
+        """Switch all currently managed axes between relative and absolute labels."""
+        display_mode = TimeDisplayMode.coerce(mode)
+        if axis_reference_time is not None:
+            self._axis_reference_time = axis_reference_time
+        elif self._axis_reference_time is None and self._record is not None:
+            self._axis_reference_time = self._record.timing_info.start_time
+        self._time_axis_mode = display_mode
+
+        reference = self._axis_reference_time
+        targets = list(self._panel_canvases.values()) or [self._canvas]
+        for canvas in targets:
+            if hasattr(canvas, "set_time_axis_mode"):
+                canvas.set_time_axis_mode(display_mode, axis_reference_time=reference)
+        if hasattr(self._timeline, "set_time_axis_mode"):
+            self._timeline.set_time_axis_mode(display_mode, axis_reference_time=reference)
+
+    def set_axis_display_mode(self, mode: AxisDisplayMode | str) -> None:
+        """Switch all managed analog canvases between shared/dedicated axes."""
+        axis_mode = AxisDisplayMode.coerce(mode)
+        self._axis_display_mode = axis_mode
+        targets = list(self._panel_canvases.values()) or [self._canvas]
+        for canvas in targets:
+            if hasattr(canvas, "set_axis_display_mode"):
+                canvas.set_axis_display_mode(axis_mode)
 
     def clear(self) -> None:
         """Clear both widgets and discard the record reference."""
         self._record = None
+        self._axis_reference_time = None
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._sync_manager.clear()
         self._canvas._clear_canvas()
         self._timeline.clear()
 
@@ -313,13 +375,36 @@ class VisualizationManager:
         self._canvas.set_cursor_pos(t)
         self._timeline.set_cursor_pos(t)
 
+    def register_synchronized_panels(
+        self,
+        canvases,
+        *,
+        timeline: DigitalEventTimeline | None = None,
+    ) -> None:
+        """Register analog panel canvases plus optional digital timeline for sync."""
+        canvases = list(canvases)
+        self._sync_manager.clear()
+        if not canvases:
+            return
+        master = canvases[0]
+        self._sync_manager.register_many(canvases, master_canvas=master)
+        if timeline is not None:
+            self._sync_manager.register_canvas(timeline)
+        x_range = master._primary_plot.getViewBox().viewRange()[0]
+        if len(x_range) == 2:
+            t_start, t_end = x_range
+            self._sync_manager.synchronize_x_range(master, (t_start, t_end))
+        cursor = getattr(master, "_cursor", None)
+        if cursor is not None:
+            self._sync_manager.synchronize_cursor(master, float(cursor.value()))
+
     def display_grouped_record(
         self,
         record: DisturbanceRecord,
         signal_metadata: dict | None = None,
         canvas_factory=None,
         *,
-        axis_mode: str = "relative_seconds",
+        axis_mode: str = AXIS_MODE_RELATIVE,
     ) -> dict:
         """Group channels by display group and create one canvas per non-empty group.
 
@@ -350,17 +435,38 @@ class VisualizationManager:
 
         groups = group_channels_for_display(record, signal_metadata)
         panel_canvases: dict = {}
+        display_mode = TimeDisplayMode.coerce(axis_mode)
+        self._time_axis_mode = display_mode
+        self._axis_reference_time = record.timing_info.start_time
 
         for group_name, channel_names in groups.items():
             if group_name == DISPLAY_GROUP_DIGITAL:
                 if channel_names:
-                    self._timeline.set_record(record)
+                    if display_mode == TimeDisplayMode.ABSOLUTE:
+                        self._timeline.set_record(
+                            record,
+                            axis_mode=axis_mode,
+                            axis_reference_time=self._axis_reference_time,
+                        )
+                    else:
+                        self._timeline.set_record(record)
                 continue
             if not channel_names:
                 continue
             filtered = _make_filtered_record(record, channel_names)
             canvas = canvas_factory()
-            canvas.set_record(filtered, axis_mode=axis_mode)
+            if display_mode == TimeDisplayMode.ABSOLUTE:
+                canvas.set_record(
+                    filtered,
+                    axis_mode=axis_mode,
+                    axis_reference_time=self._axis_reference_time,
+                )
+            else:
+                canvas.set_record(filtered, axis_mode=axis_mode)
+            if hasattr(canvas, "set_axis_display_mode"):
+                canvas.set_axis_display_mode(self._axis_display_mode)
+            if hasattr(canvas, "set_panel_title"):
+                canvas.set_panel_title(format_panel_title(group_name, len(channel_names)))
             panel_canvases[group_name] = canvas
 
         self._panel_canvases = panel_canvases
@@ -372,7 +478,7 @@ class VisualizationManager:
         session: MultiSourceSession,
         canvas_factory=None,
         *,
-        axis_mode: str = "relative_seconds",
+        axis_mode: str = AXIS_MODE_ABSOLUTE,
     ) -> dict:
         """Display a MultiSourceSession as time-aligned stacked panels.
 
@@ -407,6 +513,9 @@ class VisualizationManager:
 
         reference_start = determine_reference_start(session.sources)
         offsets = compute_relative_offsets(session.sources, reference_start)
+        display_mode = TimeDisplayMode.coerce(axis_mode)
+        self._time_axis_mode = display_mode
+        self._axis_reference_time = reference_start
 
         panel_canvases: dict = {}
         display_records: list[_DisplayRecord] = []
@@ -419,15 +528,35 @@ class VisualizationManager:
             for group_name, channel_names in groups.items():
                 if group_name == DISPLAY_GROUP_DIGITAL:
                     if channel_names:
-                        self._timeline.set_record(source.record)
+                        if display_mode == TimeDisplayMode.ABSOLUTE:
+                            self._timeline.set_record(
+                                source.record,
+                                axis_mode=axis_mode,
+                                axis_reference_time=reference_start,
+                            )
+                        else:
+                            self._timeline.set_record(source.record)
                     continue
                 if not channel_names:
                     continue
                 filtered = _make_filtered_record(source.record, channel_names)
                 display_record = _apply_time_offset(filtered, offset)
                 canvas = canvas_factory()
-                canvas.set_record(display_record, axis_mode=axis_mode)
+                if display_mode == TimeDisplayMode.ABSOLUTE:
+                    canvas.set_record(
+                        display_record,
+                        axis_mode=axis_mode,
+                        axis_reference_time=reference_start,
+                    )
+                else:
+                    canvas.set_record(display_record, axis_mode=axis_mode)
+                if hasattr(canvas, "set_axis_display_mode"):
+                    canvas.set_axis_display_mode(self._axis_display_mode)
                 panel_key = f"{source.source_id}/{group_name}"
+                if hasattr(canvas, "set_panel_title"):
+                    canvas.set_panel_title(
+                        format_panel_title(group_name, len(channel_names), source.source_id)
+                    )
                 panel_canvases[panel_key] = canvas
                 display_records.append(
                     _DisplayRecord(

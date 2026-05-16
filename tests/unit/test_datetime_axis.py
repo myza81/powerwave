@@ -19,6 +19,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ─────────────────────────────────────────────────────────────────────────────
 
 from app.visualization.axis.datetime_axis import _choose_format
+from app.visualization.axis.datetime_axis import (
+    AXIS_MODE_ABSOLUTE,
+    AXIS_MODE_RELATIVE,
+    TimeDisplayMode,
+)
+
+
+class TestTimeDisplayMode:
+    def test_relative_value_matches_axis_mode_constant(self) -> None:
+        assert TimeDisplayMode.RELATIVE.value == AXIS_MODE_RELATIVE
+
+    def test_absolute_value_matches_axis_mode_constant(self) -> None:
+        assert TimeDisplayMode.ABSOLUTE.value == AXIS_MODE_ABSOLUTE
+
+    def test_coerce_accepts_legacy_axis_mode_string(self) -> None:
+        assert TimeDisplayMode.coerce("absolute_datetime") is TimeDisplayMode.ABSOLUTE
 
 
 class TestChooseFormat:

@@ -113,45 +113,62 @@ class TestAxisModeConstants:
 
 
 class TestFlexiblePlotCanvasAxisMode:
-    """Verify axis_mode controls whether start_time is passed to DatetimeAxisItem."""
+    """Verify axis_mode is forwarded correctly from set_record to set_time_axis_mode.
 
-    def test_relative_mode_clears_start_time(self) -> None:
-        """axis_mode='relative_seconds' must leave _start_time as None."""
+    set_record delegates time-axis setup to set_time_axis_mode; these tests
+    verify the delegation contract rather than the downstream _datetime_axis call.
+    """
+
+    def test_relative_mode_forwarded_to_set_time_axis_mode(self) -> None:
+        """axis_mode='relative_seconds' must be forwarded to set_time_axis_mode."""
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
+        from app.analytics.rms.rms_models import RMSDisplayMode
         from app.visualization.axis.datetime_axis import AXIS_MODE_RELATIVE
 
         canvas = MagicMock(spec=FlexiblePlotCanvas)
         canvas._datetime_axis = MagicMock()
+        canvas._rms_display_mode = RMSDisplayMode.OFF
 
         record = _make_record(start_time=_T_START, trigger_time=_T_TRIG)
 
         FlexiblePlotCanvas.set_record(canvas, record, axis_mode=AXIS_MODE_RELATIVE)
-        canvas._datetime_axis.set_start_time.assert_called_with(None)
+        canvas.set_time_axis_mode.assert_called_with(
+            AXIS_MODE_RELATIVE, axis_reference_time=_T_START
+        )
 
-    def test_absolute_mode_sets_start_time(self) -> None:
-        """axis_mode='absolute_datetime' must pass record.timing_info.start_time."""
+    def test_absolute_mode_forwarded_to_set_time_axis_mode(self) -> None:
+        """axis_mode='absolute_datetime' must be forwarded to set_time_axis_mode."""
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
+        from app.analytics.rms.rms_models import RMSDisplayMode
         from app.visualization.axis.datetime_axis import AXIS_MODE_ABSOLUTE
 
         canvas = MagicMock(spec=FlexiblePlotCanvas)
         canvas._datetime_axis = MagicMock()
+        canvas._rms_display_mode = RMSDisplayMode.OFF
 
         record = _make_record(start_time=_T_START, trigger_time=_T_TRIG)
 
         FlexiblePlotCanvas.set_record(canvas, record, axis_mode=AXIS_MODE_ABSOLUTE)
-        canvas._datetime_axis.set_start_time.assert_called_with(_T_START)
+        canvas.set_time_axis_mode.assert_called_with(
+            AXIS_MODE_ABSOLUTE, axis_reference_time=_T_START
+        )
 
     def test_default_mode_is_relative(self) -> None:
-        """Default axis_mode must be 'relative_seconds' (no start_time)."""
+        """Default axis_mode must be 'relative_seconds'."""
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
+        from app.analytics.rms.rms_models import RMSDisplayMode
+        from app.visualization.axis.datetime_axis import AXIS_MODE_RELATIVE
 
         canvas = MagicMock(spec=FlexiblePlotCanvas)
         canvas._datetime_axis = MagicMock()
+        canvas._rms_display_mode = RMSDisplayMode.OFF
 
         record = _make_record(start_time=_T_START, trigger_time=_T_TRIG)
 
         FlexiblePlotCanvas.set_record(canvas, record)
-        canvas._datetime_axis.set_start_time.assert_called_with(None)
+        canvas.set_time_axis_mode.assert_called_with(
+            AXIS_MODE_RELATIVE, axis_reference_time=_T_START
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

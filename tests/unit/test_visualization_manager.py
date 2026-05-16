@@ -90,9 +90,11 @@ class TestSetRecord:
 
 class TestClear:
     def test_canvas_clear_called(self) -> None:
+        # VisualizationManager.clear() calls _clear_canvas() (not clear) to avoid
+        # shadowing by pg.GraphicsLayoutWidget.__init__ (see flexible_plot_canvas.py)
         mgr, canvas, _ = _make_manager()
         mgr.clear()
-        canvas.clear.assert_called_once()
+        canvas._clear_canvas.assert_called_once()
 
     def test_timeline_clear_called(self) -> None:
         mgr, _, timeline = _make_manager()
@@ -108,7 +110,7 @@ class TestClear:
     def test_clear_without_record_does_not_raise(self) -> None:
         mgr, canvas, timeline = _make_manager()
         mgr.clear()  # no record loaded
-        canvas.clear.assert_called_once()
+        canvas._clear_canvas.assert_called_once()
         timeline.clear.assert_called_once()
 
 
@@ -152,10 +154,10 @@ class TestCursorSync:
 
 
 class TestLinkXAxis:
-    def test_link_x_axis_calls_link_x_to_with_primary_plot(self) -> None:
+    def test_link_x_axis_registers_canvas_and_timeline_for_synchronization(self) -> None:
         mgr, canvas, timeline = _make_manager()
         mgr.link_x_axis()
-        timeline.link_x_to.assert_called_once_with(canvas._primary_plot)
+        assert mgr.synchronization_manager.registered_count == 2
 
     def test_is_x_linked_true_after_link(self) -> None:
         mgr, _, _ = _make_manager()

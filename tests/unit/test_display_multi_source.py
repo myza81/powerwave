@@ -136,6 +136,47 @@ class TestDisplayMultiSourceSession:
         for canvas in created:
             canvas.set_record.assert_called_once()
 
+    def test_default_multi_source_axis_mode_is_absolute(self) -> None:
+        from app.visualization.axis.datetime_axis import AXIS_MODE_ABSOLUTE
+
+        mgr, _, _ = _make_manager()
+        session = MultiSourceSession()
+        session.add_source(_make_source("a"))
+        received_modes: list[str] = []
+
+        def factory() -> MagicMock:
+            m = MagicMock()
+            m.set_record.side_effect = lambda _record, **kw: received_modes.append(
+                kw.get("axis_mode", "")
+            )
+            return m
+
+        mgr.display_multi_source_session(session, canvas_factory=factory)
+
+        assert received_modes
+        assert all(mode == AXIS_MODE_ABSOLUTE for mode in received_modes)
+
+    def test_multi_source_absolute_mode_uses_common_reference_start(self) -> None:
+        mgr, _, _ = _make_manager()
+        session = MultiSourceSession()
+        early = _make_source("early", start_offset_s=0.0)
+        late = _make_source("late", start_offset_s=2.0)
+        session.add_source(early)
+        session.add_source(late)
+        received_refs: list[dt.datetime] = []
+
+        def factory() -> MagicMock:
+            m = MagicMock()
+            m.set_record.side_effect = lambda _record, **kw: received_refs.append(
+                kw.get("axis_reference_time")
+            )
+            return m
+
+        mgr.display_multi_source_session(session, canvas_factory=factory)
+
+        assert received_refs
+        assert all(ref == early.original_start_time for ref in received_refs)
+
     def test_panel_canvases_property_updated(self) -> None:
         mgr, _, _ = _make_manager()
         session = MultiSourceSession()

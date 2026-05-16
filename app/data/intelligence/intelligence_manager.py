@@ -268,6 +268,25 @@ class IntelligenceManager:
         self._mapping_rules = all_rules
         return len(new_rules)
 
+    def save_confirmed_rules(
+        self,
+        rules: list[MappingRule],
+        path: Path | None = None,
+    ) -> int:
+        """Merge and persist a list of operator-confirmed MappingRules.
+
+        New rules override existing rules with the same match_pattern.
+        Returns the number of rules in the input list.
+        """
+        merged: dict[str, MappingRule] = {r.match_pattern: r for r in self._mapping_rules}
+        for r in rules:
+            merged[r.match_pattern] = r
+        all_rules = list(merged.values())
+        target = path or self._mapping_rules_path
+        save_mapping_rules(all_rules, target)
+        self._mapping_rules = all_rules
+        return len(rules)
+
     def save_timestamp_rule(
         self,
         rule: TimestampRule,

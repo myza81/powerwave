@@ -19,21 +19,30 @@ import dataclasses
 import sys
 from pathlib import Path
 
+from PyQt6 import sip
 from PyQt6.QtCore import Qt, QRunnable, QThreadPool, QObject, pyqtSignal, QTimer
+from PyQt6.QtGui import QActionGroup
 from PyQt6.QtWidgets import (
     QMainWindow,
     QSplitter,
     QStatusBar,
     QFileDialog,
     QMessageBox,
+    QInputDialog,
 )
 
-from app.data.intelligence import IntelligenceManager
+from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode, RMSWindowMode
+from app.analytics.scaling import EngineeringScalingMode, GlobalScalingConfig, ScalingRegistry
+
+from app.intelligence import RuleManager
 from app.models import DisturbanceRecord
 from app.providers import ProviderManager, ComtradeProvider, CsvProvider, ExcelProvider
+from app.visualization.axis.datetime_axis import TimeDisplayMode
+from app.visualization.axis_management import AxisDisplayMode
 from app.visualization.managers.visualization_manager import VisualizationManager
 from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 from app.visualization.widgets.digital_event_timeline import DigitalEventTimeline
+from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -171,7 +180,7 @@ class _IntelligentLoadWorker(QRunnable):
         self,
         provider_manager: ProviderManager,
         path: Path,
-        intelligence_manager: IntelligenceManager,
+        intelligence_manager,   # IntelligenceManager — avoid import; duck-typed
     ) -> None:
         super().__init__()
         self._manager = provider_manager
@@ -240,7 +249,8 @@ class PowerwaveMainWindow(QMainWindow):
         self.resize(1400, 900)
 
         self._provider_manager = _build_provider_manager()
-        self._intelligence_manager = IntelligenceManager()
+        self._rule_manager = RuleManager()
+        self._intelligence_manager = self._rule_manager.intelligence_manager
         self._canvas = FlexiblePlotCanvas()
         self._timeline = DigitalEventTimeline()
         self._vis_manager = VisualizationManager(self._canvas, self._timeline)
@@ -248,7 +258,25 @@ class PowerwaveMainWindow(QMainWindow):
         self._panel_canvases: dict = {}
         self._grouped_timeline = None
 
+        # RMS display state (Phase 5A)
+        self._rms_display_mode: RMSDisplayMode = RMSDisplayMode.OFF
+        self._rms_config: RMSConfig = RMSConfig()
+        self._rms_window_actions: dict[RMSWindowMode, object] = {}
+        self._current_signal_metadata: dict = {}
+        self._time_display_mode: TimeDisplayMode = TimeDisplayMode.RELATIVE
+        self._time_axis_actions: dict[TimeDisplayMode, object] = {}
+        self._axis_display_mode: AxisDisplayMode = AxisDisplayMode.SHARED
+        self._axis_mode_actions: dict[AxisDisplayMode, object] = {}
+        # Engineering scaling state (Phase 5B)
+        self._scaling_mode: EngineeringScalingMode = EngineeringScalingMode.RAW
+        self._scaling_registry: ScalingRegistry = ScalingRegistry()
+        self._scaling_mode_actions: dict[EngineeringScalingMode, object] = {}
+        self._signal_browser = SignalBrowserDock(self)
+        self._signal_entry_targets: dict[str, tuple[str, str, str]] = {}
+
         self._build_layout()
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
+        self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
         self._build_menu()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -261,6 +289,10 @@ class PowerwaveMainWindow(QMainWindow):
             self._vis_manager.link_x_axis()
             self._x_axis_linked = True
 
+    def closeEvent(self, event) -> None:
+        self._vis_manager.synchronization_manager.clear()
+        super().closeEvent(event)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
     # ─────────────────────────────────────────────────────────────────────────
@@ -270,8 +302,69 @@ class PowerwaveMainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
 
+    @staticmethod
+    def _qt_widget_alive(widget) -> bool:
+        """Return False when a Python Qt wrapper points at a deleted C++ object."""
+        if widget is None:
+            return False
+        try:
+            return not sip.isdeleted(widget)
+        except RuntimeError:
+            return False
+
+    def _detach_if_alive(self, widget) -> None:
+        if self._qt_widget_alive(widget):
+            widget.setParent(None)
+
+    def _clear_sync_before_layout_switch(self) -> None:
+        try:
+            self._vis_manager.synchronization_manager.clear()
+        except RuntimeError:
+            pass
+
+    def _ensure_standard_widgets_alive(self) -> None:
+        """Recreate standard widgets if Qt deleted their underlying objects."""
+        canvas_alive = self._qt_widget_alive(self._canvas)
+        timeline_alive = self._qt_widget_alive(self._timeline)
+        if canvas_alive and timeline_alive:
+            return
+
+        self._clear_sync_before_layout_switch()
+        if not canvas_alive:
+            self._canvas = FlexiblePlotCanvas()
+        if not timeline_alive:
+            self._timeline = DigitalEventTimeline()
+        self._vis_manager = VisualizationManager(self._canvas, self._timeline)
+        self._x_axis_linked = False
+
+    def _link_standard_x_axis(self) -> None:
+        if not (
+            self._qt_widget_alive(self._canvas)
+            and self._qt_widget_alive(self._timeline)
+        ):
+            return
+        right_axes = self._canvas.right_axis_count()
+        self._canvas.reserve_grouped_axis_columns(right_axes)
+        self._timeline.reserve_grouped_axis_columns(right_axes)
+        self._timeline.match_viewbox_geometry(self._canvas._primary_plot.getViewBox())
+        self._vis_manager.link_x_axis()
+        t_start, t_end = self._canvas._primary_plot.getViewBox().viewRange()[0]
+        self._timeline.normalize_viewport(t_start, t_end)
+        self._x_axis_linked = True
+        QTimer.singleShot(0, self._match_standard_timeline_geometry)
+
+    def _match_standard_timeline_geometry(self) -> None:
+        if not (
+            self._qt_widget_alive(self._canvas)
+            and self._qt_widget_alive(self._timeline)
+        ):
+            return
+        self._timeline.match_viewbox_geometry(self._canvas._primary_plot.getViewBox())
+
     def _restore_standard_layout(self) -> None:
         """Restore the two-pane standard layout (canvas + timeline)."""
+        self._clear_sync_before_layout_switch()
+        self._ensure_standard_widgets_alive()
         self._timeline.show()
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self._canvas)
@@ -281,6 +374,9 @@ class PowerwaveMainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         self._panel_canvases = {}
         self._grouped_timeline = None
+        self._refresh_signal_browser()
+        if self.isVisible() and not self._x_axis_linked:
+            QTimer.singleShot(0, self._link_standard_x_axis)
 
     def _rebuild_grouped_layout(
         self,
@@ -290,14 +386,20 @@ class PowerwaveMainWindow(QMainWindow):
         """Replace central widget with grouped stacked display.
 
         Panels are inserted in _PANEL_ORDER; any unrecognised groups follow.
-        X-axis linking is deferred via QTimer.singleShot(0) so PyQtGraph
-        scenes are fully initialised before setXLink is called.
+        Synchronization registration is deferred via QTimer.singleShot(0) so
+        PyQtGraph scenes are fully initialised before signal wiring is attached.
 
         Each panel canvas is given a minimum height (180 px) so the QSplitter
         cannot collapse any panel to zero.  Initial splitter sizes are set
         explicitly so all panels share space equally on first show — without
         this the splitter may give the top panel all available space.
         """
+        self._clear_sync_before_layout_switch()
+        self._ensure_standard_widgets_alive()
+        self._detach_if_alive(self._canvas)
+        if not record.digital_channels:
+            self._detach_if_alive(self._timeline)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         ordered_keys = [k for k in _PANEL_ORDER if k in panel_canvases]
@@ -332,35 +434,63 @@ class PowerwaveMainWindow(QMainWindow):
         splitter.setSizes([300] * n_panels)
 
         self.setCentralWidget(splitter)
+        self._refresh_signal_browser()
         QTimer.singleShot(0, self._link_panel_x_axes)
 
     def _link_panel_x_axes(self) -> None:
-        """Link all grouped panel canvases to the first panel's X-axis.
+        """Register grouped panels for synchronized X interaction.
 
         Called via QTimer.singleShot(0) from _rebuild_grouped_layout to ensure
-        PyQtGraph items are parented into a visible scene before setXLink.
+        PyQtGraph items are parented into a visible scene before signal wiring.
 
-        After linking, each follower is explicitly normalized to the master's
-        exact data range.  PyQtGraph's linkedViewChanged() maps ranges via screen
-        pixel widths; panels with different secondary axis counts have different
-        primary-ViewBox widths, so the initial linked range is asymmetrically
-        stretched.  normalize_viewport() overrides that with a uniform data range
-        and re-pins Y ranges for sparse records.
+        Before synchronization, all canvases reserve the same left/right axis
+        columns so identical X values map to identical horizontal pixels even
+        when one panel has more Y axes than another.
         """
         if not self._panel_canvases:
             return
-        canvases = list(self._panel_canvases.values())
+        canvases = [
+            canvas
+            for canvas in self._panel_canvases.values()
+            if self._qt_widget_alive(canvas)
+        ]
+        if not canvases:
+            self._panel_canvases = {}
+            return
         master = canvases[0]
-        for follower in canvases[1:]:
-            follower._primary_plot.setXLink(master._primary_plot)
-        if self._grouped_timeline is not None:
-            self._grouped_timeline.link_x_to(master._primary_plot)
+
+        max_right_axes = max((canvas.right_axis_count() for canvas in canvases), default=0)
+        for canvas in canvases:
+            canvas.reserve_grouped_axis_columns(max_right_axes)
+        timeline = (
+            self._grouped_timeline
+            if self._qt_widget_alive(self._grouped_timeline)
+            else None
+        )
+        if timeline is not None:
+            timeline.reserve_grouped_axis_columns(max_right_axes)
+            timeline.match_viewbox_geometry(master._primary_plot.getViewBox())
+
+        self._vis_manager.register_synchronized_panels(
+            canvases,
+            timeline=timeline,
+        )
 
         t_start, t_end = master._primary_plot.getViewBox().viewRange()[0]
         for canvas in canvases[1:]:
             canvas.normalize_viewport(t_start, t_end)
-        # Re-pin Y ranges on ALL canvases after X-linking — setXLink may trigger
-        # auto-range or linkedViewChanged which can override previously pinned ranges.
+        if timeline is not None:
+            timeline.normalize_viewport(t_start, t_end)
+            QTimer.singleShot(
+                0,
+                lambda: (
+                    timeline.match_viewbox_geometry(master._primary_plot.getViewBox())
+                    if self._qt_widget_alive(timeline) and self._qt_widget_alive(master)
+                    else None
+                ),
+            )
+        # Re-pin Y ranges on ALL canvases after synchronization registration;
+        # range propagation can trigger auto-range on sparse panels.
         for canvas in canvases:
             if canvas._sparse_mode:
                 canvas._force_y_ranges()
@@ -386,12 +516,144 @@ class PowerwaveMainWindow(QMainWindow):
         exit_action = file_menu.addAction("E&xit")
         exit_action.triggered.connect(self.close)
 
+        view_menu = menu_bar.addMenu("&View")
+        view_menu.addAction(self._signal_browser.toggleViewAction())
+        view_menu.addSeparator()
+        time_axis_menu = view_menu.addMenu("&Time Axis Mode")
+        time_axis_group = QActionGroup(self)
+        time_axis_group.setExclusive(True)
+
+        relative_time = time_axis_menu.addAction("&Relative Time")
+        relative_time.setCheckable(True)
+        relative_time.setChecked(True)
+        relative_time.triggered.connect(
+            lambda: self._on_time_axis_mode_changed(TimeDisplayMode.RELATIVE)
+        )
+        time_axis_group.addAction(relative_time)
+        self._time_axis_actions[TimeDisplayMode.RELATIVE] = relative_time
+
+        absolute_time = time_axis_menu.addAction("&Absolute Timestamp")
+        absolute_time.setCheckable(True)
+        absolute_time.triggered.connect(
+            lambda: self._on_time_axis_mode_changed(TimeDisplayMode.ABSOLUTE)
+        )
+        time_axis_group.addAction(absolute_time)
+        self._time_axis_actions[TimeDisplayMode.ABSOLUTE] = absolute_time
+
+        axis_mode_menu = view_menu.addMenu("&Axis Mode")
+        axis_mode_group = QActionGroup(self)
+        axis_mode_group.setExclusive(True)
+
+        shared_axis = axis_mode_menu.addAction("&Shared Axis")
+        shared_axis.setCheckable(True)
+        shared_axis.setChecked(True)
+        shared_axis.triggered.connect(
+            lambda: self._on_axis_display_mode_changed(AxisDisplayMode.SHARED)
+        )
+        axis_mode_group.addAction(shared_axis)
+        self._axis_mode_actions[AxisDisplayMode.SHARED] = shared_axis
+
+        dedicated_axis = axis_mode_menu.addAction("&Dedicated Axis")
+        dedicated_axis.setCheckable(True)
+        dedicated_axis.triggered.connect(
+            lambda: self._on_axis_display_mode_changed(AxisDisplayMode.DEDICATED)
+        )
+        axis_mode_group.addAction(dedicated_axis)
+        self._axis_mode_actions[AxisDisplayMode.DEDICATED] = dedicated_axis
+
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
         synthetic_action.setShortcut("Ctrl+T")
         synthetic_action.triggered.connect(self._on_load_synthetic_mixed)
         pulu_action = tools_menu.addAction("Load Sample &PULU Event")
         pulu_action.triggered.connect(self._on_load_sample_pulu)
+
+        tools_menu.addSeparator()
+        rms_menu = tools_menu.addMenu("&RMS Display")
+        rms_group = QActionGroup(self)
+        rms_group.setExclusive(True)
+
+        rms_off = rms_menu.addAction("&Off")
+        rms_off.setCheckable(True)
+        rms_off.setChecked(True)
+        rms_off.triggered.connect(lambda: self._on_rms_mode_changed(RMSDisplayMode.OFF))
+        rms_group.addAction(rms_off)
+
+        rms_overlay = rms_menu.addAction("&Overlay")
+        rms_overlay.setCheckable(True)
+        rms_overlay.triggered.connect(
+            lambda: self._on_rms_mode_changed(RMSDisplayMode.OVERLAY)
+        )
+        rms_group.addAction(rms_overlay)
+
+        rms_only = rms_menu.addAction("RMS &Only")
+        rms_only.setCheckable(True)
+        rms_only.triggered.connect(
+            lambda: self._on_rms_mode_changed(RMSDisplayMode.RMS_ONLY)
+        )
+        rms_group.addAction(rms_only)
+
+        rms_window_menu = tools_menu.addMenu("RMS &Window")
+        rms_window_group = QActionGroup(self)
+        rms_window_group.setExclusive(True)
+
+        half_cycle = rms_window_menu.addAction("&Half Cycle")
+        half_cycle.setCheckable(True)
+        half_cycle.triggered.connect(
+            lambda: self._on_rms_window_mode_changed(RMSWindowMode.HALF_CYCLE)
+        )
+        rms_window_group.addAction(half_cycle)
+        self._rms_window_actions[RMSWindowMode.HALF_CYCLE] = half_cycle
+
+        one_cycle = rms_window_menu.addAction("&One Cycle")
+        one_cycle.setCheckable(True)
+        one_cycle.setChecked(True)
+        one_cycle.triggered.connect(
+            lambda: self._on_rms_window_mode_changed(RMSWindowMode.ONE_CYCLE)
+        )
+        rms_window_group.addAction(one_cycle)
+        self._rms_window_actions[RMSWindowMode.ONE_CYCLE] = one_cycle
+
+        two_cycle = rms_window_menu.addAction("&Two Cycle")
+        two_cycle.setCheckable(True)
+        two_cycle.triggered.connect(
+            lambda: self._on_rms_window_mode_changed(RMSWindowMode.TWO_CYCLE)
+        )
+        rms_window_group.addAction(two_cycle)
+        self._rms_window_actions[RMSWindowMode.TWO_CYCLE] = two_cycle
+
+        custom_window = rms_window_menu.addAction("&Custom Samples...")
+        custom_window.setCheckable(True)
+        custom_window.triggered.connect(
+            lambda: self._on_rms_window_mode_changed(RMSWindowMode.CUSTOM_SAMPLES)
+        )
+        rms_window_group.addAction(custom_window)
+        self._rms_window_actions[RMSWindowMode.CUSTOM_SAMPLES] = custom_window
+
+        tools_menu.addSeparator()
+        scaling_mode_menu = tools_menu.addMenu("&Engineering Scaling")
+        scaling_group = QActionGroup(self)
+        scaling_group.setExclusive(True)
+
+        _scaling_items = [
+            ("&Raw (no scaling)", EngineeringScalingMode.RAW),
+            ("&Primary (×PT/CT)", EngineeringScalingMode.PRIMARY),
+            ("&Secondary (÷PT/CT)", EngineeringScalingMode.SECONDARY),
+            ("Per-&Unit (pu)", EngineeringScalingMode.PER_UNIT),
+        ]
+        for label, smode in _scaling_items:
+            action = scaling_mode_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(smode == EngineeringScalingMode.RAW)
+            action.triggered.connect(
+                lambda _checked, m=smode: self._on_scaling_mode_changed(m)
+            )
+            scaling_group.addAction(action)
+            self._scaling_mode_actions[smode] = action
+
+        tools_menu.addAction("Scaling &Configuration…").triggered.connect(
+            self._on_scaling_config
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # File loading (standard path)
@@ -427,7 +689,12 @@ class PowerwaveMainWindow(QMainWindow):
                 _log_runtime_route("COMTRADE direct open -> standard set_record")
                 if self._panel_canvases:
                     self._restore_standard_layout()
-                self._vis_manager.set_record(record)
+                self._time_display_mode = TimeDisplayMode.RELATIVE
+                self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
+                self._vis_manager.set_record(record, axis_mode=TimeDisplayMode.RELATIVE.value)
+                self._canvas.set_axis_display_mode(self._axis_display_mode)
+                QTimer.singleShot(0, self._link_standard_x_axis)
+                self._refresh_signal_browser()
                 self.statusBar().showMessage(_format_load_status(record))
                 title = (
                     record.metadata.station_name
@@ -445,7 +712,12 @@ class PowerwaveMainWindow(QMainWindow):
             _log_runtime_route("legacy DisturbanceRecord non-CSV result -> standard set_record")
             if self._panel_canvases:
                 self._restore_standard_layout()
-            self._vis_manager.set_record(result)
+            self._time_display_mode = TimeDisplayMode.RELATIVE
+            self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
+            self._vis_manager.set_record(result, axis_mode=TimeDisplayMode.RELATIVE.value)
+            self._canvas.set_axis_display_mode(self._axis_display_mode)
+            QTimer.singleShot(0, self._link_standard_x_axis)
+            self._refresh_signal_browser()
             self.statusBar().showMessage(_format_load_status(result))
             title = result.metadata.station_name or Path(result.metadata.source_file).name
             self.setWindowTitle(f"Powerwave — {title}")
@@ -523,6 +795,10 @@ class PowerwaveMainWindow(QMainWindow):
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 self.statusBar().showMessage("Load cancelled.")
                 return
+            self._rule_manager.save_confirmed_rows(
+                dlg.confirmed_column_rows.get(source_id, []),
+                source_id=source_id,
+            )
             selected_formats = dlg.selected_timestamp_formats.get(source_id, {})
 
         # Apply operator-selected timestamp format (rebases start_time only)
@@ -531,7 +807,9 @@ class PowerwaveMainWindow(QMainWindow):
                 record, result.ts_matrices, selected_formats
             )
 
-        axis_mode = "absolute_datetime"
+        self._time_display_mode = TimeDisplayMode.ABSOLUTE
+        self._set_time_axis_action_checked(TimeDisplayMode.ABSOLUTE)
+        axis_mode = TimeDisplayMode.ABSOLUTE.value
 
         diag = build_direct_open_diagnostics(
             source_path=str(result.path),
@@ -546,9 +824,13 @@ class PowerwaveMainWindow(QMainWindow):
         if self._panel_canvases:
             self._restore_standard_layout()
 
+        self._current_signal_metadata = signal_metadata or {}
+
         panel_canvases = self._vis_manager.display_grouped_record(
             record, signal_metadata or None, axis_mode=axis_mode
         )
+        for canvas in panel_canvases.values():
+            canvas.set_axis_display_mode(self._axis_display_mode)
         _log_runtime_route(
             f"display_grouped_record returned panels={list(panel_canvases.keys())}"
         )
@@ -558,6 +840,11 @@ class PowerwaveMainWindow(QMainWindow):
                 "to fall back to the standard analog/digital splitter."
             )
         self._rebuild_grouped_layout(panel_canvases, record)
+        self._refresh_signal_browser()
+
+        # Re-apply RMS mode to the newly created panels if mode is active
+        if self._rms_display_mode != RMSDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_rms_mode_to_all_canvases)
 
         self.statusBar().showMessage(_format_load_status(record))
         self.setWindowTitle(f"Powerwave — {source_id}")
@@ -606,9 +893,17 @@ class PowerwaveMainWindow(QMainWindow):
     def _on_multi_source_loaded(self, session) -> None:
         if self._panel_canvases:
             self._restore_standard_layout()
-        panel_canvases = self._vis_manager.display_multi_source_session(session)
+        self._time_display_mode = TimeDisplayMode.ABSOLUTE
+        self._set_time_axis_action_checked(TimeDisplayMode.ABSOLUTE)
+        panel_canvases = self._vis_manager.display_multi_source_session(
+            session,
+            axis_mode=TimeDisplayMode.ABSOLUTE.value,
+        )
+        for canvas in panel_canvases.values():
+            canvas.set_axis_display_mode(self._axis_display_mode)
         first_record = session.sources[0].record
         self._rebuild_grouped_layout(panel_canvases, first_record)
+        self._refresh_signal_browser()
         n = len(panel_canvases)
         ids = ", ".join(s.source_id for s in session.sources)
         self.setWindowTitle(f"Powerwave — Multi-Source: {ids}")
@@ -625,10 +920,15 @@ class PowerwaveMainWindow(QMainWindow):
         from app.data.synthetic import make_mixed_disturbance_record
         self.statusBar().showMessage("Generating synthetic mixed disturbance…")
         result = make_mixed_disturbance_record()
+        self._time_display_mode = TimeDisplayMode.RELATIVE
+        self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
         panel_canvases = self._vis_manager.display_grouped_record(
             result.record, result.signal_metadata
         )
+        for canvas in panel_canvases.values():
+            canvas.set_axis_display_mode(self._axis_display_mode)
         self._rebuild_grouped_layout(panel_canvases, result.record)
+        self._refresh_signal_browser()
         n = len(panel_canvases)
         self.setWindowTitle("Powerwave — Synthetic Mixed Disturbance")
         self.statusBar().showMessage(f"Synthetic mixed disturbance: {n} panel(s)")
@@ -648,6 +948,299 @@ class PowerwaveMainWindow(QMainWindow):
     def _on_load_sample_pulu(self) -> None:
         """Load the built-in pulu_20260306 sample event manifest."""
         self._load_manifest(_SAMPLE_MANIFEST)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RMS display mode (Phase 5A)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _set_time_axis_action_checked(self, mode: TimeDisplayMode) -> None:
+        action = self._time_axis_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
+
+    def _on_time_axis_mode_changed(self, mode: TimeDisplayMode) -> None:
+        """Switch visible panels between relative and absolute timestamp labels."""
+        self._time_display_mode = mode
+        self._apply_time_axis_mode_to_visible()
+        self._set_time_axis_action_checked(mode)
+        label = (
+            "Time axis: Absolute Timestamp"
+            if mode == TimeDisplayMode.ABSOLUTE
+            else "Time axis: Relative Time"
+        )
+        self.statusBar().showMessage(label)
+
+    def _apply_time_axis_mode_to_visible(self) -> None:
+        """Apply current time-axis display policy without changing X data."""
+        self._vis_manager.set_time_axis_mode(self._time_display_mode)
+
+    def _set_axis_mode_action_checked(self, mode: AxisDisplayMode) -> None:
+        action = self._axis_mode_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
+
+    def _on_axis_display_mode_changed(self, mode: AxisDisplayMode) -> None:
+        """Switch visible panels between shared and dedicated Y-axis grouping."""
+        self._axis_display_mode = mode
+        self._apply_axis_display_mode_to_visible()
+        self._set_axis_mode_action_checked(mode)
+        self.statusBar().showMessage(
+            "Axis mode: Shared" if mode == AxisDisplayMode.SHARED else "Axis mode: Dedicated"
+        )
+
+    def _apply_axis_display_mode_to_visible(self) -> None:
+        """Apply current Y-axis grouping without reloading records."""
+        canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
+        for canvas in canvases:
+            if self._qt_widget_alive(canvas):
+                canvas.set_axis_display_mode(self._axis_display_mode)
+        if self._panel_canvases:
+            QTimer.singleShot(0, self._link_panel_x_axes)
+        else:
+            QTimer.singleShot(0, self._link_standard_x_axis)
+
+    def _on_rms_mode_changed(self, mode: RMSDisplayMode) -> None:
+        """Apply a new global RMS display mode to all currently active canvases."""
+        self._rms_display_mode = mode
+        self._apply_rms_mode_to_all_canvases()
+        label = {
+            RMSDisplayMode.OFF: "RMS: Off",
+            RMSDisplayMode.OVERLAY: "RMS: Overlay",
+            RMSDisplayMode.RMS_ONLY: "RMS: Only",
+        }.get(mode, "RMS: Unknown")
+        self.statusBar().showMessage(label)
+
+    def _on_rms_window_mode_changed(self, mode: RMSWindowMode) -> None:
+        """Apply a new engineering RMS measurement window globally."""
+        custom_samples = self._rms_config.custom_window_samples
+        if mode == RMSWindowMode.CUSTOM_SAMPLES:
+            value, ok = QInputDialog.getInt(
+                self,
+                "RMS Window",
+                "Custom RMS window samples:",
+                int(custom_samples or 100),
+                1,
+                1_000_000,
+                1,
+            )
+            if not ok:
+                action = self._rms_window_actions.get(self._rms_config.window_mode)
+                if action is not None:
+                    action.setChecked(True)
+                return
+            custom_samples = int(value)
+
+        self._rms_config = dataclasses.replace(
+            self._rms_config,
+            window_mode=mode,
+            custom_window_samples=custom_samples if mode == RMSWindowMode.CUSTOM_SAMPLES else None,
+            cycles_per_window=2 if mode == RMSWindowMode.TWO_CYCLE else 1,
+        )
+        action = self._rms_window_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
+        self._rebuild_rms_overlays_for_config_change()
+        label = {
+            RMSWindowMode.HALF_CYCLE: "RMS window: Half Cycle",
+            RMSWindowMode.ONE_CYCLE: "RMS window: One Cycle",
+            RMSWindowMode.TWO_CYCLE: "RMS window: Two Cycle",
+            RMSWindowMode.CUSTOM_SAMPLES: f"RMS window: {custom_samples} samples",
+        }[mode]
+        self.statusBar().showMessage(label)
+
+    def _rebuild_rms_overlays_for_config_change(self) -> None:
+        """Clear and rebuild per-canvas RMS curves for the selected window."""
+        canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
+        for canvas in canvases:
+            if not self._qt_widget_alive(canvas):
+                continue
+            canvas.set_rms_display_mode(RMSDisplayMode.OFF)
+            canvas.set_rms_display_mode(
+                self._rms_display_mode,
+                config=self._rms_config,
+                signal_metadata=self._current_signal_metadata or None,
+            )
+
+    def _apply_rms_mode_to_all_canvases(self) -> None:
+        """Push the current RMS mode to every visible canvas."""
+        canvases = []
+        if self._panel_canvases:
+            canvases.extend(self._panel_canvases.values())
+        else:
+            canvases.append(self._canvas)
+
+        sig_meta = self._current_signal_metadata or None
+        for canvas in canvases:
+            if not self._qt_widget_alive(canvas):
+                continue
+            canvas.set_rms_display_mode(
+                self._rms_display_mode,
+                config=self._rms_config,
+                signal_metadata=sig_meta,
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Engineering scaling (Phase 5B)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_scaling_mode_changed(self, mode: EngineeringScalingMode) -> None:
+        """Apply a new global engineering scaling mode to all active canvases."""
+        self._scaling_mode = mode
+        self._apply_scaling_to_all_canvases()
+        action = self._scaling_mode_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
+        labels = {
+            EngineeringScalingMode.RAW: "Scaling: Raw",
+            EngineeringScalingMode.PRIMARY: "Scaling: Primary",
+            EngineeringScalingMode.SECONDARY: "Scaling: Secondary",
+            EngineeringScalingMode.PER_UNIT: "Scaling: Per-Unit",
+        }
+        self.statusBar().showMessage(labels.get(mode, "Scaling changed"))
+
+    def _apply_scaling_to_all_canvases(self) -> None:
+        """Push the current scaling mode and registry to every visible canvas."""
+        canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
+        for canvas in canvases:
+            if self._qt_widget_alive(canvas):
+                canvas.set_scaling_mode(self._scaling_mode, registry=self._scaling_registry)
+
+    def _on_scaling_config(self) -> None:
+        """Open the Scaling Configuration dialog and apply any changes."""
+        from PyQt6.QtWidgets import QDialog
+        from app.ui.dialogs.scaling_config_dialog import ScalingConfigDialog
+
+        dlg = ScalingConfigDialog(self, initial_config=self._scaling_registry.global_config)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_config: GlobalScalingConfig = dlg.get_config()
+        self._scaling_registry.set_global_config(new_config)
+        if self._scaling_mode != EngineeringScalingMode.RAW:
+            self._apply_scaling_to_all_canvases()
+        self.statusBar().showMessage("Scaling configuration updated.")
+
+    def _refresh_signal_browser(self) -> None:
+        """Rebuild the dock tree from the current visualization runtime state."""
+        entries: list[SignalBrowserEntry] = []
+        targets: dict[str, tuple[str, str, str]] = {}
+
+        def source_label(record: DisturbanceRecord | None, fallback: str) -> str:
+            if record is None:
+                return fallback
+            provider = str(getattr(record.metadata, "provider_type", "") or "").upper()
+            source_file = Path(str(getattr(record.metadata, "source_file", "") or "")).name
+            return provider or source_file or fallback
+
+        def add_entry(
+            *,
+            kind: str,
+            panel_key: str,
+            source: str,
+            group: str,
+            name: str,
+            visible: bool,
+        ) -> None:
+            key = f"signal-{len(targets)}"
+            targets[key] = (kind, panel_key, name)
+            entries.append(SignalBrowserEntry(
+                key=key,
+                source=source,
+                group=group,
+                name=name,
+                visible=visible,
+                kind=kind,
+            ))
+
+        if self._panel_canvases:
+            for panel_key, canvas in self._panel_canvases.items():
+                if not self._qt_widget_alive(canvas):
+                    continue
+                record = getattr(canvas, "_record", None)
+                if "/" in panel_key:
+                    src, group_key = panel_key.split("/", 1)
+                    src_label = src
+                else:
+                    group_key = panel_key
+                    src_label = source_label(record, "Record")
+                group_label = getattr(canvas, "_panel_base_title", "") or group_key
+                visible = set(canvas.visible_channel_names())
+                for name in canvas.all_channel_names():
+                    add_entry(
+                        kind="analog",
+                        panel_key=panel_key,
+                        source=src_label,
+                        group=group_label,
+                        name=name,
+                        visible=name in visible,
+                    )
+        elif self._qt_widget_alive(self._canvas):
+            record = getattr(self._canvas, "_record", None)
+            visible = set(self._canvas.visible_channel_names())
+            for name in self._canvas.all_channel_names():
+                add_entry(
+                    kind="analog",
+                    panel_key="standard",
+                    source=source_label(record, "Record"),
+                    group="Analog",
+                    name=name,
+                    visible=name in visible,
+                )
+
+        timeline = self._grouped_timeline if self._grouped_timeline is not None else self._timeline
+        if self._qt_widget_alive(timeline):
+            record = getattr(timeline, "_record", None)
+            visible = set(timeline.visible_channel_names())
+            for name in timeline.all_channel_names():
+                add_entry(
+                    kind="digital",
+                    panel_key="digital",
+                    source=source_label(record, "Record"),
+                    group="Digital",
+                    name=name,
+                    visible=name in visible,
+                )
+
+        self._signal_entry_targets = targets
+        self._signal_browser.set_entries(entries)
+
+    def _on_signal_visibility_changed(self, entry_key: str, visible: bool) -> None:
+        """Apply a Signal Browser checkbox change to live plot widgets."""
+        target = self._signal_entry_targets.get(entry_key)
+        if target is None:
+            return
+        kind, panel_key, name = target
+        if kind == "analog":
+            canvas = self._canvas if panel_key == "standard" else self._panel_canvases.get(panel_key)
+            if not self._qt_widget_alive(canvas):
+                return
+            names = set(canvas.visible_channel_names())
+            if visible:
+                names.add(name)
+            else:
+                names.discard(name)
+            ordered = [ch_name for ch_name in canvas.all_channel_names() if ch_name in names]
+            canvas.set_visible_channels(ordered)
+        elif kind == "digital":
+            timeline = self._grouped_timeline if self._grouped_timeline is not None else self._timeline
+            if not self._qt_widget_alive(timeline):
+                return
+            names = set(timeline.visible_channel_names())
+            if visible:
+                names.add(name)
+            else:
+                names.discard(name)
+            ordered = [ch_name for ch_name in timeline.all_channel_names() if ch_name in names]
+            timeline.set_visible_channels(ordered)
+        else:
+            return
+
+        if self._panel_canvases:
+            QTimer.singleShot(0, self._link_panel_x_axes)
+        elif self._qt_widget_alive(self._canvas):
+            QTimer.singleShot(0, self._link_standard_x_axis)
+
+        self._refresh_signal_browser()
+        self.statusBar().showMessage(f"{name}: {'visible' if visible else 'hidden'}")
 
     def _load_manifest(self, manifest_path: Path) -> None:
         """Load a YAML manifest, show the data review dialog, then visualize."""
@@ -670,5 +1263,8 @@ class PowerwaveMainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.statusBar().showMessage("Manifest load cancelled.")
             return
+
+        for src_id, confirmed_rows in dlg.confirmed_column_rows.items():
+            self._rule_manager.save_confirmed_rows(confirmed_rows, source_id=src_id)
 
         self._on_multi_source_loaded(session)

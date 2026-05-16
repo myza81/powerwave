@@ -13,12 +13,30 @@ When no start_time is set, falls back to plain elapsed-seconds labels.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from enum import Enum
 
 import pyqtgraph as pg
 
 # Explicit axis display mode constants — use these rather than inferring from start_time.
 AXIS_MODE_RELATIVE = "relative_seconds"   # COMTRADE / high-rate: elapsed s
 AXIS_MODE_ABSOLUTE = "absolute_datetime"  # CSV / Excel trend data: wall-clock labels
+
+
+class TimeDisplayMode(str, Enum):
+    """Visualization-level time-axis display modes."""
+
+    RELATIVE = AXIS_MODE_RELATIVE
+    ABSOLUTE = AXIS_MODE_ABSOLUTE
+
+    @classmethod
+    def coerce(cls, value: "TimeDisplayMode | str") -> "TimeDisplayMode":
+        if isinstance(value, cls):
+            return value
+        if value == AXIS_MODE_RELATIVE:
+            return cls.RELATIVE
+        if value == AXIS_MODE_ABSOLUTE:
+            return cls.ABSOLUTE
+        return cls(value)
 
 
 def _choose_format(spacing: float) -> str:

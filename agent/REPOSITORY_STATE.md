@@ -103,7 +103,15 @@ powerwave/
 │   ├── analytics/
 │   ├── __init__.py                    ← exports sliding_rms, to_per_unit
 │   ├── basic_conversions.py           ← sliding_rms, to_per_unit (Phase D1 COMPLETE)
-│   └── (rms/, frequency/, rocof/, harmonics/, phasor/ — all __init__.py stubs)
+│   ├── rms/                           ← RMS Overlay Foundation (Phase 5A COMPLETE)
+│   │   ├── __init__.py                ← exports 7 symbols (RMSCache, RMSConfig, RMSDisplayMode,
+│   │   │                                 RMSEligibilityResult, classify_rms_eligibility,
+│   │   │                                 compute_rms_overlay, compute_window_samples)
+│   │   ├── rms_models.py              ← RMSDisplayMode enum, RMSConfig, RMSEligibilityResult (frozen)
+│   │   ├── sliding_rms.py             ← compute_window_samples, compute_rms_overlay (O(N) cumsum)
+│   │   ├── rms_cache.py               ← RMSCache (NamedTuple key, by-reference arrays)
+│   │   └── rms_overlay.py             ← classify_rms_eligibility (priority chain)
+│   └── (frequency/, rocof/, harmonics/, phasor/ — all __init__.py stubs)
 │   ├── synchronization/ (cursor/, viewport/, managers/ — all __init__.py stubs)
 │   ├── data/                              ← NEW Phase D1 / extended Phase D3 + D4
 │   ├── __init__.py                    ← exports SignalMetadata, build_display_time_seconds,
@@ -284,7 +292,8 @@ Phase 3C — VisualizationManager (IMPLEMENTED)
 - tests/unit/test_visualization_manager.py — 32 tests (MagicMock-based, no display required)
 - 406 total unit tests passing
 
-SynchronizationManager / CursorManager: NOT IMPLEMENTED
+SynchronizationManager: IMPLEMENTED (Phase D4.5A)
+CursorManager: NOT IMPLEMENTED as a separate module; cursor propagation is handled by SynchronizationManager.
 
 Application Bootstrap / Viewer
 
@@ -297,11 +306,27 @@ Status: PHASE 4A COMPLETE
 
 Synchronization Engine
 
-Status: NOT IMPLEMENTED
+Status: IMPLEMENTED (Phase D4.5A)
+
+- `app/visualization/managers/synchronization_manager.py`
+- X-axis pan/zoom synchronization
+- shared visible time window
+- shared InfiniteLine cursor propagation
+- analog panel + digital timeline registration
+- recursion prevention and unregister lifecycle
 
 Analytics Engine
 
-Status: NOT IMPLEMENTED
+Status: PHASE 5A COMPLETE
+
+- `app/analytics/rms/` — RMS Overlay Foundation
+  - `RMSDisplayMode`: OFF / OVERLAY / RMS_ONLY
+  - `compute_rms_overlay()`: O(N) cumsum, NaN-safe, right-aligned causal windowing
+  - `RMSCache`: keyed by (channel_id, window_samples, sample_rate_hz); arrays stored by reference
+  - `classify_rms_eligibility()`: force > measurement_kind > electrical_type > name heuristics
+  - Integrated into `FlexiblePlotCanvas` via `set_rms_display_mode()`
+  - `Tools → RMS Display` submenu in main window (QActionGroup, exclusive)
+  - 116 unit tests passing
 
 CURRENT DOCUMENTATION STATUS
 agent/ — all COMPLETE (HANDOFF, TASK, REPOSITORY_STATE active)
@@ -359,7 +384,13 @@ Phase D3.1 COMPLETE + SignalMetadata electrical reference extension + real sampl
 CURRENT TEST STATUS
 Unit Tests — app/ (via .venv/Scripts/python.exe -m pytest tests/unit/)
 
-1211 tests PASSING (unit) — all app/unit tests green through Phase D4.4.1 stabilization, including direct CSV/Excel intelligence, timestamp rebasing, axis display policy, runtime Qt widgets, grouped display, and visualization manager regressions.
+2178 tests PASSING (unit) — all app/unit tests green through Phase 5B + Phase 5A.R1.
+  Includes 70 Phase 5B scaling tests (per_unit, engineering_scaling, scaling_registry, scaling_canvas).
+  Phase 5A.R1 RMS window tests added after Phase 5B (accounting for count increase from 1514 to 2178).
+  12 skipped (headless-environment guards).
+  8 pre-existing failures (not introduced by Phase 5B):
+    3 test_fuzzy_mapping.py (TestIntelligenceManagerSynonymFallback) — workspace changes pre-Phase 5A
+    5 test_d442_diagnostic.py / test_d442_panel_visibility.py — Qt/ViewBox deletion in headless environment
 
 34 tests PASSING (integration) (34 test_pulu_manifest_pipeline — real sample files required; skips if absent)
 
@@ -499,3 +530,270 @@ Next candidate actions (requires ChatGPT architecture direction):
   Option A — SynchronizationManager for multi-panel cursor coordination (Phase 3D)
   Option B — Analytics foundation: RMS overlay on raw waveform (Phase 5)
   Option C — Operator review workflow hardening and rule management UX (Phase D4.5 candidate)
+
+Phase D4.4.3C Persistent Column Mapping Rules: COMPLETE 2026-05-15
+  Key points:
+  - RuleManager created at app/intelligence/rule_manager.py (service layer)
+  - RuleManager.save_confirmed_rows() converts ColumnReviewRow → MappingRule → YAML
+  - IntelligenceManager.save_confirmed_rules() added (public merge-and-persist method)
+  - DataReviewDialog now exposes confirmed_column_rows dict after accept
+  - Status column shows "✓ Confirmed [rule]" vs "✓ Confirmed [heuristic]" per row.inferred_from
+  - PowerwaveMainWindow: _rule_manager replaces bare IntelligenceManager; both _handle_direct_csv_excel()
+    and _load_manifest() call save_confirmed_rows() on Proceed
+  - Rule persistence loop closed: operator-confirmed mappings survive app restart
+  - 34 new tests; 442 combined passing; zero regressions
+
+NEXT REQUIRED ACTION
+
+Phase D4.4.3C COMPLETE - persistent mapping rule loop closed.
+
+Current state:
+  442 tests confirmed passing in combined regression run (2026-05-15)
+  app/intelligence/ — new service layer: RuleManager wrapping IntelligenceManager
+  app/data/intelligence/ — data layer (unchanged public API; save_confirmed_rules() added)
+  app/ui/dialogs/data_review_dialog.py — confirmed_column_rows output + provenance indicators
+  app/ui/main_window/main_window.py — RuleManager held; saves on dialog accept
+  config/column_mapping_rules.yaml — operator-confirmed rules persisted here (human-editable YAML)
+  Provenance chain: name_exact / name_keyword / synonym_match / persistent_mapping_rule → visible in dialog
+
+Next candidate actions:
+  Option A — SynchronizationManager for multi-panel cursor coordination (Phase 3D)
+  Option B — Analytics foundation: RMS overlay on raw waveform (Phase 5)
+Phase D4.5A SynchronizationManager: COMPLETE 2026-05-15
+  Key points:
+  - app/visualization/managers/synchronization_manager.py added.
+  - Synchronizes X-axis pan/zoom, visible time window, and shared InfiniteLine cursor across registered analog panels and digital timeline.
+  - Uses PyQtGraph signals (`sigXRangeChanged`, `InfiniteLine.sigPositionChanged`) with SignalProxy when a Qt application exists.
+  - Recursion prevention uses `_sync_depth`, duplicate range/cursor echo suppression, and existing widget `set_cursor_pos()` signal blocking.
+  - VisualizationManager now owns a SynchronizationManager and registers standard or grouped panels.
+  - Grouped main-window displays register all analog panel canvases plus optional digital timeline through the manager.
+  - FlexiblePlotCanvas no longer manually forces secondary ViewBox X-ranges in `_sync_curve_view()`; secondary ViewBoxes already follow the primary via `setXLink`, avoiding COMTRADE multi-axis recursion.
+  - Runtime Qt tests validate analog-to-analog synchronization, digital timeline synchronization, and grouped CSV power/frequency cursor/range propagation.
+  - Focused validation:
+      88 passed: synchronization manager, visualization manager, grouped display, multi-source display, runtime Qt widgets.
+      50 passed: PULU manifest integration + synchronization/runtime tests.
+Phase D4.5B X-Domain Synchronization Drift Fix: COMPLETE 2026-05-15
+  Key points:
+  - Root cause was PyQtGraph ViewBox geometry drift, not mismatched timestamp data:
+    dual-axis grouped panels had narrower plot rectangles than single-axis panels.
+  - FlexiblePlotCanvas now reserves matched grouped axis geometry:
+    right_axis_count(), reserve_grouped_axis_columns(), invisible placeholder right axes,
+    fixed grouped left-axis width, and capped total right-axis reservation.
+  - PowerwaveMainWindow applies axis geometry reservation before SynchronizationManager registration.
+  - Direct PULU CSV power/frequency panels now map the same X values to the same widget pixels
+    at start/middle/end after initial display, zoom/pan, cursor movement, and resize.
+
+Phase 5A RMS Overlay Foundation: COMPLETE 2026-05-15
+  Key points:
+  - app/analytics/rms/ — new pure computation package (no Qt dependency)
+  - Three display modes: OFF / OVERLAY / RMS_ONLY, global per FlexiblePlotCanvas
+  - Sliding RMS: O(N) cumsum, NaN/Inf-safe, right-aligned causal windowing, float64 output
+  - Signal eligibility: V/I instantaneous → eligible; MW/Freq/ROCOF/telemetry → ineligible
+  - Operator override (force=True) always wins over all automatic classification
+  - RMSCache: by-reference array storage; survives mode-OFF toggle for fast reactivation
+  - FlexiblePlotCanvas: _build_rms_overlays (once per record), _update_viewport hot path unchanged
+  - Tools → RMS Display submenu (QActionGroup exclusive, PyQt6.QtGui)
+  - SignalMetadata.measurement_kind field added (backward-compatible, defaults None)
+  - 116 new tests passing; 1412 total unit tests passing (3 pre-existing fuzzy_mapping failures)
+
+Phase 5A.1 Engineering Display Normalization & GUI Usability Stabilization: COMPLETE 2026-05-15
+  Key points:
+  - app/visualization/engineering_display.py added as domain-aware display policy.
+  - PyQtGraph auto-SI prefixing disabled on analog Y axes.
+  - Operational units are fixed for display:
+      MW, MVar, Hz, Hz/s, kV/V, A/kA, pu.
+  - No generic SI scaling engine introduced.
+  - No waveform value scaling/conversion introduced; Phase 5B remains responsible for true engineering scaling.
+  - Grouped panels now receive consistent titles:
+      Power, Frequency, Voltage Waveforms, Current Waveforms, Other Analog Channels (N),
+      with source prefixes for multi-source panels.
+  - RMS overlays now have explicit curve names such as "VA RMS (kV)", dashed lighter traces,
+    and panel title suffixes "RMS Overlay" / "RMS Only".
+  - Focused validation:
+      183 passed: engineering display, RMS display/calculation/eligibility/cache,
+      grouped display, multi-source, synchronization, runtime widgets.
+      73 passed: PULU manifest integration + targeted engineering-display/runtime/RMS tests.
+  - Remaining usability gap:
+      high-axis "other" panels are still dense; this phase improves naming but does not redesign grouping.
+Phase 5A.2 Widget Lifecycle Fix for Reopening Files: COMPLETE 2026-05-15
+  Key points:
+  - Root cause was invalid Qt ownership during central-widget replacement:
+      grouped layout switches could delete the C++ DigitalEventTimeline/FlexiblePlotCanvas
+      while PowerwaveMainWindow still held stale Python references.
+  - PowerwaveMainWindow now validates standard widgets with sip.isdeleted().
+  - _ensure_standard_widgets_alive() recreates deleted standard canvas/timeline widgets
+    and rebuilds VisualizationManager around live objects.
+  - Layout switches clear SynchronizationManager before widget removal.
+  - Standard widgets are detached before grouped layouts replace the central widget when
+    they are not meant to be owned by the grouped splitter.
+  - SynchronizationManager now skips SignalProxy.disconnect() when the signal sender's
+    C++ object has already been deleted, preventing Qt access violations during cleanup.
+  - Runtime Qt coverage added for:
+      CSV -> CSV, COMTRADE -> COMTRADE, CSV -> COMTRADE, COMTRADE -> CSV,
+      multi-source -> direct CSV, direct CSV -> multi-source, deleted timeline recreation,
+      and stale synchronization registry prevention.
+  - Focused validation:
+      19 passed: runtime Qt widgets.
+      107 passed: synchronization manager, visualization manager, grouped display,
+      multi-source display, RMS overlay display.
+      37 passed: PULU manifest integration + targeted lifecycle reopen tests.
+  - Remaining caveat:
+      offscreen/OpenGL and Windows pytest cache warnings remain environment noise;
+      lifecycle assertions pass.
+Phase 5A.3 COMTRADE Absolute Timestamp Display Mode: COMPLETE 2026-05-15
+  Key points:
+  - Visualization-level TimeDisplayMode added:
+      RELATIVE = relative elapsed seconds
+      ABSOLUTE = wall-clock timestamp labels
+  - Internal X domain remains float64 seconds in all modes.
+  - No waveform time arrays are mutated.
+  - COMTRADE direct open still defaults to relative time.
+  - View -> Time Axis Mode lets the operator switch visible panels between
+    Relative Time and Absolute Timestamp.
+  - COMTRADE absolute labels derive from:
+      DisturbanceRecord.timing_info.start_time + waveform_data["time"] seconds.
+  - CSV/Excel direct grouped display remains absolute timestamp by default.
+  - Multi-source sessions now default to absolute timestamp and use the common
+    alignment reference start for all panels, so COMTRADE and CSV share the same
+    wall-clock label domain after display offsets.
+  - DigitalEventTimeline now uses DatetimeAxisItem and participates in the same
+    time-axis display mode policy as analog canvases.
+  - SynchronizationManager unchanged:
+      it still synchronizes numeric X ranges and cursors; label mode is cosmetic.
+  - Focused validation:
+      190 passed: datetime axis, D4.4.2 axis policy, visualization manager,
+      grouped display, multi-source display, synchronization, runtime widgets,
+      RMS overlay display.
+      38 passed: PULU manifest integration + targeted CSV/COMTRADE absolute
+      timestamp/RMS runtime tests.
+  - Remaining limitation:
+      no timezone, GPS/PTP, or leap-second correction is implemented; existing
+      parser-provided naive datetimes are used as-is.
+Phase 5A.4 Universal Signal Browser & Visibility Management: COMPLETE 2026-05-16
+  Key points:
+  - app/visualization/signal_visibility.py added as provider-neutral runtime
+    visibility policy.
+  - app/ui/widgets/signal_browser.py added as a dockable Signal Browser.
+  - View -> Signal Browser exposes a checkable source/group/signal tree.
+  - The browser is universal across direct COMTRADE, direct CSV/Excel,
+    grouped displays, and multi-source sessions.
+  - Visibility is runtime visualization state only:
+      DisturbanceRecord is not mutated.
+      waveform arrays are not mutated.
+      providers are not called again.
+  - Large records now use deterministic readable defaults:
+      first 8 analog channels visible
+      first 16 digital tracks visible
+      all channels remain revealable from the browser.
+  - FlexiblePlotCanvas visibility now rebuilds only visible axes/ViewBoxes/raw
+    curves/RMS overlay curves from cached data, removing unused Y axes.
+  - DigitalEventTimeline visibility now rebuilds visible tracks without record reload.
+  - Visibility toggles preserve:
+      X range
+      cursor position
+      synchronization registration
+      grouped pixel alignment
+      timestamp display mode
+      RMS display mode
+  - Focused validation:
+      135 passed: runtime Qt widgets, RMS overlay display, grouped display,
+      multi-source display, synchronization manager, visualization manager.
+      41 passed: PULU manifest integration + targeted browser/runtime tests.
+      8 passed: signal visibility policy + targeted browser/RMS visibility tests.
+  - Remaining usability gaps:
+      no search/filter field yet, no persisted visibility presets, no isolate/highlight
+      actions, and digital multi-source still uses the existing single timeline model.
+Phase 5A.5 Global Axis Management & Analog/Digital Geometry Alignment: COMPLETE 2026-05-16
+  Key points:
+  - app/visualization/axis_management.py added as provider-neutral runtime axis
+    display policy.
+  - Visualization-level AxisDisplayMode added:
+      SHARED = compatible signals share one engineering Y-axis
+      DEDICATED = previous one signal / one axis behavior
+  - Default axis mode is SHARED.
+  - Shared-axis grouping uses engineering role + fixed operational unit:
+      Voltage (kV/V), Current (A/kA), Power (MW), Reactive Power (MVar),
+      Frequency (Hz), ROCOF (Hz/s), Per Unit (pu).
+  - Unknown or incompatible signals remain dedicated by default.
+  - MultiAxisManager now supports multiple signal curves sharing one
+    ViewBox/AxisItem while preserving independent curve visibility.
+  - FlexiblePlotCanvas computes Y ranges per axis group from all visible raw/RMS
+    series assigned to that axis, preventing last-curve range overwrite.
+  - View -> Axis Mode exposes Shared Axis and Dedicated Axis.
+  - Signal Browser visibility continues to work with shared axes; hiding one
+    signal removes only its curve/RMS overlay and removes the shared axis only
+    when no compatible visible signals remain.
+  - DigitalEventTimeline now reserves analog-matched left/right plot chrome and
+    performs deferred ViewBox geometry matching to the analog master.
+  - Analog/digital cursor and timestamp pixel alignment is covered by runtime
+    Qt tests.
+  - Focused validation:
+      141 passed: axis management, visualization manager, grouped display,
+      multi-source display, synchronization manager, RMS overlay display,
+      runtime Qt widgets.
+      41 passed: PULU manifest integration + targeted axis/alignment tests.
+  - Remaining usability gaps:
+      no persistent axis preference system, no per-panel axis editor, no manual
+      axis assignment UI, conservative unknown-signal grouping, and digital
+      multi-source still uses the existing single timeline model.
+Phase 5B Per-Unit & Engineering Scaling Layer: COMPLETE 2026-05-16
+  Key points:
+  - app/analytics/scaling/ added as pure computation package (no Qt dependency):
+      scaling_models.py — EngineeringScalingMode, VoltageReference, GlobalScalingConfig,
+                          SignalScalingConfig, ScalingResult (all frozen dataclasses)
+      per_unit.py — pu_voltage_base_kv, compute_pu_voltage_factor, compute_pu_current_factor
+      engineering_scaling.py — compute_scaling_factor (voltage/current dispatch; pass-through for others)
+      scaling_registry.py — ScalingRegistry (per-signal > global config priority chain)
+  - app/visualization/axis_management.py extended:
+      signal_type_hint param added to axis_group_for_signal()
+      Prevents voltage/current scaled to "pu" from being mis-keyed as generic per_unit role
+      Voltage:pu and current:pu remain separate shared axes after PER_UNIT scaling
+  - app/visualization/widgets/flexible_plot_canvas.py extended:
+      _scaling_mode, _scaling_registry, _scaled_data_cache, _effective_units state
+      _build_scaled_arrays(): clears/rebuilds scaled cache for current mode; lazy ScalingRegistry
+      _get_display_data(name): returns scaled if available, else falls back to raw
+      set_scaling_mode(mode, *, registry): single dispatch for full rescale + RMS cache clear
+      All display paths (_force_y_ranges, _update_viewport, _build_rms_overlays) use _get_display_data
+  - app/ui/dialogs/scaling_config_dialog.py added:
+      QDialog with PT/CT ratio spinboxes, voltage/current base spinboxes, VoltageReference combo
+      get_config() → GlobalScalingConfig
+  - app/ui/main_window/main_window.py extended:
+      Tools → Engineering Scaling submenu (QActionGroup exclusive: Raw/Primary/Secondary/Per-Unit)
+      Tools → Scaling Configuration… dialog
+      _scaling_mode, _scaling_registry, _scaling_mode_actions state
+  - 70 new tests; 1514 total unit tests passing; 8 pre-existing failures unchanged
+  - Non-destructive invariant: DisturbanceRecord.waveform_data never touched by scaling
+  - PER_UNIT with missing base: configured=False → no scaled cache entry → raw display (no silent errors)
+  - RMS consistency: compute_rms_overlay runs on already-scaled data; RMS(k·x) = k·RMS(x) holds
+Phase 5A.R1 RMS Window Validation & Engineering RMS Correction: COMPLETE 2026-05-16
+  Key points:
+  - app/analytics/rms/rms_models.py now includes RMSWindowMode:
+      HALF_CYCLE, ONE_CYCLE, TWO_CYCLE, CUSTOM_SAMPLES.
+  - RMSConfig now carries explicit engineering RMS window selection while
+    preserving cycles_per_window compatibility for older callers.
+  - app/analytics/rms/sliding_rms.py adds compute_rms_window_samples(), deriving
+    RMS windows from sampling_rate_hz / nominal_frequency_hz.
+  - One-cycle RMS is the default:
+      5000 Hz sampling / 50 Hz nominal frequency -> 100 samples.
+  - compute_rms_overlay() accepts RMSConfig and still uses vectorized true RMS:
+      sqrt(mean(x^2)).
+  - FlexiblePlotCanvas RMS overlays now use config-aware window samples for
+    cache keys and computation, infer record nominal frequency when appropriate,
+    and do not mutate waveform arrays.
+  - Tools -> RMS Window adds:
+      Half Cycle, One Cycle, Two Cycle, Custom Samples.
+  - Changing RMS window mode rebuilds visible RMS overlays without data reload
+    and preserves synchronization, timestamp mode, shared-axis mode, and Signal
+    Browser visibility state.
+  - Deterministic engineering validation added:
+      325.27 Vpeak, 50 Hz sine at 5000 Hz sampling -> approximately 230 Vrms
+      after the 100-sample one-cycle window stabilizes.
+  - Focused validation:
+      62 passed: RMS calculation + RMS overlay display tests.
+      193 passed: RMS calculation/display/cache/eligibility, runtime widgets,
+      visualization manager, synchronization manager.
+      68 passed: PULU manifest integration + targeted RMS runtime tests.
+  - Remaining RMS limitations:
+      custom sample count is runtime-only, RMS remains trailing/right-edge
+      aligned, nominal frequency inference is intentionally simple, and no
+      phasor/FFT/frequency overlay analytics were introduced.

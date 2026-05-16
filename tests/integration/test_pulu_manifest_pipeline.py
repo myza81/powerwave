@@ -285,3 +285,38 @@ class TestVisualizationGrouping:
             warnings.simplefilter("ignore")
             groups = group_channels_for_display(csv_rec)
         assert isinstance(groups, dict)
+
+    def test_multi_source_display_uses_absolute_common_timestamp_reference(
+        self,
+        session,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from app.visualization.axis.datetime_axis import AXIS_MODE_ABSOLUTE
+        from app.visualization.managers.visualization_manager import VisualizationManager
+
+        manager = VisualizationManager(MagicMock(), MagicMock())
+        created: list[MagicMock] = []
+
+        def factory() -> MagicMock:
+            canvas = MagicMock()
+            created.append(canvas)
+            return canvas
+
+        panels = manager.display_multi_source_session(session, canvas_factory=factory)
+
+        assert panels
+        assert created
+        for canvas in created:
+            _, kwargs = canvas.set_record.call_args
+            assert kwargs["axis_mode"] == AXIS_MODE_ABSOLUTE
+            assert kwargs["axis_reference_time"] == datetime(2026, 3, 6, 17, 25, 0)
+
+        comtrade_panel = next(
+            canvas for key, canvas in panels.items() if key.startswith("comtrade_main/")
+        )
+        display_record = comtrade_panel.set_record.call_args[0][0]
+        assert float(display_record.waveform_data["time"].iloc[0]) == pytest.approx(
+            2348.817733,
+            abs=1e-3,
+        )

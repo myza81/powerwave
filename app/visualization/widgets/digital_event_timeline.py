@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
@@ -8,12 +9,22 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
 from app.models import DigitalChannel, DisturbanceRecord
+from app.visualization.axis.datetime_axis import (
+    AXIS_MODE_RELATIVE,
+    DatetimeAxisItem,
+    TimeDisplayMode,
+)
+from app.visualization.axis_management import (
+    GROUPED_LEFT_AXIS_WIDTH_PX,
+    reserved_right_axis_width,
+)
 from app.visualization.rendering.digital_transforms import (
     build_step_series,
     clip_digital_to_viewport,
     digital_role_color,
     extract_transitions,
 )
+from app.visualization.signal_visibility import default_visible_digital_names
 
 _TRACK_SPACING = 1.5   # vertical distance between track baselines (data coords)
 _TRACK_HEIGHT  = 1.0   # height of the HIGH-state fill within each track
@@ -48,7 +59,8 @@ class DigitalEventTimeline(pg.PlotWidget):
     cursor_moved = pyqtSignal(float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent=parent)
+        self._datetime_axis = DatetimeAxisItem(orientation="bottom")
+        super().__init__(parent=parent, axisItems={"bottom": self._datetime_axis})
         self.setBackground("#1E1E1E")
 
         self._record: DisturbanceRecord | None = None
@@ -56,6 +68,10 @@ class DigitalEventTimeline(pg.PlotWidget):
         self._tracks: dict[str, _TrackEntry] = {}
         self._trigger_line: pg.InfiniteLine | None = None
         self._cursor: pg.InfiniteLine | None = None
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._axis_reference_time: datetime | None = None
+        self._visible_channel_names: set[str] = set()
+        self._reserved_right_width = 0.0
 
         plot = self.getPlotItem()
         plot.showGrid(x=True, y=False, alpha=0.2)
@@ -69,14 +85,27 @@ class DigitalEventTimeline(pg.PlotWidget):
     # Public API
     # ─────────────────────────────────────────────────────────────────────────
 
-    def set_record(self, record: DisturbanceRecord) -> None:
+    def set_record(
+        self,
+        record: DisturbanceRecord,
+        *,
+        axis_mode: str = AXIS_MODE_RELATIVE,
+        axis_reference_time: datetime | None = None,
+    ) -> None:
         """Load digital channels from a DisturbanceRecord and build tracks."""
         self.clear()
         self._record = record
+        self._axis_reference_time = axis_reference_time or record.timing_info.start_time
+        self.set_time_axis_mode(
+            axis_mode,
+            axis_reference_time=self._axis_reference_time,
+        )
         self._time_cache = record.waveform_data["time"].to_numpy(dtype=np.float64)
+        self._visible_channel_names = set(default_visible_digital_names(record.digital_channels))
 
         for ch in record.digital_channels:
-            self._add_track(ch)
+            if ch.name in self._visible_channel_names:
+                self._add_track(ch)
 
         self._update_y_axis()
         self._add_trigger_line()
@@ -99,6 +128,79 @@ class DigitalEventTimeline(pg.PlotWidget):
             self._cursor.setValue(t)
             self._cursor.blockSignals(False)
 
+    def set_time_axis_mode(
+        self,
+        mode: TimeDisplayMode | str,
+        *,
+        axis_reference_time: datetime | None = None,
+    ) -> None:
+        """Switch X-axis labels without changing digital track time arrays."""
+        display_mode = TimeDisplayMode.coerce(mode)
+        if axis_reference_time is not None:
+            self._axis_reference_time = axis_reference_time
+        self._time_axis_mode = display_mode
+        self._datetime_axis.set_start_time(
+            self._axis_reference_time if display_mode == TimeDisplayMode.ABSOLUTE else None
+        )
+
+    def set_visible_channels(self, names: list[str]) -> None:
+        """Show only the selected digital tracks without mutating record data."""
+        if self._record is None:
+            return
+        valid_names = {ch.name for ch in self._record.digital_channels}
+        self._visible_channel_names = {name for name in names if name in valid_names}
+        self._rebuild_visible_tracks()
+
+    def normalize_viewport(self, t_start: float, t_end: float) -> None:
+        """Force the digital timeline to the same numeric X range as analog panels."""
+        self.getPlotItem().setXRange(float(t_start), float(t_end), padding=0)
+
+    def reserve_grouped_axis_columns(self, right_axis_count: int) -> None:
+        """Reserve the same plot chrome as analog canvases for X-pixel alignment."""
+        self._reserved_right_width = reserved_right_axis_width(right_axis_count)
+        self._apply_axis_geometry_reservation()
+
+    def match_viewbox_geometry(self, reference_viewbox: pg.ViewBox) -> None:
+        """Adjust fixed axis reservations to match an analog reference ViewBox."""
+        reference_rect = reference_viewbox.sceneBoundingRect()
+        own_rect = self.getPlotItem().getViewBox().sceneBoundingRect()
+        if reference_rect.isNull() or own_rect.isNull():
+            return
+
+        plot = self.getPlotItem()
+        left = plot.getAxis("left")
+        right = plot.getAxis("right")
+
+        left_delta = float(reference_rect.left() - own_rect.left())
+        right_delta = float(own_rect.right() - reference_rect.right())
+        if abs(left_delta) > 0.1:
+            left.setWidth(max(1.0, float(left.width()) + left_delta))
+        if abs(right_delta) > 0.1:
+            self._reserved_right_width = max(0.0, self._reserved_right_width + right_delta)
+            right.setWidth(self._reserved_right_width)
+
+        vb = plot.getViewBox()
+        vb.setGeometry(reference_rect)
+        vb.linkedViewChanged(reference_viewbox, vb.XAxis)
+        vb._matrixNeedsUpdate = True
+        vb.updateMatrix()
+
+    def visible_channel_names(self) -> list[str]:
+        """Return visible digital channel names in record order."""
+        if self._record is None:
+            return []
+        return [
+            ch.name
+            for ch in self._record.digital_channels
+            if ch.name in self._visible_channel_names
+        ]
+
+    def all_channel_names(self) -> list[str]:
+        """Return all digital channel names available in the current record."""
+        if self._record is None:
+            return []
+        return [ch.name for ch in self._record.digital_channels]
+
     def clear(self) -> None:
         """Remove all tracks, cursor, and trigger line. Reset to blank state."""
         self.getPlotItem().clear()
@@ -107,6 +209,9 @@ class DigitalEventTimeline(pg.PlotWidget):
         self._time_cache = np.empty(0, dtype=np.float64)
         self._cursor = None
         self._trigger_line = None
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._axis_reference_time = None
+        self._visible_channel_names.clear()
         self._restore_plot_config()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -138,6 +243,41 @@ class DigitalEventTimeline(pg.PlotWidget):
             d_trans=d_trans,
         )
 
+    def _rebuild_visible_tracks(self) -> None:
+        """Rebuild digital tracks while preserving X range and cursor position."""
+        if self._record is None:
+            return
+        x_range = self.getPlotItem().getViewBox().viewRange()[0]
+        cursor_pos = float(self._cursor.value()) if self._cursor is not None else 0.0
+        record = self._record
+        time_cache = self._time_cache
+        mode = self._time_axis_mode
+        reference = self._axis_reference_time
+        visible = set(self._visible_channel_names)
+
+        self.getPlotItem().clear()
+        self._tracks.clear()
+        self._record = record
+        self._time_cache = time_cache
+        self._time_axis_mode = mode
+        self._axis_reference_time = reference
+        self._visible_channel_names = visible
+        self._restore_plot_config()
+        self._datetime_axis.set_start_time(
+            reference if mode == TimeDisplayMode.ABSOLUTE else None
+        )
+
+        for ch in record.digital_channels:
+            if ch.name in visible:
+                self._add_track(ch)
+
+        self._update_y_axis()
+        self._add_trigger_line()
+        self._add_cursor()
+        self.set_cursor_pos(cursor_pos)
+        self.getPlotItem().setXRange(float(x_range[0]), float(x_range[1]), padding=0)
+        self._update_viewport()
+
     def _update_y_axis(self) -> None:
         n = len(self._tracks)
         if n == 0:
@@ -151,6 +291,7 @@ class DigitalEventTimeline(pg.PlotWidget):
             for entry in self._tracks.values()
         ]
         plot.getAxis("left").setTicks([ticks])
+        self._apply_axis_geometry_reservation()
 
     def _add_trigger_line(self) -> None:
         if self._record is None:
@@ -224,4 +365,26 @@ class DigitalEventTimeline(pg.PlotWidget):
         plot.setLabel("bottom", "Time", units="s")
         plot.showAxis("left")
         plot.getAxis("left").setTicks(None)
+        self._apply_axis_geometry_reservation()
         plot.setMouseEnabled(x=True, y=False)
+
+    def _apply_axis_geometry_reservation(self) -> None:
+        plot = self.getPlotItem()
+        left = plot.getAxis("left")
+        left.setWidth(GROUPED_LEFT_AXIS_WIDTH_PX)
+        left.setStyle(
+            autoExpandTextSpace=False,
+            tickTextWidth=max(1, GROUPED_LEFT_AXIS_WIDTH_PX - 8),
+        )
+
+        right = plot.getAxis("right")
+        plot.showAxis("right")
+        right.enableAutoSIPrefix(False)
+        right.setWidth(self._reserved_right_width)
+        right.setStyle(showValues=False)
+        right.setPen(pg.mkPen((0, 0, 0, 0)))
+        right.setTextPen(pg.mkPen((0, 0, 0, 0)))
+
+        vb = plot.getViewBox()
+        vb._matrixNeedsUpdate = True
+        vb.updateMatrix()

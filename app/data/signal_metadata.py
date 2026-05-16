@@ -32,3 +32,6 @@ class SignalMetadata:
     confidence: float | None = None
     inferred_from: str | None = None
     requires_user_confirmation: bool = False
+    # Analytics classification — used by RMS eligibility and future analytics layers
+    # Values: "instantaneous" | "rms" | "average" | "calculated" | "telemetry" | "unknown"
+    measurement_kind: str | None = None

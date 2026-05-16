@@ -108,7 +108,9 @@ def _status_text(row: ColumnReviewRow) -> str:
         if row.confidence < 0.50:
             return "⚠ Review required"
         return "⚠ Review suggested"
-    return "✓ Confirmed"
+    if row.inferred_from == "persistent_mapping_rule":
+        return "✓ Confirmed [rule]"
+    return "✓ Confirmed [heuristic]"
 
 
 def _fmt_offset(seconds: float) -> str:
@@ -203,6 +205,9 @@ class DataReviewDialog(QDialog):
         self._ts_matrices: dict = ts_matrices or {}
         # Stores operator-selected format strings: {source_id: {col_name: format_str}}
         self.selected_timestamp_formats: dict[str, dict[str, str]] = {}
+        # Confirmed column rows populated on accept: {source_id: [ColumnReviewRow, ...]}
+        # Rows with requires_user_confirmation=False and a signal_type are included.
+        self.confirmed_column_rows: dict[str, list[ColumnReviewRow]] = {}
         # Radio-button groups keyed by (source_id, col_name) for later harvest
         self._radio_groups: dict[tuple[str, str], QButtonGroup] = {}
         self._setup_ui()
@@ -276,9 +281,25 @@ class DataReviewDialog(QDialog):
         self.move(frame.topLeft())
 
     def _on_accept(self) -> None:
-        """Harvest all radio-button selections before closing."""
+        """Harvest all selections before closing."""
         self._harvest_ts_selections()
+        self._harvest_confirmed_rows()
         self.accept()
+
+    def _harvest_confirmed_rows(self) -> None:
+        """Collect confirmed column rows per source for the caller to persist.
+
+        Only rows with requires_user_confirmation=False and a valid signal_type
+        are included — these are the mappings the operator implicitly confirmed
+        by clicking Proceed without overriding them.
+        """
+        for src in self._summary.sources:
+            confirmed = [
+                r for r in src.column_rows
+                if not r.requires_user_confirmation and r.signal_type
+            ]
+            if confirmed:
+                self.confirmed_column_rows[src.source_id] = confirmed
 
     def _harvest_ts_selections(self) -> None:
         """Read selected radio buttons and populate selected_timestamp_formats."""

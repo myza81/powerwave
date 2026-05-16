@@ -1,23 +1,59 @@
 from __future__ import annotations
 
+from datetime import datetime
+from dataclasses import replace
+
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
+from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode
+from app.analytics.scaling.scaling_models import EngineeringScalingMode
 from app.models import AnalogChannel, DisturbanceRecord
 from app.visualization.axis.datetime_axis import (
     AXIS_MODE_ABSOLUTE,
     AXIS_MODE_RELATIVE,
     DatetimeAxisItem,
+    TimeDisplayMode,
+)
+from app.visualization.engineering_display import (
+    format_rms_curve_label,
+    format_rms_mode_title,
+    infer_signal_type as _infer_signal_type,
+)
+from app.visualization.axis_management import (
+    AxisDisplayMode,
+    GROUPED_LEFT_AXIS_WIDTH_PX,
+    GROUPED_MAX_RIGHT_AXIS_WIDTH_PX,
+    GROUPED_RIGHT_AXIS_WIDTH_PX,
+    axis_group_for_signal,
 )
 from app.visualization.managers.multi_axis_manager import MultiAxisManager
 from app.visualization.rendering.downsampling import decimate_for_display
+from app.visualization.signal_visibility import default_visible_analog_names
 
 # Canonical phase-detection color heuristic (VIEWPORT_RENDERING_POLICY §9 + §16)
 _AXIS_COLORS = ["#FF4444", "#FFCC00", "#4488FF", "#44BB44", "#AAAAAA", "#FF8800"]
 _SPARSE_RATE_THRESHOLD_HZ = 2.0
 _SPARSE_INTERVAL_THRESHOLD_S = 2.0
+
+
+def _rms_pen_color(hex_color: str) -> str:
+    """Return a lighter shade of *hex_color* for RMS overlay curves.
+
+    Blends the channel color 40% toward white so the RMS envelope is clearly
+    visible against the dark background while remaining visually linked to its
+    raw waveform channel.
+    """
+    c = hex_color.lstrip("#")
+    if len(c) != 6:
+        return "#FFFFFF"
+    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    r2 = min(255, r + int((255 - r) * 0.4))
+    g2 = min(255, g + int((255 - g) * 0.4))
+    b2 = min(255, b + int((255 - b) * 0.4))
+    return f"#{r2:02X}{g2:02X}{b2:02X}"
 
 
 def _channel_color(ch: AnalogChannel) -> str:
@@ -92,6 +128,26 @@ def _finite_y_range(data: np.ndarray) -> tuple[float, float] | None:
     return y_min - pad, y_max + pad
 
 
+def _combined_y_range(series_list: list[np.ndarray]) -> tuple[float, float] | None:
+    y_min: float | None = None
+    y_max: float | None = None
+    for data in series_list:
+        finite = data[np.isfinite(data)]
+        if len(finite) == 0:
+            continue
+        current_min = float(np.min(finite))
+        current_max = float(np.max(finite))
+        y_min = current_min if y_min is None else min(y_min, current_min)
+        y_max = current_max if y_max is None else max(y_max, current_max)
+    if y_min is None or y_max is None:
+        return None
+    if y_min == y_max:
+        pad = max(abs(y_min) * 0.05, 1.0)
+    else:
+        pad = max((y_max - y_min) * 0.05, 1e-9)
+    return y_min - pad, y_max + pad
+
+
 class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
     """N-Axis Single Canvas for analog waveform rendering (SIGRA-style).
 
@@ -111,6 +167,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self,
         parent: QWidget | None = None,
         max_display_points: int = 4_000,
+        axis_display_mode: AxisDisplayMode | str = AxisDisplayMode.SHARED,
     ) -> None:
         super().__init__(parent=parent)
         self.setBackground("#1E1E1E")
@@ -121,10 +178,33 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._time_cache: np.ndarray = np.empty(0, dtype=np.float64)
         self._data_cache: dict[str, np.ndarray] = {}
         self._sparse_mode = False
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._axis_reference_time: datetime | None = None
+        self._axis_display_mode = AxisDisplayMode.coerce(axis_display_mode)
+        self._visible_channel_names: set[str] = set()
 
         self._resize_pending = False
         self._cursor: pg.InfiniteLine | None = None
         self._trigger_line: pg.InfiniteLine | None = None
+        self._reserved_right_axes: list[pg.AxisItem] = []
+
+        # Engineering scaling state (Phase 5B)
+        self._scaling_mode: EngineeringScalingMode = EngineeringScalingMode.RAW
+        self._scaling_registry: object = None   # ScalingRegistry — lazy import
+        self._scaled_data_cache: dict[str, np.ndarray] = {}
+        self._effective_units: dict[str, str] = {}
+
+        # RMS overlay state (Phase 5A)
+        self._rms_display_mode: RMSDisplayMode = RMSDisplayMode.OFF
+        self._rms_config: RMSConfig = RMSConfig()
+        self._rms_signal_metadata: dict = {}
+        self._rms_force_channels: set[str] = set()
+        self._rms_cache: object = None   # RMSCache — lazy import to avoid top-level cost
+        self._rms_curves: dict[str, pg.PlotDataItem] = {}
+        self._rms_time_cache: dict[str, np.ndarray] = {}
+        self._rms_data_cache: dict[str, np.ndarray] = {}
+        self._panel_base_title: str = ""
+        self._panel_title: str = ""
 
         self._datetime_axis = DatetimeAxisItem(orientation="bottom")
         self._primary_plot: pg.PlotItem = self.addPlot(
@@ -154,6 +234,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         record: DisturbanceRecord,
         *,
         axis_mode: str = AXIS_MODE_RELATIVE,
+        axis_reference_time: datetime | None = None,
     ) -> None:
         """Load a DisturbanceRecord. Build N-Axis layout. Zoom to trigger.
 
@@ -165,8 +246,10 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._clear_canvas()
 
         self._record = record
-        self._datetime_axis.set_start_time(
-            record.timing_info.start_time if axis_mode == AXIS_MODE_ABSOLUTE else None
+        self._axis_reference_time = axis_reference_time or record.timing_info.start_time
+        self.set_time_axis_mode(
+            axis_mode,
+            axis_reference_time=self._axis_reference_time,
         )
 
         # Cache numpy arrays once — avoids per-frame DataFrame access in _update_viewport
@@ -177,18 +260,14 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             for ch in record.analog_channels
         }
 
+        # Apply current scaling mode before building axes so effective units
+        # are available when _add_channel_axis() computes grouping keys.
+        self._build_scaled_arrays()
+
+        self._visible_channel_names = set(default_visible_analog_names(record.analog_channels))
         for ch in record.analog_channels:
-            color = _channel_color(ch)
-            vb = self._axis_manager.add_axis(ch.name, ch.unit, color)
-
-            curve = self._make_curve(color)
-
-            if vb is self._primary_plot.getViewBox():
-                self._primary_plot.addItem(curve)
-            else:
-                vb.addItem(curve)
-
-            self._axis_manager.register(ch.name, vb, curve, color)
+            if ch.name in self._visible_channel_names:
+                self._add_channel_axis(ch)
 
         self._add_trigger_line()
         self._add_cursor()
@@ -198,6 +277,47 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         # Y ranges from the raw data cache is both correct and stable.
         if self._sparse_mode:
             self._force_y_ranges()
+
+        # Rebuild RMS overlays for the new record if mode is active
+        if self._rms_display_mode != RMSDisplayMode.OFF:
+            self._build_rms_overlays(
+                self._rms_config,
+                self._rms_signal_metadata or None,
+                self._rms_force_channels or None,
+            )
+            self._update_viewport()
+
+    def set_panel_title(self, title: str) -> None:
+        """Set a concise grouped-display panel title."""
+        self._panel_base_title = title.strip()
+        self._refresh_panel_title()
+
+    def set_time_axis_mode(
+        self,
+        mode: TimeDisplayMode | str,
+        *,
+        axis_reference_time: datetime | None = None,
+    ) -> None:
+        """Switch X-axis labels between elapsed seconds and wall-clock time."""
+        display_mode = TimeDisplayMode.coerce(mode)
+        if axis_reference_time is not None:
+            self._axis_reference_time = axis_reference_time
+        self._time_axis_mode = display_mode
+        self._datetime_axis.set_start_time(
+            self._axis_reference_time if display_mode == TimeDisplayMode.ABSOLUTE else None
+        )
+
+    def set_axis_display_mode(self, mode: AxisDisplayMode | str) -> None:
+        """Switch between shared and dedicated Y-axis grouping."""
+        axis_mode = AxisDisplayMode.coerce(mode)
+        if axis_mode == self._axis_display_mode:
+            return
+        self._axis_display_mode = axis_mode
+        self._rebuild_visible_channel_axes()
+
+    def axis_display_mode(self) -> AxisDisplayMode:
+        """Return the active Y-axis grouping mode."""
+        return self._axis_display_mode
 
     def add_parameter(
         self,
@@ -217,7 +337,14 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         n_existing = len(self._axis_manager.parameter_names())
         effective_color = color if color is not None else _AXIS_COLORS[n_existing % len(_AXIS_COLORS)]
 
-        vb = self._axis_manager.add_axis(name, unit, effective_color)
+        group = axis_group_for_signal(name, unit, mode=self._axis_display_mode)
+        vb = self._axis_manager.add_axis(
+            name,
+            unit,
+            effective_color,
+            axis_key=group.key,
+            axis_label=group.label,
+        )
 
         curve = pg.PlotDataItem(
             pen=pg.mkPen(effective_color, width=1),
@@ -242,36 +369,31 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
     def set_visible_channels(self, names: list[str]) -> None:
         """Show or hide analog channels by name.
 
-        Visible channels are repopulated with current viewport decimation.
-        Hidden channels have their curve data cleared (zero-allocation setData).
+        Visibility is render-layer state only. The record and cached data arrays
+        remain intact; ViewBoxes, axes, raw curves, and RMS overlay curves are
+        rebuilt for the requested visible subset.
         """
-        names_set = set(names)
-        t_start, t_end = self._primary_plot.getViewBox().viewRange()[0]
+        if self._record is None:
+            return
+        valid_names = {ch.name for ch in self._record.analog_channels}
+        self._visible_channel_names = {name for name in names if name in valid_names}
+        self._rebuild_visible_channel_axes()
 
-        for ch_name, curve in self._axis_manager.get_curves().items():
-            if ch_name in names_set and ch_name in self._data_cache:
-                if self._sparse_mode:
-                    t_dec, d_dec = _sparse_display_series(
-                        self._time_cache,
-                        self._data_cache[ch_name],
-                        t_start,
-                        t_end,
-                    )
-                else:
-                    t_dec, d_dec = decimate_for_display(
-                        self._time_cache,
-                        self._data_cache[ch_name],
-                        t_start,
-                        t_end,
-                        self._max_pts,
-                    )
-                curve.setData(t_dec, d_dec)
-                self._sync_curve_view(curve, d_dec, t_start, t_end)
-            elif ch_name not in names_set:
-                curve.setData(
-                    np.empty(0, dtype=np.float64),
-                    np.empty(0, dtype=np.float64),
-                )
+    def visible_channel_names(self) -> list[str]:
+        """Return visible analog channel names in record order."""
+        if self._record is None:
+            return []
+        return [
+            ch.name
+            for ch in self._record.analog_channels
+            if ch.name in self._visible_channel_names
+        ]
+
+    def all_channel_names(self) -> list[str]:
+        """Return all analog channel names available in the current record."""
+        if self._record is None:
+            return []
+        return [ch.name for ch in self._record.analog_channels]
 
     def zoom_to_trigger(self, window_s: float = 0.2) -> None:
         """Centre the viewport on the trigger event ± window_s seconds."""
@@ -328,6 +450,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         except TypeError:
             pass
 
+        self._remove_reserved_right_axes()
         self._axis_manager.clear()
         self._primary_plot.clear()
 
@@ -335,6 +458,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
         self._primary_plot.setLabel("bottom", "Time")
         self._datetime_axis.set_start_time(None)
+        self._refresh_panel_title()
 
         # Fresh axis manager — its __init__ connects _sync_geometries FIRST
         self._axis_manager = MultiAxisManager(self._primary_plot, self)
@@ -345,9 +469,22 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._record = None
         self._time_cache = np.empty(0, dtype=np.float64)
         self._data_cache.clear()
+        self._scaled_data_cache.clear()
+        self._effective_units.clear()
         self._sparse_mode = False
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._axis_reference_time = None
+        self._visible_channel_names.clear()
         self._cursor = None
         self._trigger_line = None
+
+        # RMS overlay — curves removed by PlotItem.clear() / scene removeItem;
+        # only Python-side dicts need explicit reset here.
+        self._rms_curves.clear()
+        self._rms_time_cache.clear()
+        self._rms_data_cache.clear()
+        if self._rms_cache is not None:
+            self._rms_cache.clear()  # type: ignore[union-attr]
 
     # ─────────────────────────────────────────────────────────────────────────
     # Private helpers
@@ -373,6 +510,93 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         curve.setClipToView(True)
         return curve
 
+    def _add_channel_axis(self, ch: AnalogChannel) -> None:
+        """Create a visible axis and raw curve for one analog channel."""
+        color = _channel_color(ch)
+        effective_unit = self._effective_units.get(ch.name, ch.unit or "")
+        # When scaling changes the unit (e.g. kV → pu) we still want voltage
+        # channels to share a "Voltage (pu)" axis rather than merging with the
+        # generic "per_unit" role.  Passing the original signal type as a hint
+        # keeps the grouping key role-correct.
+        signal_hint = _infer_signal_type(ch.name, ch.unit or "")
+        group = axis_group_for_signal(
+            ch.name,
+            effective_unit,
+            mode=self._axis_display_mode,
+            signal_type_hint=signal_hint,
+        )
+        vb = self._axis_manager.add_axis(
+            ch.name,
+            effective_unit,
+            color,
+            axis_key=group.key,
+            axis_label=group.label,
+        )
+        curve = self._make_curve(color)
+        if vb is self._primary_plot.getViewBox():
+            self._primary_plot.addItem(curve)
+        else:
+            vb.addItem(curve)
+        self._axis_manager.register(ch.name, vb, curve, color)
+
+    def _reset_plot_for_axis_rebuild(self) -> None:
+        """Clear plot items and axes while preserving record/data caches."""
+        vb = self._primary_plot.getViewBox()
+        try:
+            vb.sigResized.disconnect(self._axis_manager._sync_geometries)
+        except TypeError:
+            pass
+        try:
+            vb.sigResized.disconnect(self._on_plot_resized)
+        except TypeError:
+            pass
+
+        self._remove_rms_curves()
+        self._remove_reserved_right_axes()
+        self._axis_manager.clear()
+        self._primary_plot.clear()
+        self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
+        self._primary_plot.setLabel("bottom", "Time")
+        self._datetime_axis.set_start_time(
+            self._axis_reference_time
+            if self._time_axis_mode == TimeDisplayMode.ABSOLUTE
+            else None
+        )
+        self._refresh_panel_title()
+
+        self._axis_manager = MultiAxisManager(self._primary_plot, self)
+        vb.sigResized.connect(self._on_plot_resized)
+        self._cursor = None
+        self._trigger_line = None
+
+    def _rebuild_visible_channel_axes(self) -> None:
+        """Rebuild visible axes without reloading or mutating waveform data."""
+        if self._record is None:
+            return
+        x_range = self._primary_plot.getViewBox().viewRange()[0]
+        cursor_pos = float(self._cursor.value()) if self._cursor is not None else 0.0
+
+        self._reset_plot_for_axis_rebuild()
+        for ch in self._record.analog_channels:
+            if ch.name in self._visible_channel_names:
+                self._add_channel_axis(ch)
+
+        self._add_trigger_line()
+        self._add_cursor()
+        self.set_cursor_pos(cursor_pos)
+        self._primary_plot.setXRange(float(x_range[0]), float(x_range[1]), padding=0)
+
+        if self._rms_display_mode != RMSDisplayMode.OFF:
+            self._build_rms_overlays(
+                self._rms_config,
+                self._rms_signal_metadata or None,
+                self._rms_force_channels or None,
+            )
+
+        self._update_viewport()
+        if self._sparse_mode:
+            self._force_y_ranges()
+
     def _on_x_range_changed(
         self,
         _viewbox: pg.ViewBox,
@@ -392,6 +616,80 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._primary_plot.setXRange(t_start, t_end, padding=0)
         if self._sparse_mode:
             self._force_y_ranges()
+
+    def right_axis_count(self) -> int:
+        """Return the number of real secondary right-side Y axes."""
+        return max(0, self._axis_manager.axis_count() - 1)
+
+    def reserve_grouped_axis_columns(self, right_axis_count: int) -> None:
+        """Reserve matching axis columns for stacked grouped panels.
+
+        PyQtGraph sizes each PlotItem from the axes present in that widget. In a
+        grouped display, a dual-axis panel therefore gets a narrower ViewBox
+        than a single-axis panel, which makes identical X values map to different
+        pixels even when their numeric X ranges match. Reserving the same axis
+        columns across the stack keeps the canonical X domain visually aligned.
+        """
+        self._remove_reserved_right_axes()
+
+        left_axis = self._primary_plot.getAxis("left")
+        left_axis.setWidth(GROUPED_LEFT_AXIS_WIDTH_PX)
+
+        real_right_count = self.right_axis_count()
+        target_right_count = max(real_right_count, int(right_axis_count))
+        target_right_width = min(
+            target_right_count * GROUPED_RIGHT_AXIS_WIDTH_PX,
+            GROUPED_MAX_RIGHT_AXIS_WIDTH_PX,
+        )
+        if target_right_count == 0 or target_right_width <= 0:
+            primary_vb = self._primary_plot.getViewBox()
+            primary_vb._matrixNeedsUpdate = True
+            primary_vb.updateMatrix()
+            return
+        target_slots = min(
+            target_right_count,
+            max(1, int(np.ceil(target_right_width / GROUPED_RIGHT_AXIS_WIDTH_PX))),
+        )
+        if real_right_count <= target_slots:
+            real_right_width = target_right_width / target_slots
+            placeholder_count = target_slots - real_right_count
+            placeholder_width = real_right_width
+        else:
+            real_right_width = target_right_width / real_right_count
+            placeholder_count = 0
+            placeholder_width = 0.0
+
+        primary_vb = self._primary_plot.getViewBox()
+        seen_axes: set[int] = set()
+        for entry in self._axis_manager._axes.values():
+            if entry.viewbox is not primary_vb:
+                axis_id = id(entry.axis_item)
+                if axis_id in seen_axes:
+                    continue
+                seen_axes.add(axis_id)
+                entry.axis_item.setWidth(real_right_width)
+
+        for placeholder_index in range(placeholder_count):
+            axis = pg.AxisItem(orientation="right")
+            axis.enableAutoSIPrefix(False)
+            axis.setWidth(placeholder_width)
+            axis.setStyle(showValues=False)
+            axis.setPen(pg.mkPen((0, 0, 0, 0)))
+            axis.setTextPen(pg.mkPen((0, 0, 0, 0)))
+            self.addItem(axis, row=0, col=1 + real_right_count + placeholder_index)
+            self._reserved_right_axes.append(axis)
+
+        primary_vb._matrixNeedsUpdate = True
+        primary_vb.updateMatrix()
+
+    def _remove_reserved_right_axes(self) -> None:
+        for axis in self._reserved_right_axes:
+            try:
+                self.removeItem(axis)
+            except Exception:
+                if axis.scene():
+                    axis.scene().removeItem(axis)
+        self._reserved_right_axes.clear()
 
     def _on_plot_resized(self) -> None:
         if not self._resize_pending:
@@ -414,20 +712,31 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         if vp is not None:
             vp.update()
 
+    def _get_display_data(self, name: str) -> np.ndarray | None:
+        """Return the current display array for a channel.
+
+        Returns the scaled view when engineering scaling is active, else the
+        raw data.  Returns None if the channel has no data at all.
+        """
+        if name in self._scaled_data_cache:
+            return self._scaled_data_cache[name]
+        return self._data_cache.get(name)
+
     def _force_y_ranges(self) -> None:
         """Pin each ViewBox's Y range to its channel's full-data extent.
 
         Used for sparse-mode records where the full dataset is always in the
-        viewport.  Computes the range from the raw data cache rather than from
-        decimated viewport data, so the range is stable regardless of when this
-        is called relative to the first viewport update.
+        viewport.  Computes the range from the display data cache (scaled when
+        active, else raw) so Y ranges are stable and engineering-correct.
         """
+        data_by_viewbox: dict[pg.ViewBox, list[np.ndarray]] = {}
         for name, entry in self._axis_manager._axes.items():
-            if name not in self._data_cache:
-                continue
-            y_range = _finite_y_range(self._data_cache[name])
-            if y_range is not None:
-                entry.viewbox.setYRange(y_range[0], y_range[1], padding=0)
+            display_data = self._get_display_data(name)
+            if display_data is not None:
+                data_by_viewbox.setdefault(entry.viewbox, []).append(display_data)
+            if name in self._rms_data_cache:
+                data_by_viewbox.setdefault(entry.viewbox, []).append(self._rms_data_cache[name])
+        self._set_grouped_y_ranges(data_by_viewbox)
 
     def _update_viewport(
         self,
@@ -445,41 +754,68 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         if t_start is None or t_end is None:
             t_start, t_end = self._primary_plot.getViewBox().viewRange()[0]
 
+        rms_only = self._rms_display_mode == RMSDisplayMode.RMS_ONLY
+        rms_active = self._rms_display_mode in (
+            RMSDisplayMode.OVERLAY,
+            RMSDisplayMode.RMS_ONLY,
+        )
+
+        data_by_viewbox: dict[pg.ViewBox, list[np.ndarray]] = {}
+
         for name, curve in self._axis_manager.get_curves().items():
-            if name in self._data_cache:
-                if self._sparse_mode:
-                    t_dec, d_dec = _sparse_display_series(
-                        self._time_cache,
-                        self._data_cache[name],
-                        t_start,
-                        t_end,
+            display_data = self._get_display_data(name)
+            if display_data is not None:
+                # RMS_ONLY: suppress raw/scaled data for channels with an RMS overlay
+                if rms_only and name in self._rms_data_cache:
+                    curve.setData(
+                        np.empty(0, dtype=np.float64),
+                        np.empty(0, dtype=np.float64),
                     )
                 else:
-                    t_dec, d_dec = decimate_for_display(
-                        self._time_cache,
-                        self._data_cache[name],
-                        t_start,
-                        t_end,
-                        self._max_pts,
-                    )
-                curve.setData(t_dec, d_dec)
-                self._sync_curve_view(curve, d_dec, t_start, t_end)
+                    if self._sparse_mode:
+                        t_dec, d_dec = _sparse_display_series(
+                            self._time_cache,
+                            display_data,
+                            t_start,
+                            t_end,
+                        )
+                    else:
+                        t_dec, d_dec = decimate_for_display(
+                            self._time_cache,
+                            display_data,
+                            t_start,
+                            t_end,
+                            self._max_pts,
+                        )
+                    curve.setData(t_dec, d_dec)
+                    viewbox = curve.getViewBox()
+                    if viewbox is not None:
+                        data_by_viewbox.setdefault(viewbox, []).append(d_dec)
 
-    def _sync_curve_view(
+        # RMS overlay rendering — no analytics here, only array slicing + setData
+        if rms_active and self._rms_curves:
+            for name, rms_curve in self._rms_curves.items():
+                rms_t = self._rms_time_cache.get(name)
+                rms_d = self._rms_data_cache.get(name)
+                if rms_t is not None and rms_d is not None and len(rms_t) > 0:
+                    t_rms_dec, d_rms_dec = decimate_for_display(
+                        rms_t, rms_d, t_start, t_end, self._max_pts
+                    )
+                    rms_curve.setData(t_rms_dec, d_rms_dec)
+                    viewbox = rms_curve.getViewBox()
+                    if viewbox is not None:
+                        data_by_viewbox.setdefault(viewbox, []).append(d_rms_dec)
+
+        self._set_grouped_y_ranges(data_by_viewbox)
+
+    def _set_grouped_y_ranges(
         self,
-        curve: pg.PlotDataItem,
-        data: np.ndarray,
-        t_start: float,
-        t_end: float,
+        data_by_viewbox: dict[pg.ViewBox, list[np.ndarray]],
     ) -> None:
-        viewbox = curve.getViewBox()
-        if viewbox is None:
-            return
-        if viewbox is not self._primary_plot.getViewBox():
-            viewbox.setXRange(t_start, t_end, padding=0)
-        y_range = _finite_y_range(data)
-        if y_range is not None:
-            viewbox.setYRange(y_range[0], y_range[1], padding=0)
+        for viewbox, series_list in data_by_viewbox.items():
+            y_range = _combined_y_range(series_list)
+            if y_range is not None:
+                viewbox.setYRange(y_range[0], y_range[1], padding=0)
 
     def _add_trigger_line(self) -> None:
         """Add a fixed red trigger marker to the primary plot."""
@@ -512,3 +848,278 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
 
     def _on_cursor_moved(self, line: pg.InfiniteLine) -> None:
         self.cursor_moved.emit(line.value())
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Engineering scaling (Phase 5B)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_scaling_mode(
+        self,
+        mode: EngineeringScalingMode,
+        *,
+        registry: object = None,
+    ) -> None:
+        """Apply an engineering scaling mode to all visible waveforms.
+
+        This is a visualization-layer operation only — raw waveform arrays in
+        _data_cache are never mutated.  _scaled_data_cache holds the current
+        display view (raw * factor) and is rebuilt on every mode change.
+
+        Args:
+            mode:     New scaling mode (RAW / PRIMARY / SECONDARY / PER_UNIT).
+            registry: Optional ScalingRegistry to replace the current one.
+        """
+        if registry is not None:
+            self._scaling_registry = registry
+        if mode == self._scaling_mode and registry is None:
+            return
+
+        self._scaling_mode = mode
+        self._build_scaled_arrays()
+
+        # RMS cache holds values computed from the previous scale — clear it so
+        # overlays are recomputed on the new scaled arrays when rebuilt.
+        if self._rms_cache is not None:
+            self._rms_cache.clear()  # type: ignore[union-attr]
+        self._rms_curves.clear()
+        self._rms_time_cache.clear()
+        self._rms_data_cache.clear()
+
+        # Rebuild axes: effective unit may have changed (e.g. kV → pu), which
+        # changes axis labels and shared-axis grouping keys.
+        if self._record is not None:
+            self._rebuild_visible_channel_axes()
+            if self._rms_display_mode != RMSDisplayMode.OFF:
+                self._build_rms_overlays(
+                    self._rms_config,
+                    self._rms_signal_metadata or None,
+                    self._rms_force_channels or None,
+                )
+
+        self._update_viewport()
+
+    def set_scaling_registry(self, registry: object) -> None:
+        """Update scaling configuration without changing the scaling mode."""
+        self.set_scaling_mode(self._scaling_mode, registry=registry)
+
+    def _build_scaled_arrays(self) -> None:
+        """Pre-compute scaled display arrays for the current scaling mode.
+
+        If mode is RAW, _scaled_data_cache is left empty and _update_viewport
+        falls back to _data_cache directly — no extra allocation.
+        """
+        self._scaled_data_cache.clear()
+        self._effective_units.clear()
+
+        if self._scaling_mode == EngineeringScalingMode.RAW or self._record is None:
+            return
+
+        from app.analytics.scaling.scaling_registry import ScalingRegistry
+
+        if self._scaling_registry is None:
+            self._scaling_registry = ScalingRegistry()
+
+        for ch in self._record.analog_channels:
+            if ch.name not in self._data_cache:
+                continue
+            result = self._scaling_registry.compute_scaling_result(  # type: ignore[union-attr]
+                ch.name, ch.unit, self._scaling_mode
+            )
+            self._effective_units[ch.name] = result.display_unit
+            if result.configured and result.factor != 1.0:
+                self._scaled_data_cache[ch.name] = (
+                    self._data_cache[ch.name] * result.factor
+                )
+            # unconfigured (e.g. PER_UNIT without a voltage base) → fall back
+            # to raw so we never display a silently wrong per-unit value.
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RMS overlay (Phase 5A)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_rms_display_mode(
+        self,
+        mode: RMSDisplayMode,
+        *,
+        config: RMSConfig | None = None,
+        signal_metadata: dict | None = None,
+        force_channels: set[str] | None = None,
+    ) -> None:
+        """Set the global RMS overlay display mode for this canvas.
+
+        OFF       — raw waveform only (default).
+        OVERLAY   — raw waveform + RMS envelope together.
+        RMS_ONLY  — RMS envelope only; raw waveform hidden for eligible channels.
+
+        Switching to OVERLAY/RMS_ONLY triggers RMS computation for eligible
+        channels on the first call; subsequent mode switches reuse the cache.
+        Switching back to OFF removes overlay curves and restores raw rendering.
+
+        Args:
+            mode:            New display mode.
+            config:          RMS configuration (nominal frequency, cycles/window).
+            signal_metadata: Optional dict[channel_name → SignalMetadata] for
+                             improved eligibility classification.
+            force_channels:  Channel names to force RMS on regardless of the
+                             automatic eligibility check (operator override).
+        """
+        if config is not None:
+            self._rms_config = config
+        if signal_metadata is not None:
+            self._rms_signal_metadata = signal_metadata
+        if force_channels is not None:
+            self._rms_force_channels = set(force_channels)
+
+        self._rms_display_mode = mode
+        self._refresh_panel_title()
+
+        if mode == RMSDisplayMode.OFF:
+            self._remove_rms_curves()
+            self._update_viewport()
+            return
+
+        # Build overlays when none exist yet (first activation or after OFF)
+        if not self._rms_curves:
+            self._build_rms_overlays(
+                self._rms_config,
+                self._rms_signal_metadata or None,
+                self._rms_force_channels or None,
+            )
+
+        self._update_viewport()
+
+    def _build_rms_overlays(
+        self,
+        config: RMSConfig,
+        signal_metadata: dict | None,
+        force_channels: set[str] | None,
+    ) -> None:
+        """Compute RMS for eligible channels and add overlay curves to ViewBoxes.
+
+        Hot-path guard: all heavy computation (sliding_rms) happens here once
+        per record load.  Subsequent viewport updates only call setData().
+
+        The RMSCache is queried first so that switching modes OFF→ON reuses
+        previously computed results without re-running the O(N) calculation.
+        """
+        from app.analytics.rms.rms_cache import RMSCache
+        from app.analytics.rms.rms_overlay import classify_rms_eligibility
+        from app.analytics.rms.sliding_rms import compute_rms_overlay, compute_rms_window_samples
+
+        if self._record is None or len(self._time_cache) == 0:
+            return
+
+        config = self._resolve_rms_config(config)
+
+        # Lazily create the per-canvas cache
+        if self._rms_cache is None:
+            self._rms_cache = RMSCache()
+
+        # Estimate sample rate — prefer record metadata, fall back to time array
+        rates = [r for r in self._record.sampling_info.sampling_rates if r > 0]
+        if rates:
+            sample_rate_hz = float(rates[0])
+        elif len(self._time_cache) >= 2:
+            diffs = np.diff(self._time_cache[: min(100, len(self._time_cache))])
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
+        else:
+            sample_rate_hz = 0.0
+
+        if sample_rate_hz <= 0:
+            return
+
+        window = compute_rms_window_samples(sample_rate_hz, config)
+        forced: set[str] = force_channels or set()
+
+        for ch in self._record.analog_channels:
+            name = ch.name
+            display_data = self._get_display_data(name)
+            if display_data is None or name not in self._axis_manager._axes:
+                continue
+
+            sig_meta = None if signal_metadata is None else signal_metadata.get(name)
+            eligibility = classify_rms_eligibility(name, sig_meta, force=name in forced)
+
+            if not eligibility.eligible:
+                continue
+
+            if not eligibility.auto_classified:
+                import sys
+                print(f"[RMS] Manual override active for '{name}'", file=sys.stderr)
+
+            # Cache lookup before compute.  Cache is cleared when scaling mode
+            # changes so stale entries from a different scale are never reused.
+            cached = self._rms_cache.get(name, window, sample_rate_hz)  # type: ignore[union-attr]
+            if cached is not None:
+                rms_t, rms_d = cached
+            else:
+                try:
+                    rms_t, rms_d = compute_rms_overlay(
+                        self._time_cache,
+                        display_data,   # scaled when active, raw otherwise
+                        sample_rate_hz,
+                        config=config,
+                    )
+                except ValueError:
+                    continue
+                self._rms_cache.put(name, window, sample_rate_hz, rms_t, rms_d)  # type: ignore[union-attr]
+
+            self._rms_time_cache[name] = rms_t
+            self._rms_data_cache[name] = rms_d
+
+            # Create RMS curve — lighter shade of the channel color, width=2
+            channel_color = self._axis_manager._axes[name].color
+            rms_color = _rms_pen_color(channel_color)
+            rms_curve = pg.PlotDataItem(
+                pen=pg.mkPen(rms_color, width=2, style=Qt.PenStyle.DashLine),
+                name=format_rms_curve_label(name, ch.unit),
+                skipFiniteCheck=True,
+            )
+            rms_curve.setClipToView(True)
+
+            # Add to the same ViewBox as the raw channel
+            vb = self._axis_manager._axes[name].viewbox
+            if vb is self._primary_plot.getViewBox():
+                self._primary_plot.addItem(rms_curve)
+            else:
+                vb.addItem(rms_curve)
+
+            self._rms_curves[name] = rms_curve
+
+    def _resolve_rms_config(self, config: RMSConfig) -> RMSConfig:
+        """Use record nominal frequency when the global config is still default."""
+        if self._record is None:
+            return config
+        record_nominal = getattr(self._record.metadata, "nominal_frequency", None)
+        try:
+            nominal = float(record_nominal)
+        except (TypeError, ValueError):
+            return config
+        if nominal <= 0:
+            return config
+        if config.nominal_frequency_hz == RMSConfig().nominal_frequency_hz:
+            return replace(config, nominal_frequency_hz=nominal)
+        return config
+
+    def _remove_rms_curves(self) -> None:
+        """Remove all RMS overlay curves from their ViewBoxes."""
+        for rms_curve in self._rms_curves.values():
+            try:
+                vb = rms_curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(rms_curve)
+            except Exception:  # noqa: BLE001
+                pass
+        self._rms_curves.clear()
+        self._rms_time_cache.clear()
+        self._rms_data_cache.clear()
+        # _rms_cache intentionally preserved — reused when mode is re-enabled
+
+    def _refresh_panel_title(self) -> None:
+        """Apply base panel title plus a lightweight RMS mode suffix."""
+        self._panel_title = format_rms_mode_title(
+            self._panel_base_title,
+            self._rms_display_mode.value,
+        )
+        self._primary_plot.setTitle(self._panel_title)
