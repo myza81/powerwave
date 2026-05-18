@@ -1,0 +1,63 @@
+"""Timestamp repair strategy contract.
+
+Defines *what* kind of repair is needed and the parameters that repair engine
+will require.  Contains NO repair logic — that is deferred to a later phase.
+
+Strategy selection guide
+------------------------
+NO_REPAIR                  Timestamps already valid; parse as-is.
+PARSE_DETECTED_FORMAT      Auto-detected strptime/ISO format; use detected_format.
+PARSE_USER_FORMAT          User supplied a custom strptime format string; use user_format.
+INTERPOLATE_MISSING        Some timestamps are NaT/blank; fill via linear interpolation.
+RECONSTRUCT_FROM_INTERVAL  No usable timestamp column; rebuild from sampling_interval_seconds.
+COMBINE_DATE_TIME_COLUMNS  Date and time are in separate columns; combine via date_column + time_column.
+EXCEL_SERIAL_CONVERSION    Column contains Excel serial date numbers (days since 1899-12-30).
+TIMEZONE_ALIGNMENT         Timestamps are in a non-UTC timezone; convert to target_timezone.
+"""
+from __future__ import annotations
+
+import enum
+from dataclasses import dataclass
+
+
+class TimestampRepairStrategy(enum.Enum):
+    NO_REPAIR                  = "no_repair"
+    PARSE_DETECTED_FORMAT      = "parse_detected_format"
+    PARSE_USER_FORMAT          = "parse_user_format"
+    INTERPOLATE_MISSING        = "interpolate_missing"
+    RECONSTRUCT_FROM_INTERVAL  = "reconstruct_from_interval"
+    COMBINE_DATE_TIME_COLUMNS  = "combine_date_time_columns"
+    EXCEL_SERIAL_CONVERSION    = "excel_serial_conversion"
+    TIMEZONE_ALIGNMENT         = "timezone_alignment"
+
+
+@dataclass(frozen=True, slots=True)
+class TimestampRepairPlan:
+    """All parameters needed by the (future) timestamp repair engine.
+
+    Immutable once created — the wizard builds a new instance when the user
+    confirms or changes any timestamp setting.
+    """
+
+    strategy: TimestampRepairStrategy
+
+    # Format strings used by PARSE_DETECTED_FORMAT / PARSE_USER_FORMAT
+    detected_format: str | None = None
+    user_format: str | None = None
+
+    # Used by RECONSTRUCT_FROM_INTERVAL
+    sampling_interval_seconds: float | None = None
+
+    # Used by COMBINE_DATE_TIME_COLUMNS
+    date_column: str | None = None
+    time_column: str | None = None
+
+    # Used by TIMEZONE_ALIGNMENT
+    source_timezone: str | None = None
+    target_timezone: str | None = None
+
+    # Set to True once the wizard has validated this plan is internally consistent
+    repair_validated: bool = False
+
+    # Human-readable notes surfaced to the user during review
+    repair_notes: str | None = None

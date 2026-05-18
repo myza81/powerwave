@@ -123,11 +123,16 @@ class TestFlexiblePlotCanvasAxisMode:
         """axis_mode='relative_seconds' must be forwarded to set_time_axis_mode."""
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
         from app.analytics.rms.rms_models import RMSDisplayMode
+        from app.analytics.phasors.phasor_models import PhasorDisplayMode
         from app.visualization.axis.datetime_axis import AXIS_MODE_RELATIVE
+
+        from app.analytics.harmonics.harmonic_models import HarmonicDisplayMode
 
         canvas = MagicMock(spec=FlexiblePlotCanvas)
         canvas._datetime_axis = MagicMock()
         canvas._rms_display_mode = RMSDisplayMode.OFF
+        canvas._phasor_display_mode = PhasorDisplayMode.OFF
+        canvas._harmonic_display_mode = HarmonicDisplayMode.OFF
 
         record = _make_record(start_time=_T_START, trigger_time=_T_TRIG)
 
@@ -140,11 +145,15 @@ class TestFlexiblePlotCanvasAxisMode:
         """axis_mode='absolute_datetime' must be forwarded to set_time_axis_mode."""
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
         from app.analytics.rms.rms_models import RMSDisplayMode
+        from app.analytics.phasors.phasor_models import PhasorDisplayMode
+        from app.analytics.harmonics.harmonic_models import HarmonicDisplayMode
         from app.visualization.axis.datetime_axis import AXIS_MODE_ABSOLUTE
 
         canvas = MagicMock(spec=FlexiblePlotCanvas)
         canvas._datetime_axis = MagicMock()
         canvas._rms_display_mode = RMSDisplayMode.OFF
+        canvas._phasor_display_mode = PhasorDisplayMode.OFF
+        canvas._harmonic_display_mode = HarmonicDisplayMode.OFF
 
         record = _make_record(start_time=_T_START, trigger_time=_T_TRIG)
 
@@ -157,11 +166,15 @@ class TestFlexiblePlotCanvasAxisMode:
         """Default axis_mode must be 'relative_seconds'."""
         from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
         from app.analytics.rms.rms_models import RMSDisplayMode
+        from app.analytics.phasors.phasor_models import PhasorDisplayMode
+        from app.analytics.harmonics.harmonic_models import HarmonicDisplayMode
         from app.visualization.axis.datetime_axis import AXIS_MODE_RELATIVE
 
         canvas = MagicMock(spec=FlexiblePlotCanvas)
         canvas._datetime_axis = MagicMock()
         canvas._rms_display_mode = RMSDisplayMode.OFF
+        canvas._phasor_display_mode = PhasorDisplayMode.OFF
+        canvas._harmonic_display_mode = HarmonicDisplayMode.OFF
 
         record = _make_record(start_time=_T_START, trigger_time=_T_TRIG)
 

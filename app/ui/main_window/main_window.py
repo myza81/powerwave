@@ -32,6 +32,9 @@ from PyQt6.QtWidgets import (
 )
 
 from app.analytics.frequency import FrequencyDisplayMode, FrequencyRegistry
+from app.analytics.harmonics import HarmonicRegistry
+from app.analytics.harmonics.harmonic_models import HarmonicDisplayMode
+from app.analytics.phasors import PhasorDisplayMode, PhasorRegistry
 from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode, RMSWindowMode
 from app.analytics.scaling import EngineeringScalingMode, GlobalScalingConfig, ScalingRegistry
 
@@ -41,8 +44,11 @@ from app.providers import ProviderManager, ComtradeProvider, CsvProvider, ExcelP
 from app.visualization.axis.datetime_axis import TimeDisplayMode
 from app.visualization.axis_management import AxisDisplayMode
 from app.visualization.managers.visualization_manager import VisualizationManager
+from app.visualization.overlays.overlay_colors import sequence_curve_label
+from app.visualization.performance import timed_section
 from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 from app.visualization.widgets.digital_event_timeline import DigitalEventTimeline
+from app.ui.import_wizard import ImportWizardDialog
 from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
 
 _FILE_FILTER = (
@@ -77,7 +83,12 @@ def _record_source_path(record: DisturbanceRecord) -> Path:
 def _is_csv_excel_record(record: DisturbanceRecord) -> bool:
     path = _record_source_path(record)
     provider_type = str(getattr(record.metadata, "provider_type", "") or "").lower()
-    return provider_type in {"csv", "excel"} or path.suffix.lower() in _CSV_EXCEL_SUFFIXES
+    return provider_type in {
+        "csv",
+        "excel",
+        "normalized_csv",
+        "normalized_excel",
+    } or path.suffix.lower() in _CSV_EXCEL_SUFFIXES
 
 
 def _make_source_record(
@@ -102,15 +113,28 @@ def _make_source_record(
         sampling_rates=list(record.sampling_info.sampling_rates),
     )
 
-# Preferred display order for grouped panels
+# Preferred display order for grouped panels (harmonic/sequence panels start hidden)
 _PANEL_ORDER = [
     "voltage_raw",
     "current_raw",
+    "sequence_voltage",
+    "sequence_current",
+    "thd_voltage",
+    "thd_current",
+    "harmonic_spectrum_voltage",
+    "harmonic_spectrum_current",
     "power",
     "frequency",
     "rocof",
     "other",
 ]
+
+_HARMONIC_PANEL_KEYS: frozenset[str] = frozenset({
+    "thd_voltage",
+    "thd_current",
+    "harmonic_spectrum_voltage",
+    "harmonic_spectrum_current",
+})
 
 
 def _log_direct_open_mapping(filename: str, signal_metadata: dict) -> None:
@@ -124,6 +148,62 @@ def _log_direct_open_mapping(filename: str, signal_metadata: dict) -> None:
 def _log_runtime_route(message: str) -> None:
     """Write concise runtime routing evidence for direct-open reconciliation."""
     print(f"[D4.4.3 route] {message}", file=sys.stderr)
+
+
+def _make_sequence_record(
+    source_record: DisturbanceRecord,
+    time: object,
+    data_dict: dict,
+    unit: str,
+) -> DisturbanceRecord:
+    """Build a synthetic DisturbanceRecord from sequence component magnitude arrays."""
+    import numpy as np
+    import pandas as pd
+    from app.models import AnalogChannel
+
+    df = pd.DataFrame({"time": np.asarray(time, dtype=np.float64)})
+    channels = []
+    for i, (name, arr) in enumerate(data_dict.items()):
+        df[name] = np.asarray(arr, dtype=np.float64)
+        channels.append(AnalogChannel(name=name, unit=unit, index=i))
+
+    return DisturbanceRecord(
+        metadata=source_record.metadata,
+        waveform_data=df,
+        analog_channels=channels,
+        digital_channels=[],
+        sampling_info=source_record.sampling_info,
+        timing_info=source_record.timing_info,
+        disturbance_info=source_record.disturbance_info,
+    )
+
+
+def _make_harmonic_record(
+    source_record: DisturbanceRecord,
+    time: object,
+    data_dict: dict,
+    unit: str,
+) -> DisturbanceRecord:
+    """Build a synthetic DisturbanceRecord from harmonic/THD trend arrays."""
+    import numpy as np
+    import pandas as pd
+    from app.models import AnalogChannel
+
+    df = pd.DataFrame({"time": np.asarray(time, dtype=np.float64)})
+    channels = []
+    for i, (name, arr) in enumerate(data_dict.items()):
+        df[name] = np.asarray(arr, dtype=np.float64)
+        channels.append(AnalogChannel(name=name, unit=unit, index=i))
+
+    return DisturbanceRecord(
+        metadata=source_record.metadata,
+        waveform_data=df,
+        analog_channels=channels,
+        digital_channels=[],
+        sampling_info=source_record.sampling_info,
+        timing_info=source_record.timing_info,
+        disturbance_info=source_record.disturbance_info,
+    )
 
 
 def _build_provider_manager() -> ProviderManager:
@@ -275,6 +355,16 @@ class PowerwaveMainWindow(QMainWindow):
         # Frequency/ROCOF display state (Phase 5C)
         self._frequency_registry: FrequencyRegistry = FrequencyRegistry()
         self._frequency_display_mode_actions: dict[FrequencyDisplayMode, object] = {}
+        # Phasor/sequence display state (Phase 6A)
+        self._phasor_registry: PhasorRegistry = PhasorRegistry()
+        self._phasor_display_mode_actions: dict[PhasorDisplayMode, object] = {}
+        # Harmonic analysis state (Phase 8)
+        self._harmonic_registry: HarmonicRegistry = HarmonicRegistry()
+        self._harmonic_display_mode_actions: dict[HarmonicDisplayMode, object] = {}
+        self._harmonic_panel_cache: object = None
+        self._harmonic_panel_cache_record_id: int | None = None
+        self._performance_timing_enabled = False
+        self._performance_timing_sink = None
         self._signal_browser = SignalBrowserDock(self)
         self._signal_entry_targets: dict[str, tuple[str, str, str]] = {}
 
@@ -510,6 +600,9 @@ class PowerwaveMainWindow(QMainWindow):
         open_action = file_menu.addAction("&Open…")
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._open_file_dialog)
+        import_action = file_menu.addAction("&Import Wizard...")
+        import_action.setShortcut("Ctrl+I")
+        import_action.triggered.connect(self._open_import_wizard)
         multi_action = file_menu.addAction("Open &Multi-Source…")
         multi_action.setShortcut("Ctrl+M")
         multi_action.triggered.connect(self._open_multi_source_dialog)
@@ -679,6 +772,48 @@ class PowerwaveMainWindow(QMainWindow):
             freq_disp_group.addAction(action)
             self._frequency_display_mode_actions[fmode] = action
 
+        tools_menu.addSeparator()
+        phasor_disp_menu = tools_menu.addMenu("&Phasor Display")
+        phasor_disp_group = QActionGroup(self)
+        phasor_disp_group.setExclusive(True)
+
+        _phasor_disp_items = [
+            ("O&ff (default)",           PhasorDisplayMode.OFF),
+            ("&Magnitude",               PhasorDisplayMode.MAGNITUDE),
+            ("&Angle",                   PhasorDisplayMode.ANGLE),
+            ("&Sequence Components",     PhasorDisplayMode.SEQUENCE_COMPONENTS),
+        ]
+        for label, pmode in _phasor_disp_items:
+            action = phasor_disp_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(pmode == PhasorDisplayMode.OFF)
+            action.triggered.connect(
+                lambda _checked, m=pmode: self._on_phasor_display_mode_changed(m)
+            )
+            phasor_disp_group.addAction(action)
+            self._phasor_display_mode_actions[pmode] = action
+
+        tools_menu.addSeparator()
+        harmonic_disp_menu = tools_menu.addMenu("&Harmonic Analysis")
+        harmonic_disp_group = QActionGroup(self)
+        harmonic_disp_group.setExclusive(True)
+
+        _harmonic_disp_items = [
+            ("O&ff (default)",          HarmonicDisplayMode.OFF),
+            ("&Magnitude Overlay",      HarmonicDisplayMode.HARMONIC_MAGNITUDE),
+            ("&THD Trend",              HarmonicDisplayMode.THD),
+            ("&Spectrum Panels",        HarmonicDisplayMode.SPECTRUM),
+        ]
+        for label, hmode in _harmonic_disp_items:
+            action = harmonic_disp_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(hmode == HarmonicDisplayMode.OFF)
+            action.triggered.connect(
+                lambda _checked, m=hmode: self._on_harmonic_display_mode_changed(m)
+            )
+            harmonic_disp_group.addAction(action)
+            self._harmonic_display_mode_actions[hmode] = action
+
     # ─────────────────────────────────────────────────────────────────────────
     # File loading (standard path)
     # ─────────────────────────────────────────────────────────────────────────
@@ -689,6 +824,62 @@ class PowerwaveMainWindow(QMainWindow):
         )
         if path_str:
             self._load_file(Path(path_str))
+
+    def _open_import_wizard(self) -> None:
+        dlg = ImportWizardDialog(self)
+        dlg.import_completed.connect(self._on_import_wizard_record_ready)
+        dlg.exec()
+
+    def _on_import_wizard_record_ready(self, record: object) -> None:
+        if not isinstance(record, DisturbanceRecord):
+            QMessageBox.warning(
+                self,
+                "Import Wizard",
+                "Import did not return a waveform record.",
+            )
+            return
+        self._display_imported_record(record)
+
+    def _display_imported_record(self, record: DisturbanceRecord) -> None:
+        """Render an Import Wizard record through existing visualization paths."""
+        source_path = _record_source_path(record)
+        provider_type = str(getattr(record.metadata, "provider_type", "") or "import")
+        source_id = source_path.stem or record.metadata.station_name or "imported_record"
+
+        if self._panel_canvases:
+            self._restore_standard_layout()
+
+        self._time_display_mode = TimeDisplayMode.ABSOLUTE
+        self._set_time_axis_action_checked(TimeDisplayMode.ABSOLUTE)
+        axis_mode = TimeDisplayMode.ABSOLUTE.value
+        self._current_signal_metadata = {}
+
+        panel_canvases = self._vis_manager.display_grouped_record(
+            record, None, axis_mode=axis_mode
+        )
+        for canvas in panel_canvases.values():
+            canvas.set_axis_display_mode(self._axis_display_mode)
+
+        if panel_canvases:
+            seq_panels = self._build_sequence_panels(record, None, FlexiblePlotCanvas)
+            panel_canvases.update(seq_panels)
+            harmonic_panels = self._build_harmonic_panels(record, None, FlexiblePlotCanvas)
+            panel_canvases.update(harmonic_panels)
+            self._rebuild_grouped_layout(panel_canvases, record)
+        else:
+            self._vis_manager.set_record(record, axis_mode=axis_mode)
+            self._canvas.set_axis_display_mode(self._axis_display_mode)
+            QTimer.singleShot(0, self._link_standard_x_axis)
+
+        self._refresh_signal_browser()
+        if self._rms_display_mode != RMSDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_rms_mode_to_all_canvases)
+        if self._phasor_registry.display_mode != PhasorDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_phasor_display_mode)
+        if self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_harmonic_display_mode)
+        self.statusBar().showMessage(_format_load_status(record))
+        self.setWindowTitle(f"Powerwave - {source_id} ({provider_type})")
 
     def _load_file(self, path: Path) -> None:
         self.statusBar().showMessage(f"Loading: {path.name} …")
@@ -863,12 +1054,33 @@ class PowerwaveMainWindow(QMainWindow):
                 "CSV/Excel direct open produced no grouped panels; refusing "
                 "to fall back to the standard analog/digital splitter."
             )
+
+        # Build sequence component panels if three-phase groups exist (Phase 6B)
+        seq_panels = self._build_sequence_panels(
+            record, signal_metadata or None, FlexiblePlotCanvas
+        )
+        panel_canvases.update(seq_panels)
+
+        # Build harmonic analysis panels (Phase 8)
+        harmonic_panels = self._build_harmonic_panels(
+            record, signal_metadata or None, FlexiblePlotCanvas
+        )
+        panel_canvases.update(harmonic_panels)
+
         self._rebuild_grouped_layout(panel_canvases, record)
         self._refresh_signal_browser()
 
         # Re-apply RMS mode to the newly created panels if mode is active
         if self._rms_display_mode != RMSDisplayMode.OFF:
             QTimer.singleShot(0, self._apply_rms_mode_to_all_canvases)
+
+        # Re-apply phasor mode to the newly created panels if mode is active
+        if self._phasor_registry.display_mode != PhasorDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_phasor_display_mode)
+
+        # Re-apply harmonic mode to the newly created panels if mode is active
+        if self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_harmonic_display_mode)
 
         self.statusBar().showMessage(_format_load_status(record))
         self.setWindowTitle(f"Powerwave — {source_id}")
@@ -951,8 +1163,28 @@ class PowerwaveMainWindow(QMainWindow):
         )
         for canvas in panel_canvases.values():
             canvas.set_axis_display_mode(self._axis_display_mode)
+
+        # Build sequence panels if three-phase groups exist (Phase 6B)
+        seq_panels = self._build_sequence_panels(
+            result.record, result.signal_metadata, FlexiblePlotCanvas
+        )
+        panel_canvases.update(seq_panels)
+
+        # Build harmonic analysis panels (Phase 8)
+        harmonic_panels = self._build_harmonic_panels(
+            result.record, result.signal_metadata, FlexiblePlotCanvas
+        )
+        panel_canvases.update(harmonic_panels)
+
         self._rebuild_grouped_layout(panel_canvases, result.record)
         self._refresh_signal_browser()
+
+        if self._phasor_registry.display_mode != PhasorDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_phasor_display_mode)
+
+        if self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF:
+            QTimer.singleShot(0, self._apply_harmonic_display_mode)
+
         n = len(panel_canvases)
         self.setWindowTitle("Powerwave — Synthetic Mixed Disturbance")
         self.statusBar().showMessage(f"Synthetic mixed disturbance: {n} panel(s)")
@@ -1170,6 +1402,409 @@ class PowerwaveMainWindow(QMainWindow):
             canvas = self._panel_canvases.get(key)
             if canvas is not None and self._qt_widget_alive(canvas):
                 canvas.setVisible(visible)
+
+    def _on_phasor_display_mode_changed(self, mode: PhasorDisplayMode) -> None:
+        """Apply a new phasor/sequence component display mode."""
+        self._phasor_registry.set_display_mode(mode)
+        action = self._phasor_display_mode_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)  # type: ignore[union-attr]
+        with timed_section(
+            "phasor_mode_switch",
+            enabled=self._performance_timing_enabled,
+            sink=self._performance_timing_sink,
+        ):
+            self._apply_phasor_display_mode()
+        labels = {
+            PhasorDisplayMode.OFF:                 "Phasor: Off",
+            PhasorDisplayMode.MAGNITUDE:           "Phasor: Magnitude",
+            PhasorDisplayMode.ANGLE:               "Phasor: Angle",
+            PhasorDisplayMode.SEQUENCE_COMPONENTS: "Phasor: Sequence Components",
+        }
+        self.statusBar().showMessage(labels.get(mode, "Phasor display changed"))
+
+    def _apply_phasor_display_mode(self) -> None:
+        """Apply phasor display mode: overlays on waveform canvases + sequence panel visibility.
+
+        MAGNITUDE / ANGLE  — calls set_phasor_display_mode() on all non-sequence
+                             canvases; phasor overlays appear/disappear on the
+                             voltage_raw and current_raw panes.
+        SEQUENCE_COMPONENTS — shows sequence_voltage / sequence_current panels and
+                              calls set_phasor_display_mode(SEQUENCE_COMPONENTS) on
+                              waveform canvases to clear any magnitude/angle overlays.
+        OFF                — calls set_phasor_display_mode(OFF) on all waveform
+                             canvases and hides sequence panels.
+        """
+        mode = self._phasor_registry.display_mode
+
+        def _is_sequence_key(k: str) -> bool:
+            return (
+                k in ("sequence_voltage", "sequence_current")
+                or k.endswith("/sequence_voltage")
+                or k.endswith("/sequence_current")
+            )
+
+        # Gather waveform canvases (not sequence panels)
+        if self._panel_canvases:
+            waveform_canvases = [
+                c for k, c in self._panel_canvases.items()
+                if not _is_sequence_key(k) and self._qt_widget_alive(c)
+            ]
+        elif self._qt_widget_alive(self._canvas):
+            waveform_canvases = [self._canvas]
+        else:
+            waveform_canvases = []
+
+        # Apply phasor overlay mode to waveform canvases
+        sig_meta = self._current_signal_metadata or None
+        for canvas in waveform_canvases:
+            if hasattr(canvas, "set_performance_timing"):
+                canvas.set_performance_timing(
+                    self._performance_timing_enabled,
+                    self._performance_timing_sink,
+                )
+            canvas.set_phasor_display_mode(
+                mode, signal_metadata=sig_meta
+            )
+
+        # Show or hide sequence component panels
+        seq_visible = (mode == PhasorDisplayMode.SEQUENCE_COMPONENTS)
+        for key, canvas in (self._panel_canvases or {}).items():
+            if _is_sequence_key(key) and self._qt_widget_alive(canvas):
+                canvas.setVisible(seq_visible)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Sequence panel construction (Phase 6B)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_sequence_panels(
+        self,
+        record: DisturbanceRecord,
+        signal_metadata: dict | None,
+        canvas_factory,
+    ) -> dict:
+        """Build sequence component canvas panels for a single-record grouped layout.
+
+        Detects three-phase groups, computes V1/V2/V0 and I1/I2/I0 magnitudes,
+        and returns panel canvases keyed by "sequence_voltage" / "sequence_current".
+        Panels start hidden; _apply_phasor_display_mode() controls visibility.
+
+        Returns {} when no complete three-phase groups are found or on any error.
+        Multi-source sessions are not handled here (document as Phase 6B limitation).
+        """
+        import numpy as np
+        from app.analytics.phasors.phasor_extraction import (
+            compute_phasor_window_samples,
+            extract_phasor,
+        )
+        from app.analytics.phasors.symmetrical_components import (
+            compute_sequence_from_phasor_arrays,
+        )
+
+        if record is None:
+            return {}
+
+        channel_names = [ch.name for ch in record.analog_channels]
+        channel_phases = {
+            ch.name: ch.phase
+            for ch in record.analog_channels
+            if ch.phase
+        }
+
+        groups = self._phasor_registry.detect_three_phase_groups(
+            channel_names,
+            signal_metadata or None,
+            channel_phases or None,
+        )
+        if not groups:
+            return {}
+
+        # Estimate sample rate
+        try:
+            time_col = record.waveform_data["time"].to_numpy(dtype=np.float64)
+        except (KeyError, Exception):  # noqa: BLE001
+            return {}
+
+        rates = [r for r in record.sampling_info.sampling_rates if r > 0]
+        if rates:
+            sample_rate_hz = float(rates[0])
+        elif len(time_col) >= 2:
+            diffs = np.diff(time_col[: min(100, len(time_col))])
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
+        else:
+            sample_rate_hz = 0.0
+
+        if sample_rate_hz <= 0:
+            return {}
+
+        config = self._phasor_registry.config
+        seq_voltage_data: dict[str, np.ndarray] = {}
+        seq_current_data: dict[str, np.ndarray] = {}
+        seq_time: np.ndarray | None = None
+
+        with timed_section(
+            "sequence_rendering",
+            enabled=self._performance_timing_enabled,
+            sink=self._performance_timing_sink,
+        ):
+            for group in groups:
+                if not group.complete:
+                    continue
+                try:
+                    ch_a = record.waveform_data[group.phase_a].to_numpy(dtype=np.float64)  # type: ignore[index]
+                    ch_b = record.waveform_data[group.phase_b].to_numpy(dtype=np.float64)  # type: ignore[index]
+                    ch_c = record.waveform_data[group.phase_c].to_numpy(dtype=np.float64)  # type: ignore[index]
+                    pa = extract_phasor(time_col, ch_a, sample_rate_hz, config)
+                    pb = extract_phasor(time_col, ch_b, sample_rate_hz, config)
+                    pc = extract_phasor(time_col, ch_c, sample_rate_hz, config)
+                    seq = compute_sequence_from_phasor_arrays(pa, pb, pc)
+                except Exception:  # noqa: BLE001
+                    continue
+
+                seq_time = seq["time"]
+                if group.signal_type == "voltage":
+                    seq_voltage_data[sequence_curve_label("V", "positive")] = seq["mag_v1"]
+                    seq_voltage_data[sequence_curve_label("V", "negative")] = seq["mag_v2"]
+                    seq_voltage_data[sequence_curve_label("V", "zero")] = seq["mag_v0"]
+                else:
+                    seq_current_data[sequence_curve_label("I", "positive")] = seq["mag_v1"]
+                    seq_current_data[sequence_curve_label("I", "negative")] = seq["mag_v2"]
+                    seq_current_data[sequence_curve_label("I", "zero")] = seq["mag_v0"]
+
+        if seq_time is None:
+            return {}
+
+        result: dict = {}
+        for panel_key, data_dict, unit, title in [
+            ("sequence_voltage", seq_voltage_data, "V", "Sequence Voltage"),
+            ("sequence_current", seq_current_data, "A", "Sequence Current"),
+        ]:
+            if not data_dict:
+                continue
+            syn_record = _make_sequence_record(record, seq_time, data_dict, unit)
+            canvas = canvas_factory()
+            canvas.set_record(syn_record)
+            canvas.set_panel_title(title)
+            canvas.setVisible(False)
+            result[panel_key] = canvas
+
+        return result
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Harmonic display mode (Phase 8)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_harmonic_display_mode_changed(self, mode: HarmonicDisplayMode) -> None:
+        """Apply a new harmonic display mode to all currently active canvases."""
+        self._harmonic_registry.set_display_mode(mode)
+        action = self._harmonic_display_mode_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)  # type: ignore[union-attr]
+        with timed_section(
+            "harmonic_mode_switch",
+            enabled=self._performance_timing_enabled,
+            sink=self._performance_timing_sink,
+        ):
+            self._apply_harmonic_display_mode()
+        labels = {
+            HarmonicDisplayMode.OFF:                "Harmonic: Off",
+            HarmonicDisplayMode.HARMONIC_MAGNITUDE: "Harmonic: Magnitude Overlay",
+            HarmonicDisplayMode.THD:                "Harmonic: THD Trend",
+            HarmonicDisplayMode.SPECTRUM:           "Harmonic: Spectrum Panels",
+        }
+        self.statusBar().showMessage(labels.get(mode, "Harmonic display changed"))
+
+    def _apply_harmonic_display_mode(self) -> None:
+        """Apply harmonic display mode: overlays on waveform canvases + panel visibility.
+
+        HARMONIC_MAGNITUDE — calls set_harmonic_display_mode() on all non-harmonic
+                             canvases; per-order magnitude envelopes appear on the
+                             voltage_raw and current_raw panes.
+        THD               — hides magnitude overlays; shows thd_voltage / thd_current
+                             panels.
+        SPECTRUM          — hides magnitude overlays; shows harmonic_spectrum panels.
+        OFF               — removes magnitude overlays; hides all harmonic panels.
+        """
+        mode = self._harmonic_registry.display_mode
+
+        # Gather waveform canvases (exclude harmonic analysis panels)
+        if self._panel_canvases:
+            waveform_canvases = [
+                c for k, c in self._panel_canvases.items()
+                if k not in _HARMONIC_PANEL_KEYS and self._qt_widget_alive(c)
+            ]
+        elif self._qt_widget_alive(self._canvas):
+            waveform_canvases = [self._canvas]
+        else:
+            waveform_canvases = []
+
+        # Push harmonic overlay mode to waveform canvases
+        sig_meta = self._current_signal_metadata or None
+        for canvas in waveform_canvases:
+            if hasattr(canvas, "set_performance_timing"):
+                canvas.set_performance_timing(
+                    self._performance_timing_enabled,
+                    self._performance_timing_sink,
+                )
+            canvas.set_harmonic_display_mode(mode, signal_metadata=sig_meta)
+
+        # Show/hide THD panels
+        thd_visible = (mode == HarmonicDisplayMode.THD)
+        for key in ("thd_voltage", "thd_current"):
+            canvas = (self._panel_canvases or {}).get(key)
+            if canvas is not None and self._qt_widget_alive(canvas):
+                canvas.setVisible(thd_visible)
+
+        # Show/hide spectrum panels
+        spectrum_visible = (mode == HarmonicDisplayMode.SPECTRUM)
+        for key in ("harmonic_spectrum_voltage", "harmonic_spectrum_current"):
+            canvas = (self._panel_canvases or {}).get(key)
+            if canvas is not None and self._qt_widget_alive(canvas):
+                canvas.setVisible(spectrum_visible)
+
+    def _build_harmonic_panels(
+        self,
+        record: DisturbanceRecord,
+        signal_metadata: dict | None,
+        canvas_factory,
+    ) -> dict:
+        """Build THD trend and harmonic spectrum panels for a grouped layout.
+
+        Computes harmonic extraction for all eligible channels, then constructs:
+          - thd_voltage / thd_current  — time-varying THD% trend panels
+          - harmonic_spectrum_voltage / harmonic_spectrum_current
+                                       — H3..H13 magnitude trend panels
+
+        Panels start hidden; _apply_harmonic_display_mode() controls visibility.
+        Returns {} when no eligible channels are found or on any error.
+        """
+        import numpy as np
+        from app.analytics.harmonics.harmonic_cache import HarmonicCache
+        from app.analytics.harmonics.harmonic_extraction import (
+            compute_harmonic_window_samples,
+            extract_harmonics,
+        )
+        from app.analytics.harmonics.harmonic_metrics import compute_thd_array
+        from app.analytics.harmonics.harmonic_models import HarmonicChannelRole
+        from app.analytics.harmonics.harmonic_overlay import classify_harmonic_role
+
+        if record is None:
+            return {}
+
+        config = self._harmonic_registry.config
+
+        try:
+            time_col = record.waveform_data["time"].to_numpy(dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            return {}
+
+        rates = [r for r in record.sampling_info.sampling_rates if r > 0]
+        if rates:
+            sample_rate_hz = float(rates[0])
+        elif len(time_col) >= 2:
+            diffs = np.diff(time_col[: min(100, len(time_col))])
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
+        else:
+            sample_rate_hz = 0.0
+
+        if sample_rate_hz <= 0:
+            return {}
+
+        window = compute_harmonic_window_samples(sample_rate_hz, config)
+        overlap_clamped = max(0.0, min(config.overlap, 0.999))
+        hop = max(1, int(round(window * (1.0 - overlap_clamped))))
+
+        if (
+            self._harmonic_panel_cache is None
+            or self._harmonic_panel_cache_record_id != id(record)
+        ):
+            self._harmonic_panel_cache = HarmonicCache()
+            self._harmonic_panel_cache_record_id = id(record)
+        cache = self._harmonic_panel_cache
+        thd_voltage: dict[str, np.ndarray] = {}
+        thd_current: dict[str, np.ndarray] = {}
+        # Spectrum: H3..H13 for the first eligible voltage/current channel only.
+        spec_voltage: dict[str, np.ndarray] = {}
+        spec_current: dict[str, np.ndarray] = {}
+        harmonic_time: np.ndarray | None = None
+        _SPECTRUM_ORDERS = [3, 5, 7, 11, 13]
+
+        with timed_section(
+            "harmonic_panel_build",
+            enabled=self._performance_timing_enabled,
+            sink=self._performance_timing_sink,
+        ):
+            for ch in record.analog_channels:
+                name = ch.name
+                meta = (signal_metadata or {}).get(name)
+                role = classify_harmonic_role(name, ch.unit, meta).role
+                if role == HarmonicChannelRole.UNKNOWN:
+                    continue
+
+                try:
+                    raw_data = record.waveform_data[name].to_numpy(dtype=np.float64)
+                except Exception:  # noqa: BLE001
+                    continue
+
+                cached = cache.get(
+                    name, window, hop, config.nominal_hz, config.max_order
+                )
+                if cached is not None:
+                    h_result = cached
+                else:
+                    try:
+                        h_result = extract_harmonics(
+                            raw_data, sample_rate_hz, config, time=time_col
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    cache.put(
+                        name, window, hop, config.nominal_hz, config.max_order, h_result
+                    )
+
+                if h_result.n_windows == 0:
+                    continue
+
+                harmonic_time = h_result.harmonic_time
+                thd_arr = compute_thd_array(h_result.magnitudes) * 100.0  # → percent
+
+                if role == HarmonicChannelRole.VOLTAGE_HARMONIC:
+                    thd_voltage[name] = thd_arr
+                    if not spec_voltage:
+                        for order in _SPECTRUM_ORDERS:
+                            mag = h_result.get_magnitude(order)
+                            if mag is not None:
+                                spec_voltage[f"H{order}"] = mag
+                else:
+                    thd_current[name] = thd_arr
+                    if not spec_current:
+                        for order in _SPECTRUM_ORDERS:
+                            mag = h_result.get_magnitude(order)
+                            if mag is not None:
+                                spec_current[f"H{order}"] = mag
+
+        if harmonic_time is None:
+            return {}
+
+        result: dict = {}
+        for panel_key, data_dict, unit, title in [
+            ("thd_voltage",              thd_voltage,   "%",     "THD — Voltage (%)"),
+            ("thd_current",              thd_current,   "%",     "THD — Current (%)"),
+            ("harmonic_spectrum_voltage", spec_voltage, "V RMS", "Harmonic Spectrum — Voltage"),
+            ("harmonic_spectrum_current", spec_current, "A RMS", "Harmonic Spectrum — Current"),
+        ]:
+            if not data_dict:
+                continue
+            syn_record = _make_harmonic_record(record, harmonic_time, data_dict, unit)
+            canvas = canvas_factory()
+            canvas.set_record(syn_record)
+            canvas.set_panel_title(title)
+            canvas.setVisible(False)
+            result[panel_key] = canvas
+
+        return result
 
     def _refresh_signal_browser(self) -> None:
         """Rebuild the dock tree from the current visualization runtime state."""

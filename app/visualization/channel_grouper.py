@@ -16,6 +16,10 @@ DISPLAY_GROUP_ROCOF = "rocof"
 DISPLAY_GROUP_DIGITAL = "digital"
 DISPLAY_GROUP_OTHER = "other"
 
+# Phase 6A: sequence component display groups
+DISPLAY_GROUP_SEQUENCE_VOLTAGE = "sequence_voltage"
+DISPLAY_GROUP_SEQUENCE_CURRENT = "sequence_current"
+
 
 def group_channels_for_display(
     record: DisturbanceRecord,
@@ -80,4 +84,28 @@ def _infer_display_group(name: str) -> str:
     if "rocof" in lower or lower.startswith("df"):
         return DISPLAY_GROUP_ROCOF
 
+    # Sequence voltage: V1, V2, V0 naming patterns
+    if _is_sequence_voltage(lower):
+        return DISPLAY_GROUP_SEQUENCE_VOLTAGE
+
+    # Sequence current: I1, I2, I0 naming patterns
+    if _is_sequence_current(lower):
+        return DISPLAY_GROUP_SEQUENCE_CURRENT
+
     return DISPLAY_GROUP_OTHER
+
+
+def _is_sequence_voltage(lower: str) -> bool:
+    """Return True if name looks like a sequence voltage channel."""
+    patterns = ("v1", "v2", "v0", "vpos", "vneg", "vzero",
+                "seq_v", "sequence_v", "pos_seq_v", "neg_seq_v", "zero_seq_v")
+    return any(lower == p or lower.startswith(p + "_") or ("_" + p) in lower
+               for p in patterns)
+
+
+def _is_sequence_current(lower: str) -> bool:
+    """Return True if name looks like a sequence current channel."""
+    patterns = ("i1", "i2", "i0", "ipos", "ineg", "izero",
+                "seq_i", "sequence_i", "pos_seq_i", "neg_seq_i", "zero_seq_i")
+    return any(lower == p or lower.startswith(p + "_") or ("_" + p) in lower
+               for p in patterns)

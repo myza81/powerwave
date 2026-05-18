@@ -227,6 +227,10 @@ class VisualizationManager:
         self._record: DisturbanceRecord | None = None
         self._x_linked: bool = False
         self._panel_canvases: dict = {}
+        self._sequence_panels_visible = False
+        self._sequence_panel_data: dict = {}
+        self._harmonic_panels_visible = False
+        self._harmonic_panel_data: dict = {}
         self._sync_manager = SynchronizationManager()
         self._time_axis_mode = TimeDisplayMode.RELATIVE
         self._axis_reference_time: datetime | None = None
@@ -342,6 +346,8 @@ class VisualizationManager:
         self._record = None
         self._axis_reference_time = None
         self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._harmonic_panels_visible = False
+        self._harmonic_panel_data = {}
         self._sync_manager.clear()
         self._canvas._clear_canvas()
         self._timeline.clear()
@@ -374,6 +380,44 @@ class VisualizationManager:
         """Move master cursor on both widgets without emitting cursor_moved."""
         self._canvas.set_cursor_pos(t)
         self._timeline.set_cursor_pos(t)
+
+    def show_sequence_panels(self, *args, **kwargs) -> None:
+        """Phase 6B hook: mark sequence component panels as requested.
+
+        This method intentionally does not create panels or render sequence
+        data yet. It provides a stable routing point for the future phasor UI.
+        """
+        self._sequence_panels_visible = True
+
+    def hide_sequence_panels(self) -> None:
+        """Phase 6B hook: mark sequence component panels as hidden."""
+        self._sequence_panels_visible = False
+
+    def set_sequence_panel_data(self, *args, **kwargs) -> None:
+        """Phase 6B hook: accept future sequence panel payloads without rendering."""
+        self._sequence_panel_data = {
+            "args": args,
+            "kwargs": kwargs,
+        }
+
+    def show_harmonic_panels(self, *args, **kwargs) -> None:
+        """Phase 8 hook: mark harmonic panels as requested without rendering."""
+        self._harmonic_panels_visible = True
+        self._harmonic_panel_data = {
+            "args": args,
+            "kwargs": kwargs,
+        }
+
+    def hide_harmonic_panels(self) -> None:
+        """Phase 8 hook: mark harmonic panels hidden without altering waveforms."""
+        self._harmonic_panels_visible = False
+
+    def set_harmonic_panel_data(self, *args, **kwargs) -> None:
+        """Phase 8 hook: accept future harmonic panel payloads without rendering."""
+        self._harmonic_panel_data = {
+            "args": args,
+            "kwargs": kwargs,
+        }
 
     def register_synchronized_panels(
         self,

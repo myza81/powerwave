@@ -120,6 +120,20 @@ powerwave/
 │   │   ├── rocof_overlay.py       ← classify_rocof, rocof_display_label, rocof_axis_label,
 │   │   │                             frequency_display_label, frequency_axis_label
 │   │   └── frequency_registry.py  ← FrequencyRegistry (session cache, display mode, panel keys)
+│   ├── phasors/                   ← Phasor & Sequence Component Engine (Phase 6A COMPLETE)
+│   │   ├── __init__.py            ← public exports (29 symbols)
+│   │   ├── phasor_models.py       ← PhasorDisplayMode, PhasorWindowMode, PhaseLabel,
+│   │   │                             PhasorChannelRole, PhasorChannelResult, PhasorConfig,
+│   │   │                             ThreePhaseGroup
+│   │   ├── phasor_extraction.py   ← extract_phasor (sliding DFT, stride-trick, O(N·W)),
+│   │   │                             compute_phasor_window_samples
+│   │   ├── symmetrical_components.py ← compute_sequence_components (Fortescue V1/V2/V0),
+│   │   │                              compute_sequence_from_phasor_arrays, unbalance_factor
+│   │   ├── phasor_overlay.py      ← classify_phasor_role (priority chain), identify_phase,
+│   │   │                             detect_three_phase_groups, is_voltage_channel, is_current_channel
+│   │   ├── phasor_registry.py     ← PhasorRegistry (session cache, display mode, panel keys,
+│   │   │                             detect_three_phase_groups wrapper)
+│   │   └── phasor_cache.py        ← PhasorCache (phasor + sequence stores, invalidate_channel)
 │   └── (rocof/, harmonics/, phasor/ — all __init__.py stubs)
 │   ├── synchronization/ (cursor/, viewport/, managers/ — all __init__.py stubs)
 │   ├── data/                              ← NEW Phase D1 / extended Phase D3 + D4
@@ -326,7 +340,36 @@ Status: IMPLEMENTED (Phase D4.5A)
 
 Analytics Engine
 
-Status: PHASE 5C COMPLETE
+Status: PHASE 7 COMPLETE
+
+- `app/analytics/phasors/` — Phasor & Sequence Component Engine (Phase 6A) + Rendering Integration (Phase 6B)
+  - `PhasorDisplayMode`: OFF (default) / MAGNITUDE / ANGLE / SEQUENCE_COMPONENTS
+  - `PhasorChannelRole`: VOLTAGE_PHASOR / CURRENT_PHASOR / UNKNOWN
+  - `PhaseLabel`: A / B / C / UNKNOWN
+  - `extract_phasor()`: vectorized sliding DFT (stride-trick, n_cycle kernel — correct for all window modes)
+  - `compute_sequence_components()`: Fortescue V1/V2/V0 (V0=(Va+Vb+Vc)/3, a=exp(j2π/3))
+  - `unbalance_factor()`: NSVUF = |V2|/|V1|×100%
+  - `classify_phasor_role()`: 5-level priority chain (force > measurement_kind > electrical_type > unit > name)
+  - `identify_phase()`: ABC universal + RYB context-gated (prevents false positives)
+  - `detect_three_phase_groups()`: complete A/B/C group detection
+  - `PhasorRegistry`: session cache + display mode + phasor_panel_keys() + three-phase group detection
+  - `PhasorCache`: separate phasor and sequence stores, keyed by (channel_id, window_samples, nominal_hz)
+  - `Tools → Phasor Display` menu in main window
+  - 214 + 48 = 262 unit tests passing (Phase 6A + Phase 6B)
+- `app/visualization/overlays/phasor_overlay.py` — PhasorCurveOverlay (Phase 6B)
+  - General-purpose `PhasorCurveOverlay(BaseOverlay)` for single-PlotItem phasor curve management
+  - Uses `CurveStore` for dedup; supports MAGNITUDE (dotted) and ANGLE (dash-dot) pen styles
+  - For FlexiblePlotCanvas multi-axis: inline `_build_phasor_overlays()` pattern (per-channel ViewBox access)
+- `FlexiblePlotCanvas` phasor rendering (Phase 6B)
+  - `set_phasor_display_mode(mode, ...)` — rebuilds/clears phasor curves; delegates to _build_phasor_overlays
+  - `_build_phasor_overlays()` — lazy DFT extraction via PhasorCache, per-channel ViewBox curve creation
+  - `_update_viewport()` — MAGNITUDE curves contribute to Y-range; ANGLE curves excluded (degrees scale)
+  - Pen colors: MAGNITUDE = 60%-blend-toward-white (dotted); ANGLE = 40%-blend-toward-cyan (dash-dot)
+- Sequence panels (Phase 6B)
+  - `_make_sequence_record()` — builds synthetic DisturbanceRecord with V1/V2/V0 or I1/I2/I0 channels
+  - `_build_sequence_panels()` — creates hidden FlexiblePlotCanvas panels at load time
+  - `_PANEL_ORDER` in main_window.py: sequence_voltage/current placed after current_raw
+  - Visibility controlled solely by `_apply_phasor_display_mode()` via `setVisible()`
 
 - `app/analytics/frequency/` — Frequency/ROCOF Integration (Phase 5C)
   - `FrequencyDisplayMode`: OFF / OVERLAY / PANEL_ONLY (default)
@@ -403,7 +446,10 @@ Phase D3.1 COMPLETE + SignalMetadata electrical reference extension + real sampl
 CURRENT TEST STATUS
 Unit Tests — app/ (via .venv/Scripts/python.exe -m pytest tests/ --ignore=tests/integration)
 
-2349 tests PASSING — all green through Phase 5C (Frequency/ROCOF Analytics).
+2824 tests PASSING — all green through Phase 7 (Harmonic Analysis Foundation).
+  Includes 157 Phase 7 harmonic tests (extraction, metrics, classification, registry/cache).
+  Includes 48 Phase 6B phasor rendering tests (overlay lifecycle, pen colors, sequence record building, routing, cache reuse).
+  Includes 214 Phase 6A phasor tests (extraction, symmetrical components, classification, display/registry).
   Includes 197 Phase 5C frequency tests (classification, display, visualization).
   12 skipped (headless-environment guards).
   0 failures.
@@ -813,3 +859,236 @@ Phase 5A.R1 RMS Window Validation & Engineering RMS Correction: COMPLETE 2026-05
       custom sample count is runtime-only, RMS remains trailing/right-edge
       aligned, nominal frequency inference is intentionally simple, and no
       phasor/FFT/frequency overlay analytics were introduced.
+Phase 6B Phasor Rendering Integration: COMPLETE 2026-05-17
+  Key points:
+  - app/visualization/overlays/phasor_overlay.py added:
+      PhasorCurveOverlay(BaseOverlay) — general-purpose single-PlotItem phasor overlay.
+      Uses CurveStore for dedup; MAGNITUDE=dotted pen, ANGLE=dash-dot pen.
+      SEQUENCE_COMPONENTS intentionally excluded (dedicated panel approach used instead).
+  - app/visualization/overlays/__init__.py: PhasorCurveOverlay exported.
+  - FlexiblePlotCanvas phasor state added:
+      _phasor_display_mode, _phasor_config, _phasor_curves, _phasor_cache,
+      _phasor_time_cache, _phasor_data_cache.
+  - FlexiblePlotCanvas methods added:
+      set_phasor_display_mode() — public API for mode switching.
+      _build_phasor_overlays() — lazy phasor DFT extraction + per-channel ViewBox curve creation.
+      _remove_phasor_curves() — removes curves from ViewBoxes, preserves cache.
+  - _update_viewport() extended:
+      MAGNITUDE phasor curves decimated and rendered; data contributed to Y-range (same units as raw).
+      ANGLE phasor curves decimated and rendered; excluded from Y-range ([-180,180] degrees).
+  - set_record() and _rebuild_visible_channel_axes() rebuild phasor overlays when mode is active.
+  - main_window.py _make_sequence_record():
+      Builds synthetic DisturbanceRecord with V1/V2/V0 (voltage) or I1/I2/I0 (current) channels.
+      Shares timing_info, metadata, sampling_info with source record.
+      Time column is the phasor time array (right-aligned, starts window-1 samples into source).
+  - main_window.py _build_sequence_panels():
+      Detects three-phase groups, computes sequence components, creates hidden FlexiblePlotCanvas panels.
+      Only handles single-record display (CSV/Excel/Synthetic); multi-source deferred.
+  - main_window.py _apply_phasor_display_mode() rewired:
+      Delegates to canvas.set_phasor_display_mode() on waveform canvases.
+      Toggles sequence panel visibility for sequence_voltage/sequence_current keys.
+  - test_d441_stabilization.py: TestFlexiblePlotCanvasAxisMode updated with canvas._phasor_display_mode = OFF
+    to match expanded FlexiblePlotCanvas.set_record() contract (regression fix, not new test).
+  - 48 new tests; 2657 total passing, 12 skipped, 0 failures.
+Phase 7 Harmonic Analysis Foundation: COMPLETE 2026-05-17
+  Key points:
+  - app/analytics/harmonics/ package created (6 modules + __init__.py):
+      harmonic_models.py: HarmonicDisplayMode (OFF/HARMONIC_MAGNITUDE/THD/SPECTRUM),
+        HarmonicWindowMode (ONE_CYCLE/TWO_CYCLE/FOUR_CYCLE), HarmonicChannelRole
+        (VOLTAGE_HARMONIC/CURRENT_HARMONIC/UNKNOWN), HarmonicChannelResult (frozen
+        dataclass), HarmonicConfig (frozen dataclass, defaults: 50 Hz/25 orders/TWO_CYCLE/
+        hann/0.5 overlap), HarmonicResult (dataclass with orders, n_windows, get_magnitude,
+        fundamental properties + empty() classmethod).
+      harmonic_extraction.py: compute_harmonic_window_samples() — cycle-aligned window
+        sizing (n_cycles * round(fs/f0)); extract_harmonics() — sliding-window stride-trick
+        view, batch rfft, amplitude-correct RMS normalisation (sqrt(2)*|FFT[k]|/win_sum),
+        right-aligned time axis, NaN/Inf replacement, max_order limiting.
+      harmonic_metrics.py: compute_thd() (scalar, THD=sqrt(sum H2..HN²)/H1),
+        compute_thd_array() (vectorized), compute_thd_from_result() (convenience wrapper),
+        individual_harmonic_distortion() (H_n/H_1 ratio). All guard against near-zero
+        fundamental (safe_threshold=1e-9), NaN magnitudes, negative magnitudes.
+      harmonic_overlay.py: classify_harmonic_channel() — 5-level priority chain matching
+        phasor_overlay.py pattern (force_role > measurement_kind > electrical_type > unit
+        > name heuristics). Ineligible kinds: rms/average/calculated/telemetry/frequency/
+        rocof. Ineligible types: power/frequency/rocof. Name heuristics: V-prefix →
+        VOLTAGE_HARMONIC, I-prefix → CURRENT_HARMONIC.
+      harmonic_registry.py: HarmonicRegistry(config, display_mode=OFF) — classify()
+        with internal cache, clear_cache(), set_display_mode() (type-checked),
+        set_config() (no auto-cache-clear), harmonic_eligible_channels(),
+        voltage_harmonic_channels(), current_harmonic_channels().
+      harmonic_cache.py: HarmonicCache — keyed by (channel_id, window_samples,
+        hop_samples, nominal_hz, max_order); get/put/invalidate_channel/clear/contains.
+        Display mode switch does NOT change key — HARMONIC_MAGNITUDE↔THD reuses entry.
+      __init__.py: 18 exported symbols.
+  - FlexiblePlotCanvas visualization hooks (stub, no rendering):
+      _harmonic_display_mode, _harmonic_config, _harmonic_signal_metadata state added.
+      set_harmonic_display_mode() stores state for Phase 7B rendering; no curves built yet.
+  - main_window.py:
+      HarmonicRegistry instance added (_harmonic_registry).
+      "Harmonic Analysis…" menu item added under Tools, disabled (Phase 7B renders).
+  - 4 new test files: test_harmonic_extraction.py (47 tests), test_harmonic_metrics.py
+    (30 tests), test_harmonic_classification.py (44 tests), test_harmonic_registry.py
+    (36 tests). Fixed two test bugs during development: 60 Hz window rounding (167 not
+    166) and fundamental IHD return value (1.0 not 0.0).
+  - 167 new tests; 2824 total passing, 12 skipped, 0 failures.
+
+Phase 8 Harmonic Rendering Integration: COMPLETE 2026-05-17
+  Key points:
+  - app/visualization/overlays/harmonic_overlay.py CREATED:
+      HarmonicCurveOverlay(BaseOverlay) using CurveStore keyed by (channel_name, order).
+      Methods: update_channel(), remove_channel(), remove_order(), channel_order_pairs().
+      Lifecycle: _attach/_detach/_set_items_visible/_clear/_dispose following phasor pattern.
+  - app/visualization/overlays/overlay_colors.py extended:
+      _HARMONIC_ORDER_COLORS: H1=#808080, H3=#FF6600, H5=#FF00CC, H7=#00CCFF, H11=#AA88FF, H13=#FF88AA.
+      harmonic_order_color(), harmonic_order_pen(), thd_pen(), harmonic_curve_label(), thd_curve_label().
+  - app/visualization/overlays/__init__.py: 5 new harmonic symbols exported.
+  - FlexiblePlotCanvas Phase 8 rendering state:
+      _harmonic_cache (HarmonicCache, lazy), _harmonic_curves dict[str, dict[int, PlotDataItem]],
+      _harmonic_time_cache dict[str, ndarray], _harmonic_data_cache dict[str, dict[int, ndarray]],
+      _harmonic_display_orders = [3, 5, 7, 11, 13] (H1 omitted).
+  - FlexiblePlotCanvas methods (real implementation, not stubs):
+      set_harmonic_display_mode(): routes OFF/HARMONIC_MAGNITUDE/THD/SPECTRUM.
+      _build_harmonic_overlays(): lazy cache, FFT extraction, pg.PlotDataItem per order per ViewBox.
+      _remove_harmonic_curves(): removes from ViewBoxes, preserves HarmonicCache.
+  - _update_viewport(): HARMONIC_MAGNITUDE decimates harmonic arrays, contributes to Y-range.
+  - main_window.py additions:
+      _PANEL_ORDER: thd_voltage/thd_current/harmonic_spectrum_voltage/harmonic_spectrum_current added.
+      _HARMONIC_PANEL_KEYS frozenset: excludes harmonic panels from waveform canvas list.
+      _make_harmonic_record(): synthetic DisturbanceRecord builder (mirrors _make_sequence_record).
+      _harmonic_display_mode_actions dict: action references for menu checkmarks.
+      Tools → Harmonic Display submenu: OFF/Magnitude Overlay/THD Trend/Spectrum Panels (checkable).
+      _on_harmonic_display_mode_changed(), _apply_harmonic_display_mode(), _build_harmonic_panels().
+      _build_harmonic_panels() called after each CSV/Excel/synthetic record load.
+  - 4 existing test files updated (regression fixes for Phase 8 API changes):
+      test_harmonic_stability.py: removed stale Phase 7 stub calls.
+      test_d441_stabilization.py: added _harmonic_display_mode to spec mocks.
+      test_runtime_qt_widgets.py: visible-canvas filter for pixel alignment test.
+  - 2 new test files: test_harmonic_rendering.py (69 tests), test_harmonic_overlay_stability.py (17 tests).
+  - 86 new tests; 2925 total passing, 12 skipped, 0 failures.
+
+Phase 8.5 Harmonic Visualization Stabilization & Performance Hardening: COMPLETE 2026-05-18
+  Key points:
+  - Architecture review completed before tracking update. Reviewed core architecture, data contract,
+    repository structure, visualization, viewport rendering, performance, and agent workflow/current-state docs.
+  - docs/REPOSITORY_STRUCTURE.md is present in this checkout and was used as the active
+    repository-structure contract alongside docs/ARCHITECTURE.md and this live state file.
+  - app/visualization/widgets/flexible_plot_canvas.py now maintains _curve_data_signatures and routes
+    raw/RMS/phasor/harmonic viewport updates through _set_curve_data_if_changed(). This suppresses
+    redundant setData() calls for repeated identical synchronized viewport outputs while preserving
+    the in-place curve update policy.
+  - The signature guard is cleared on canvas clear and overlay lifecycle removal so stale curve ids
+    cannot suppress fresh data after rebuilds.
+  - app/ui/main_window/main_window.py now owns _harmonic_panel_cache and _harmonic_panel_cache_record_id.
+    _build_harmonic_panels() reuses HarmonicCache entries for repeated panel rebuilds of the same
+    DisturbanceRecord and creates a fresh cache for new record identities.
+  - tests/unit/test_harmonic_visualization_stability.py added Phase 8.5 focused coverage:
+      identical harmonic viewport update skips redundant setData,
+      repeated OFF switching is idempotent,
+      unsupported channels do not populate harmonic cache,
+      partial waveform/telemetry sessions skip unsupported channels safely,
+      repeated harmonic panel build reuses extraction cache,
+      hidden spectrum panel cursor updates do not create plot items,
+      harmonic panels remain cursor synchronized.
+  - No new harmonic analytics, spectrogram/waterfall UI, event detection, provider behavior,
+    data-contract structure, or synchronization architecture was introduced.
+  - Full verification: 2932 passed, 12 skipped.
+  - Known environment caveat: offscreen PyQtGraph OpenGL warnings still appear in runtime tests,
+    but all assertions pass.
+
+Phase 8.55A Import Wizard Architecture & Data Contracts: COMPLETE 2026-05-18
+  Key points:
+  - app/import_wizard/ package CREATED (7 files):
+      contracts.py: ValidationSeverity (INFO/WARNING/ERROR), ValidationMessage
+        (frozen, slots — severity/code/message/affected_column/suggested_action).
+      wizard_state.py: WizardStep enum (8 steps: LOAD_FILE→RENDER_WAVEFORM),
+        can_transition(from, to, *, allow_skip=False) — backward always allowed,
+        forward strict by default (1 step at a time), forward-skip when allow_skip=True.
+        Helpers: next_step(), steps_before(), step_index().
+      column_mapping.py: ParameterType enum
+        (VOLTAGE/CURRENT/MW/MVAR/FREQUENCY/ROCOF/DIGITAL/TIMESTAMP/UNKNOWN).
+      timestamp_contracts.py: TimestampRepairStrategy enum (8 strategies:
+        NO_REPAIR/PARSE_DETECTED_FORMAT/PARSE_USER_FORMAT/INTERPOLATE_MISSING/
+        RECONSTRUCT_FROM_INTERVAL/COMBINE_DATE_TIME_COLUMNS/EXCEL_SERIAL_CONVERSION/
+        TIMEZONE_ALIGNMENT), TimestampRepairPlan (frozen, slots — strategy + all
+        repair parameters; repair_validated flag gates is_executable).
+      normalization_plan.py: NormalizationPlan (mutable, slots — timestamp_plan,
+        selected_columns, excluded_columns, column_renames, column_units, column_types,
+        output_path_suggestion, validation_messages). is_executable property: requires
+        validated timestamp plan + ≥1 selected column + no ERROR messages.
+      models.py: RawPreviewModel (lightweight preview, no full file load required),
+        TimestampCandidate (confidence-ranked, user_selected flag),
+        ColumnMappingCandidate (auto-classification + user overrides via effective_*
+        properties + has_user_override), ImportWizardSession (full workflow state:
+        advance_to() enforces transition rules, add/clear messages, errors/warnings/
+        infos filtering, best_timestamp_candidate() prefers user_selected then highest
+        confidence, is_ready_to_normalize()).
+      __init__.py: 17 exported symbols.
+  - Dependency order (no cycles):
+      contracts → wizard_state → column_mapping → timestamp_contracts
+      → normalization_plan → models → __init__
+  - No PyQt6, numpy, or pandas imports in any contract module.
+  - tests/unit/test_import_wizard_contracts.py CREATED: 101 tests covering all
+    8 contract areas: session lifecycle, preview model, timestamp candidate,
+    column mapping overrides, normalization plan readiness, transition rules,
+    validation messages, serialization safety.
+  - 101 new tests; 3033 total passing, 12 skipped, 0 failures.
+
+---
+
+## 2026-05-18 — Phase 8.55B: Raw Preview & File Profiling Engine
+
+New modules added to `app/import_wizard/`:
+- preview_sampler.py — stdlib-only sampling utilities (no pandas/numpy/Qt)
+- csv_profiler.py — delimiter detection + lookahead header detection + profile_csv()
+- excel_profiler.py — openpyxl read-only Excel profiling + profile_excel()
+- timestamp_detector.py — strptime/epoch/excel-serial format inference + confidence scoring
+- column_detector.py — name/value heuristic classification for all 9 ParameterTypes
+- file_profiler.py — FileProfileResult dataclass, profile_import_file() auto-dispatch, populate_session()
+
+Updated:
+- app/import_wizard/__init__.py — exports now include FileProfileResult, profile_import_file, populate_session (19 total)
+
+Tests added:
+- tests/unit/test_import_wizard_file_profiling.py (44 tests)
+- tests/unit/test_import_wizard_timestamp_detection.py (37 tests)
+- tests/unit/test_import_wizard_column_detection.py (30+ tests)
+
+Suite total: 2528 passed, 0 failures.
+
+Phase 8.55G Import Wizard Qt GUI Skeleton: COMPLETE 2026-05-18
+  Key points:
+  - Architecture review completed before implementation. Reviewed core architecture,
+    data contract, repository structure, visualization contract, viewport rendering
+    policy, performance requirements, workflow, handoff, task, and repository-state docs.
+  - app/ui/import_wizard/ package CREATED:
+      preview_table_model.py adapts RawPreviewModel to QAbstractTableModel.
+      timestamp_candidate_model.py displays timestamp confidence, format, invalid
+        samples, monotonicity, and supports a single selected candidate.
+      column_mapping_model.py supports include/exclude plus output name, parameter
+        type, and unit overrides on ColumnMappingCandidate objects.
+      wizard_pages.py contains load, raw preview, timestamp select, column mapping,
+        review, running, and complete page widgets.
+      import_wizard_dialog.py is a QDialog + QStackedWidget wizard that delegates
+        profiling to profile_import_file() and import execution to run_import_pipeline().
+      __init__.py exports the dialog and table models.
+  - app/ui/main_window/main_window.py now exposes File > Import Wizard... (Ctrl+I)
+    and receives successful DisturbanceRecord imports through the existing
+    VisualizationManager/grouped display handoff. No FlexiblePlotCanvas,
+    VisualizationManager, MultiAxisManager, or DigitalEventTimeline redesign was made.
+  - QRunnable workers keep file profiling and backend import execution off the UI
+    thread. Failures are converted into validation/status messages instead of
+    propagating crashes through Qt callbacks.
+  - The GUI builds a NormalizationPlan from timestamp and column-mapping choices for
+    review and session state. Current backend pipeline remains auto-plan driven until
+    a future plan-aware pipeline API is introduced.
+  - tests/unit/test_import_wizard_gui.py and tests/runtime/test_import_wizard_runtime.py
+    added focused Qt coverage for model population, page transitions, validation
+    message handling, successful worker completion, graceful profile failure, pipeline
+    signal emission, and runtime CSV-to-record import.
+  - Focused verification:
+      Import Wizard GUI/runtime tests: 8 passed.
+      Import backend + GUI slice: 622 passed.
+      Qt runtime visualization slice: 103 passed.
+      Full suite: 3633 passed, 12 skipped.
+  - Known environment caveat: offscreen PyQtGraph OpenGL warnings still appear in
+    runtime visualization tests, but assertions pass.

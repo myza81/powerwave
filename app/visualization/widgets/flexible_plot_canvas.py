@@ -8,6 +8,8 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
+from app.analytics.harmonics.harmonic_models import HarmonicConfig, HarmonicDisplayMode
+from app.analytics.phasors.phasor_models import PhasorConfig, PhasorDisplayMode
 from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode
 from app.analytics.scaling.scaling_models import EngineeringScalingMode
 from app.models import AnalogChannel, DisturbanceRecord
@@ -30,6 +32,13 @@ from app.visualization.axis_management import (
     axis_group_for_signal,
 )
 from app.visualization.managers.multi_axis_manager import MultiAxisManager
+from app.visualization.overlays.overlay_colors import (
+    is_waveform_phasor_candidate,
+    phasor_color,
+    phasor_curve_label,
+    sequence_color,
+)
+from app.visualization.performance import timed_section
 from app.visualization.rendering.downsampling import decimate_for_display
 from app.visualization.signal_visibility import default_visible_analog_names
 
@@ -37,6 +46,24 @@ from app.visualization.signal_visibility import default_visible_analog_names
 _AXIS_COLORS = ["#FF4444", "#FFCC00", "#4488FF", "#44BB44", "#AAAAAA", "#FF8800"]
 _SPARSE_RATE_THRESHOLD_HZ = 2.0
 _SPARSE_INTERVAL_THRESHOLD_S = 2.0
+
+
+def _phasor_mag_pen_color(hex_color: str) -> str:
+    """Return a brighter shade of *hex_color* for phasor magnitude overlay curves.
+
+    Blends 60% toward white — brighter than the RMS overlay (40%) so the two
+    overlays remain visually distinguishable when both are active.
+    """
+    return phasor_color("", PhasorDisplayMode.MAGNITUDE, base_color=hex_color)
+
+
+def _phasor_angle_pen_color(hex_color: str) -> str:
+    """Return a cyan-shifted color for phasor angle overlay curves.
+
+    Shifts the channel color 40% toward #00FFFF (cyan) so angle traces are
+    visually distinct from both raw waveforms and magnitude/RMS overlays.
+    """
+    return phasor_color("", PhasorDisplayMode.ANGLE, base_color=hex_color)
 
 
 def _rms_pen_color(hex_color: str) -> str:
@@ -59,6 +86,12 @@ def _rms_pen_color(hex_color: str) -> str:
 def _channel_color(ch: AnalogChannel) -> str:
     """Assign a display color based on channel name phase heuristics."""
     name = ch.name.lower()
+    if name.endswith(("v1", "i1", "1")):
+        return sequence_color("positive")
+    if name.endswith(("v2", "i2", "2")):
+        return sequence_color("negative")
+    if name.endswith(("v0", "i0", "0")):
+        return sequence_color("zero")
     if any(x in name for x in ("_a", "va", "ia", "vr", "ir", "phase_a", "ph_a")):
         return "#FF4444"
     if any(x in name for x in ("_b", "vb", "ib", "vy", "iy", "phase_b", "ph_b")):
@@ -206,6 +239,30 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._panel_base_title: str = ""
         self._panel_title: str = ""
 
+        # Phasor overlay state (Phase 6B)
+        self._phasor_display_mode: PhasorDisplayMode = PhasorDisplayMode.OFF
+        self._phasor_config: PhasorConfig = PhasorConfig()
+        self._phasor_signal_metadata: dict = {}
+        self._phasor_cache: object = None   # PhasorCache — lazy
+        self._phasor_curves: dict[str, pg.PlotDataItem] = {}
+        self._phasor_time_cache: dict[str, np.ndarray] = {}
+        self._phasor_data_cache: dict[str, np.ndarray] = {}
+
+        # Harmonic overlay state (Phase 8 — rendering wired)
+        self._harmonic_display_mode: HarmonicDisplayMode = HarmonicDisplayMode.OFF
+        self._harmonic_config: HarmonicConfig = HarmonicConfig()
+        self._harmonic_signal_metadata: dict = {}
+        self._harmonic_cache: object = None   # HarmonicCache — lazy
+        self._harmonic_curves: dict[str, dict[int, pg.PlotDataItem]] = {}
+        self._harmonic_time_cache: dict[str, np.ndarray] = {}
+        self._harmonic_data_cache: dict[str, dict[int, np.ndarray]] = {}
+        # Default display orders: H3/H5/H7/H11/H13 (H1 omitted — too large).
+        self._harmonic_display_orders: list[int] = [3, 5, 7, 11, 13]
+
+        self._performance_timing_enabled = False
+        self._performance_timing_sink = None
+        self._curve_data_signatures: dict[int, tuple] = {}
+
         self._datetime_axis = DatetimeAxisItem(orientation="bottom")
         self._primary_plot: pg.PlotItem = self.addPlot(
             row=0, col=0, axisItems={"bottom": self._datetime_axis}
@@ -287,10 +344,29 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             )
             self._update_viewport()
 
+        # Rebuild phasor overlays for the new record if mode is active
+        if self._phasor_display_mode not in (
+            PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS
+        ):
+            self._build_phasor_overlays(
+                self._phasor_display_mode, self._phasor_config, None
+            )
+            self._update_viewport()
+
+        # Rebuild harmonic overlays for the new record if mode is active
+        if self._harmonic_display_mode == HarmonicDisplayMode.HARMONIC_MAGNITUDE:
+            self._build_harmonic_overlays(self._harmonic_config, None)
+            self._update_viewport()
+
     def set_panel_title(self, title: str) -> None:
         """Set a concise grouped-display panel title."""
         self._panel_base_title = title.strip()
         self._refresh_panel_title()
+
+    def set_performance_timing(self, enabled: bool, sink=None) -> None:
+        """Enable optional visualization timing callbacks for overlay hot paths."""
+        self._performance_timing_enabled = bool(enabled)
+        self._performance_timing_sink = sink
 
     def set_time_axis_mode(
         self,
@@ -477,6 +553,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._visible_channel_names.clear()
         self._cursor = None
         self._trigger_line = None
+        self._curve_data_signatures.clear()
 
         # RMS overlay — curves removed by PlotItem.clear() / scene removeItem;
         # only Python-side dicts need explicit reset here.
@@ -485,6 +562,20 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._rms_data_cache.clear()
         if self._rms_cache is not None:
             self._rms_cache.clear()  # type: ignore[union-attr]
+
+        # Phasor overlay — same pattern: scene handles item removal on clear().
+        self._phasor_curves.clear()
+        self._phasor_time_cache.clear()
+        self._phasor_data_cache.clear()
+        if self._phasor_cache is not None:
+            self._phasor_cache.clear()  # type: ignore[union-attr]
+
+        # Harmonic overlay — same pattern.
+        self._harmonic_curves.clear()
+        self._harmonic_time_cache.clear()
+        self._harmonic_data_cache.clear()
+        if self._harmonic_cache is not None:
+            self._harmonic_cache.clear()  # type: ignore[union-attr]
 
     # ─────────────────────────────────────────────────────────────────────────
     # Private helpers
@@ -552,6 +643,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             pass
 
         self._remove_rms_curves()
+        self._remove_harmonic_curves()
         self._remove_reserved_right_axes()
         self._axis_manager.clear()
         self._primary_plot.clear()
@@ -592,6 +684,16 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
                 self._rms_signal_metadata or None,
                 self._rms_force_channels or None,
             )
+
+        if self._phasor_display_mode not in (
+            PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS
+        ):
+            self._build_phasor_overlays(
+                self._phasor_display_mode, self._phasor_config, None
+            )
+
+        if self._harmonic_display_mode == HarmonicDisplayMode.HARMONIC_MAGNITUDE:
+            self._build_harmonic_overlays(self._harmonic_config, None)
 
         self._update_viewport()
         if self._sparse_mode:
@@ -767,7 +869,8 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             if display_data is not None:
                 # RMS_ONLY: suppress raw/scaled data for channels with an RMS overlay
                 if rms_only and name in self._rms_data_cache:
-                    curve.setData(
+                    self._set_curve_data_if_changed(
+                        curve,
                         np.empty(0, dtype=np.float64),
                         np.empty(0, dtype=np.float64),
                     )
@@ -787,7 +890,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
                             t_end,
                             self._max_pts,
                         )
-                    curve.setData(t_dec, d_dec)
+                    self._set_curve_data_if_changed(curve, t_dec, d_dec)
                     viewbox = curve.getViewBox()
                     if viewbox is not None:
                         data_by_viewbox.setdefault(viewbox, []).append(d_dec)
@@ -801,12 +904,86 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
                     t_rms_dec, d_rms_dec = decimate_for_display(
                         rms_t, rms_d, t_start, t_end, self._max_pts
                     )
-                    rms_curve.setData(t_rms_dec, d_rms_dec)
+                    self._set_curve_data_if_changed(rms_curve, t_rms_dec, d_rms_dec)
                     viewbox = rms_curve.getViewBox()
                     if viewbox is not None:
                         data_by_viewbox.setdefault(viewbox, []).append(d_rms_dec)
 
+        # Phasor overlay rendering — only array slicing + setData here, no analytics
+        _phasor_active = self._phasor_display_mode in (
+            PhasorDisplayMode.MAGNITUDE, PhasorDisplayMode.ANGLE
+        )
+        if _phasor_active and self._phasor_curves:
+            for name, phasor_curve in self._phasor_curves.items():
+                ph_t = self._phasor_time_cache.get(name)
+                ph_d = self._phasor_data_cache.get(name)
+                if ph_t is not None and ph_d is not None and len(ph_t) > 0:
+                    t_ph_dec, d_ph_dec = decimate_for_display(
+                        ph_t, ph_d, t_start, t_end, self._max_pts
+                    )
+                    self._set_curve_data_if_changed(phasor_curve, t_ph_dec, d_ph_dec)
+                    # Only magnitude contributes to ViewBox Y range.
+                    # Angle is degrees [-180, 180] — including it would corrupt
+                    # the voltage/current Y axis scale.
+                    if self._phasor_display_mode == PhasorDisplayMode.MAGNITUDE:
+                        viewbox = phasor_curve.getViewBox()
+                        if viewbox is not None:
+                            data_by_viewbox.setdefault(viewbox, []).append(d_ph_dec)
+
+        # Harmonic overlay rendering — HARMONIC_MAGNITUDE mode only
+        _harmonic_active = (
+            self._harmonic_display_mode == HarmonicDisplayMode.HARMONIC_MAGNITUDE
+        )
+        if _harmonic_active and self._harmonic_curves:
+            for name, order_curves in self._harmonic_curves.items():
+                h_t = self._harmonic_time_cache.get(name)
+                if h_t is None or len(h_t) == 0:
+                    continue
+                order_data = self._harmonic_data_cache.get(name, {})
+                for order, h_curve in order_curves.items():
+                    h_d = order_data.get(order)
+                    if h_d is not None and len(h_d) > 0:
+                        t_h_dec, d_h_dec = decimate_for_display(
+                            h_t, h_d, t_start, t_end, self._max_pts
+                        )
+                        self._set_curve_data_if_changed(h_curve, t_h_dec, d_h_dec)
+                        viewbox = h_curve.getViewBox()
+                        if viewbox is not None:
+                            data_by_viewbox.setdefault(viewbox, []).append(d_h_dec)
+
         self._set_grouped_y_ranges(data_by_viewbox)
+
+    def _set_curve_data_if_changed(
+        self,
+        curve: pg.PlotDataItem,
+        x_data: np.ndarray,
+        y_data: np.ndarray,
+    ) -> None:
+        """Avoid redundant setData calls for repeated synchronized viewport echoes."""
+        signature = self._curve_data_signature(x_data, y_data)
+        key = id(curve)
+        if self._curve_data_signatures.get(key) == signature:
+            return
+        curve.setData(x_data, y_data)
+        self._curve_data_signatures[key] = signature
+
+    @staticmethod
+    def _curve_data_signature(
+        x_data: np.ndarray,
+        y_data: np.ndarray,
+    ) -> tuple:
+        x_len = int(len(x_data))
+        y_len = int(len(y_data))
+        if x_len == 0 or y_len == 0:
+            return (x_len, y_len)
+        return (
+            x_len,
+            y_len,
+            float(x_data[0]),
+            float(x_data[-1]),
+            float(y_data[0]),
+            float(y_data[-1]),
+        )
 
     def _set_grouped_y_ranges(
         self,
@@ -884,6 +1061,9 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._rms_curves.clear()
         self._rms_time_cache.clear()
         self._rms_data_cache.clear()
+        curve_signatures = getattr(self, "_curve_data_signatures", None)
+        if curve_signatures is not None:
+            curve_signatures.clear()
 
         # Rebuild axes: effective unit may have changed (e.g. kV → pu), which
         # changes axis labels and shared-axis grouping keys.
@@ -1115,6 +1295,360 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._rms_time_cache.clear()
         self._rms_data_cache.clear()
         # _rms_cache intentionally preserved — reused when mode is re-enabled
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phasor overlay (Phase 6B)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_phasor_display_mode(
+        self,
+        mode: PhasorDisplayMode,
+        *,
+        config: PhasorConfig | None = None,
+        signal_metadata: dict | None = None,
+        phasor_cache: object = None,
+    ) -> None:
+        """Set the phasor overlay display mode for this canvas.
+
+        OFF               — raw waveform only; all phasor curves removed.
+        MAGNITUDE         — phasor RMS magnitude envelope overlaid on raw waveforms.
+        ANGLE             — phasor angle trace overlaid on raw waveforms.
+        SEQUENCE_COMPONENTS — no overlay drawn here; handled by dedicated panels.
+
+        Switching between MAGNITUDE and ANGLE discards and rebuilds curves;
+        switching back to the same active mode is a no-op (no redundant compute).
+        The underlying PhasorCache is preserved across mode switches so that
+        re-enabling a mode reuses previously computed results.
+
+        Args:
+            mode:           New display mode.
+            config:         Optional PhasorConfig override (nominal Hz, window).
+            signal_metadata: Optional per-channel SignalMetadata mapping.
+            phasor_cache:   Optional shared PhasorCache for cross-canvas reuse.
+        """
+        prev_mode = self._phasor_display_mode
+        if config is not None:
+            self._phasor_config = config
+        if signal_metadata is not None:
+            self._phasor_signal_metadata = signal_metadata
+        self._phasor_display_mode = mode
+
+        if mode in (PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS):
+            self._remove_phasor_curves()
+            self._update_viewport()
+            return
+
+        # Rebuild when mode switches (MAGNITUDE ↔ ANGLE) or no curves exist yet
+        if prev_mode != mode or not self._phasor_curves:
+            self._remove_phasor_curves()
+            with timed_section(
+                "phasor_overlay_rebuild",
+                enabled=self._performance_timing_enabled,
+                sink=self._performance_timing_sink,
+            ):
+                self._build_phasor_overlays(mode, self._phasor_config, phasor_cache)
+
+        self._update_viewport()
+
+    def _build_phasor_overlays(
+        self,
+        mode: PhasorDisplayMode,
+        config: PhasorConfig,
+        external_cache: object,
+    ) -> None:
+        """Compute phasor overlays for eligible channels and add curves.
+
+        Hot-path guard: all heavy computation (extract_phasor) happens once per
+        record load. Subsequent viewport updates only call setData().
+
+        The PhasorCache is queried before computing so that mode switches reuse
+        previously extracted results. Cache is keyed by (channel, window, Hz).
+        """
+        from app.analytics.phasors.phasor_cache import PhasorCache
+        from app.analytics.phasors.phasor_extraction import (
+            compute_phasor_window_samples,
+            extract_phasor,
+        )
+        from app.analytics.phasors.phasor_models import PhasorChannelRole
+        from app.analytics.phasors.phasor_overlay import classify_phasor_role
+
+        if self._record is None or len(self._time_cache) == 0:
+            return
+
+        phasor_cache = external_cache
+        if phasor_cache is None:
+            if self._phasor_cache is None:
+                self._phasor_cache = PhasorCache()
+            phasor_cache = self._phasor_cache
+
+        # Estimate sample rate — same logic as _build_rms_overlays
+        rates = [r for r in self._record.sampling_info.sampling_rates if r > 0]
+        if rates:
+            sample_rate_hz = float(rates[0])
+        elif len(self._time_cache) >= 2:
+            diffs = np.diff(self._time_cache[: min(100, len(self._time_cache))])
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
+        else:
+            sample_rate_hz = 0.0
+
+        if sample_rate_hz <= 0:
+            return
+
+        window = compute_phasor_window_samples(sample_rate_hz, config)
+
+        for ch in self._record.analog_channels:
+            name = ch.name
+            if name not in self._axis_manager._axes:
+                continue
+
+            sig_meta = self._phasor_signal_metadata.get(name)
+            if not is_waveform_phasor_candidate(sig_meta):
+                continue
+
+            result = classify_phasor_role(name, ch.unit, sig_meta)
+            if result.role == PhasorChannelRole.UNKNOWN:
+                continue
+
+            display_data = self._get_display_data(name)
+            if display_data is None:
+                continue
+
+            # Cache lookup before compute
+            cached = phasor_cache.get_phasor(  # type: ignore[union-attr]
+                name, window, config.nominal_hz
+            )
+            if cached is not None:
+                phasor_t, mag_rms, angle_deg, _ = cached
+            else:
+                try:
+                    phasor_t, mag_rms, angle_deg, cpx = extract_phasor(
+                        self._time_cache, display_data, sample_rate_hz, config
+                    )
+                except ValueError:
+                    continue
+                phasor_cache.put_phasor(  # type: ignore[union-attr]
+                    name, window, config.nominal_hz,
+                    (phasor_t, mag_rms, angle_deg, cpx),
+                )
+
+            if mode == PhasorDisplayMode.MAGNITUDE:
+                display_arr = mag_rms
+                label_suffix = " |mag|"
+                pen_color = _phasor_mag_pen_color(self._axis_manager._axes[name].color)
+                pen_style = Qt.PenStyle.DotLine
+            else:  # ANGLE
+                display_arr = angle_deg
+                label_suffix = " angle°"
+                pen_color = _phasor_angle_pen_color(self._axis_manager._axes[name].color)
+                pen_style = Qt.PenStyle.DashDotLine
+
+            self._phasor_time_cache[name] = phasor_t
+            self._phasor_data_cache[name] = display_arr
+
+            phasor_curve = pg.PlotDataItem(
+                pen=pg.mkPen(pen_color, width=1.5, style=pen_style),
+                name=phasor_curve_label(name, mode),
+                skipFiniteCheck=True,
+            )
+            phasor_curve.setClipToView(True)
+
+            vb = self._axis_manager._axes[name].viewbox
+            if vb is self._primary_plot.getViewBox():
+                self._primary_plot.addItem(phasor_curve)
+            else:
+                vb.addItem(phasor_curve)
+
+            self._phasor_curves[name] = phasor_curve
+
+    def _remove_phasor_curves(self) -> None:
+        """Remove all phasor overlay curves from their ViewBoxes."""
+        for phasor_curve in self._phasor_curves.values():
+            try:
+                vb = phasor_curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(phasor_curve)
+            except Exception:  # noqa: BLE001
+                pass
+        self._phasor_curves.clear()
+        self._phasor_time_cache.clear()
+        self._phasor_data_cache.clear()
+        self._curve_data_signatures.clear()
+        # _phasor_cache preserved — reused when mode is re-enabled
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Harmonic overlay (Phase 8)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_harmonic_display_mode(
+        self,
+        mode: HarmonicDisplayMode,
+        config: HarmonicConfig | None = None,
+        signal_metadata: dict | None = None,
+        harmonic_cache: object = None,
+    ) -> None:
+        """Set harmonic analysis display mode for this canvas.
+
+        OFF               — raw waveform only; all harmonic curves removed.
+        HARMONIC_MAGNITUDE — per-order RMS magnitude envelopes overlaid on
+                            raw waveforms (H3/H5/H7/H11/H13 by default).
+        THD / SPECTRUM    — handled by dedicated panels in main_window; this
+                            canvas removes any magnitude overlays and shows
+                            raw waveforms only.
+
+        Args:
+            mode:            New harmonic display mode.
+            config:          Optional HarmonicConfig override.
+            signal_metadata: Optional per-channel SignalMetadata mapping.
+            harmonic_cache:  Optional shared HarmonicCache for cross-canvas reuse.
+        """
+        prev_mode = self._harmonic_display_mode
+        if config is not None:
+            self._harmonic_config = config
+        if signal_metadata is not None:
+            self._harmonic_signal_metadata = signal_metadata
+        self._harmonic_display_mode = mode
+
+        if mode != HarmonicDisplayMode.HARMONIC_MAGNITUDE:
+            self._remove_harmonic_curves()
+            self._update_viewport()
+            return
+
+        # HARMONIC_MAGNITUDE: rebuild when mode switches or no curves yet
+        if prev_mode != mode or not self._harmonic_curves:
+            self._remove_harmonic_curves()
+            with timed_section(
+                "harmonic_overlay_rebuild",
+                enabled=self._performance_timing_enabled,
+                sink=self._performance_timing_sink,
+            ):
+                self._build_harmonic_overlays(self._harmonic_config, harmonic_cache)
+
+        self._update_viewport()
+
+    def _build_harmonic_overlays(
+        self,
+        config: HarmonicConfig,
+        external_cache: object,
+    ) -> None:
+        """Compute harmonic overlays for eligible channels and add curves.
+
+        Hot-path guard: all heavy FFT computation happens once per record load.
+        Subsequent viewport updates only call setData().  HarmonicCache is
+        queried first so that mode switches reuse previously extracted results.
+        """
+        from app.analytics.harmonics.harmonic_cache import HarmonicCache
+        from app.analytics.harmonics.harmonic_extraction import (
+            compute_harmonic_window_samples,
+            extract_harmonics,
+        )
+        from app.analytics.harmonics.harmonic_models import HarmonicChannelRole
+        from app.analytics.harmonics.harmonic_overlay import classify_harmonic_role
+        from app.visualization.overlays.overlay_colors import harmonic_order_pen
+
+        if self._record is None or len(self._time_cache) == 0:
+            return
+
+        harmonic_cache = external_cache
+        if harmonic_cache is None:
+            if self._harmonic_cache is None:
+                self._harmonic_cache = HarmonicCache()
+            harmonic_cache = self._harmonic_cache
+
+        # Estimate sample rate — same logic as _build_rms_overlays / _build_phasor_overlays
+        rates = [r for r in self._record.sampling_info.sampling_rates if r > 0]
+        if rates:
+            sample_rate_hz = float(rates[0])
+        elif len(self._time_cache) >= 2:
+            diffs = np.diff(self._time_cache[: min(100, len(self._time_cache))])
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
+        else:
+            sample_rate_hz = 0.0
+
+        if sample_rate_hz <= 0:
+            return
+
+        window = compute_harmonic_window_samples(sample_rate_hz, config)
+        overlap_clamped = max(0.0, min(config.overlap, 0.999))
+        hop = max(1, int(round(window * (1.0 - overlap_clamped))))
+
+        for ch in self._record.analog_channels:
+            name = ch.name
+            if name not in self._axis_manager._axes:
+                continue
+
+            sig_meta = self._harmonic_signal_metadata.get(name)
+            role = classify_harmonic_role(name, ch.unit, sig_meta).role
+            if role == HarmonicChannelRole.UNKNOWN:
+                continue
+
+            display_data = self._get_display_data(name)
+            if display_data is None:
+                continue
+
+            # Cache lookup before compute
+            cached = harmonic_cache.get(  # type: ignore[union-attr]
+                name, window, hop, config.nominal_hz, config.max_order
+            )
+            if cached is not None:
+                h_result = cached
+            else:
+                try:
+                    h_result = extract_harmonics(
+                        display_data, sample_rate_hz, config, time=self._time_cache
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                harmonic_cache.put(  # type: ignore[union-attr]
+                    name, window, hop, config.nominal_hz, config.max_order, h_result
+                )
+
+            if h_result.n_windows == 0:
+                continue
+
+            self._harmonic_time_cache[name] = h_result.harmonic_time
+            self._harmonic_data_cache[name] = {}
+            self._harmonic_curves[name] = {}
+
+            vb = self._axis_manager._axes[name].viewbox
+
+            for order in self._harmonic_display_orders:
+                mag_arr = h_result.get_magnitude(order)
+                if mag_arr is None:
+                    continue
+
+                self._harmonic_data_cache[name][order] = mag_arr
+
+                harmonic_curve = pg.PlotDataItem(
+                    pen=harmonic_order_pen(order),
+                    name=f"{name} H{order}",
+                    skipFiniteCheck=True,
+                )
+                harmonic_curve.setClipToView(True)
+
+                if vb is self._primary_plot.getViewBox():
+                    self._primary_plot.addItem(harmonic_curve)
+                else:
+                    vb.addItem(harmonic_curve)
+
+                self._harmonic_curves[name][order] = harmonic_curve
+
+    def _remove_harmonic_curves(self) -> None:
+        """Remove all harmonic overlay curves from their ViewBoxes."""
+        for order_curves in self._harmonic_curves.values():
+            for curve in order_curves.values():
+                try:
+                    vb = curve.getViewBox()
+                    if vb is not None:
+                        vb.removeItem(curve)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._harmonic_curves.clear()
+        self._harmonic_time_cache.clear()
+        self._harmonic_data_cache.clear()
+        self._curve_data_signatures.clear()
+        # _harmonic_cache intentionally preserved — reused when mode is re-enabled
 
     def _refresh_panel_title(self) -> None:
         """Apply base panel title plus a lightweight RMS mode suffix."""

@@ -439,7 +439,9 @@ def test_synthetic_grouped_panels_keep_x_pixel_alignment(qapp: QApplication) -> 
         win._on_load_synthetic_mixed()
         _process_events(qapp, count=8)
 
-        canvases = list(win._panel_canvases.values())
+        # Only check visible canvases — hidden panels (e.g. harmonic THD/spectrum)
+        # have no valid pixel geometry and are excluded from alignment assertions.
+        canvases = [c for c in win._panel_canvases.values() if c.isVisible()]
         assert len(canvases) >= 3
         first_range = canvases[0]._primary_plot.getViewBox().viewRange()[0]
         for canvas in canvases[1:]:
