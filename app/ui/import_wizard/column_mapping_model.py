@@ -38,6 +38,17 @@ class ColumnMappingTableModel(QAbstractTableModel):
             return None
         mapping = self._mappings[index.row()]
         col = index.column()
+        if role == Qt.ItemDataRole.ToolTipRole:
+            markers = []
+            if mapping.excluded:
+                markers.append("Column is excluded from normalized output.")
+            if mapping.user_name_override is not None:
+                markers.append("Output name is a user override.")
+            if mapping.user_type_override is not None:
+                markers.append("Parameter type is a user override.")
+            if mapping.user_unit_override is not None:
+                markers.append("Engineering unit is a user override.")
+            return "\n".join(markers) if markers else None
         if role == Qt.ItemDataRole.CheckStateRole and col == 0:
             return (
                 Qt.CheckState.Unchecked
@@ -51,13 +62,23 @@ class ColumnMappingTableModel(QAbstractTableModel):
         if col == 1:
             return mapping.source_name
         if col == 2:
-            return mapping.effective_name
+            value = mapping.effective_name
+            if role == Qt.ItemDataRole.DisplayRole and mapping.user_name_override is not None:
+                return f"{value} (User Override)"
+            return value
         if col == 3:
-            return mapping.effective_type.value
+            value = mapping.effective_type.value
+            if role == Qt.ItemDataRole.DisplayRole and mapping.user_type_override is not None:
+                return f"{value} (User Override)"
+            return value
         if col == 4:
-            return mapping.effective_unit or ""
+            value = mapping.effective_unit or ""
+            if role == Qt.ItemDataRole.DisplayRole and mapping.user_unit_override is not None:
+                return f"{value} (User Override)"
+            return value
         if col == 5:
-            return f"{mapping.confidence:.0%}"
+            suffix = " | User Override" if mapping.has_user_override or mapping.excluded else ""
+            return f"{mapping.confidence:.0%}{suffix}"
         return None
 
     def setData(  # noqa: N802

@@ -4004,3 +4004,347 @@ Findings:
 ### Next Recommended Step
 Phase 8.55H - Plan-aware Import Wizard execution plus timestamp repair controls,
 then UX polish and larger-file runtime hardening.
+
+---
+
+## 2026-05-19 - Phase 8.55I - Timestamp Format Override UI
+
+### Agent
+Codex
+
+### Task
+Implement manual timestamp format override support in the Import Wizard GUI and make the override authoritative during plan-aware execution.
+
+### Completed
+- Reviewed authoritative architecture, visualization/performance, workflow, handoff, task, and repository-state docs before editing.
+- Added backend sampled validation for manual strptime format overrides.
+- Added timestamp page controls for selected timestamp column, detected format, manual override input, reset-to-detected, and parse preview feedback.
+- Wired override edits into ImportWizardSession.timestamp_repair_plan using TimestampRepairStrategy.PARSE_USER_FORMAT when non-empty.
+- Preserved detected-format behavior when the override field is cleared.
+- Integrated validation into build_execution_plan() so complete parse failure blocks execution and partial parse success is surfaced as a warning.
+- Hardened run_import_pipeline_with_plan() so unvalidated timestamp repair plans fail gracefully before full file load.
+- Added deterministic unit and runtime coverage for valid/invalid/partial override validation, stale plan invalidation, detected-format restoration, user-format execution authority, and DisturbanceRecord timing.
+
+### Files Modified
+- app/import_wizard/__init__.py
+- app/import_wizard/import_pipeline.py
+- app/import_wizard/pipeline_plan_builder.py
+- app/import_wizard/timestamp_format_validator.py
+- app/ui/import_wizard/import_wizard_dialog.py
+- app/ui/import_wizard/wizard_pages.py
+- tests/unit/test_timestamp_override_ui.py
+- tests/runtime/test_timestamp_override_execution.py
+- agent/HANDOFF.md
+- agent/TASK.md
+- agent/REPOSITORY_STATE.md
+
+### Architecture Impact
+No redesign. UI remains a thin Qt orchestration layer; validation and execution decisions live in app/import_wizard. The existing TimestampRepairPlan and run_import_pipeline_with_plan() authority path are reused. No timestamp normalization engine logic was duplicated.
+
+### Performance Impact
+Override validation uses only candidate example samples with a hard max of 50 rows. No full dataset parsing occurs during editing. Existing QRunnable execution flow remains unchanged for import execution.
+
+### Risks / Concerns
+- Validation quality depends on profiler sample representativeness.
+- Existing repository temp directories have Windows permission issues; broader pytest slices that use tmp_path fail during setup before assertions run.
+- Some Phase 8.55H files are currently untracked in git status in this checkout, but they are required by the current plan-aware import wizard path.
+
+### Test Results
+- .venv\\Scripts\\python.exe -m pytest tests\\unit\\test_timestamp_override_ui.py tests\\runtime\\test_timestamp_override_execution.py -q
+  - 12 passed
+- .venv\\Scripts\\python.exe -m py_compile app\\import_wizard\\timestamp_format_validator.py app\\import_wizard\\pipeline_plan_builder.py app\\import_wizard\\import_pipeline.py app\\ui\\import_wizard\\import_wizard_dialog.py app\\ui\\import_wizard\\wizard_pages.py
+  - passed
+- Broader import wizard slice attempted; blocked by pytest tmp_path PermissionError at C:\\Users\\fairizat\\AppData\\Local\\Temp\\pytest-of-fairizat.
+
+### Next Recommended Step
+Phase 8.55J - import wizard runtime hardening: resolve repository/pytest temp-directory permission hygiene, then run the full import-wizard and runtime visualization slices again.
+
+---
+
+## 2026-05-19 - Phase 8.55J - Test Environment Stabilization & Runtime Hygiene
+
+### Agent
+Codex
+
+### Task
+Stabilize pytest/runtime execution after the Import Wizard backend, Qt skeleton, authoritative execution, and timestamp override phases.
+
+### Completed
+- Reviewed authoritative architecture, visualization/performance, workflow, handoff, task, and repository-state docs before editing.
+- Added repository-native runtime temp helpers for isolated temp dirs, safe cleanup, and short Windows-lock retries.
+- Redirected pytest/Python temp roots away from the user profile and into `.powerwave_runtime_tmp`.
+- Added a narrow Windows pytest shim for pytest-created temp directories because Python 3.14 `mode=0o700` directories are unreadable in this sandbox.
+- Added Qt runtime teardown fixture that drains QThreadPool work, closes top-level widgets, deletes Qt objects, and processes posted events.
+- Added deterministic runtime hygiene tests for CSV/XLSX cleanup, Qt worker cleanup, repeated Import Wizard runtime execution, timestamp override repeatability, and safe cleanup reporting.
+- Added gitignore entries for generated runtime/temp artifacts and configured pytest cache under the repo-local runtime temp area.
+
+### Files Modified
+- .gitignore
+- pyproject.toml
+- app/testing/__init__.py
+- app/testing/temp_runtime.py
+- tests/conftest.py
+- tests/runtime/conftest.py
+- tests/runtime/test_runtime_environment.py
+- agent/HANDOFF.md
+- agent/TASK.md
+- agent/REPOSITORY_STATE.md
+
+### Architecture Impact
+No product runtime redesign. New `app/testing` utilities are test/runtime support only. Import Wizard execution, timestamp normalization, DisturbanceRecord construction, visualization handoff, and Qt dialog architecture are unchanged.
+
+### Performance Impact
+Cleanup scans only immediate runtime-temp children and uses short bounded retries. Qt cleanup waits are bounded. No large filesystem scans, full dataset parsing, or rendering-path changes were introduced.
+
+### Risks / Concerns
+- Several pre-existing stale temp directories in the checkout still have Windows AccessDenied ACLs and cannot be removed from this session. They are ignored by the new pytest temp root and gitignore entries.
+- The pytest temp-mode shim is intentionally Windows-only and exists because this sandbox/Python combination creates unreadable `0o700` directories.
+
+### Test Results
+- `.venv\\Scripts\\python.exe -m pytest tests\\runtime\\test_runtime_environment.py -q` -> 7 passed.
+- Broad import/runtime slice repeated twice:
+  `.venv\\Scripts\\python.exe -m pytest tests\\unit\\test_plan_aware_pipeline.py tests\\unit\\test_import_wizard_gui.py tests\\runtime\\test_import_wizard_authoritative_flow.py tests\\unit\\test_timestamp_override_ui.py tests\\runtime\\test_timestamp_override_execution.py tests\\runtime\\test_import_wizard_runtime.py tests\\runtime\\test_runtime_environment.py -q`
+  -> 71 passed, then 71 passed.
+
+### Next Recommended Step
+Proceed with the next Import Wizard feature/runtime phase. Keep new runtime tests in the standard import-wizard validation slice so temp and Qt regressions are caught early.
+
+---
+
+## 2026-05-19 - Phase 8.55L - Export UI Integration
+
+### Agent
+Codex
+
+### Task
+Expose the normalized export writer through the Import Wizard Qt GUI so users can save normalized CSV/Parquet/Feather datasets and metadata sidecars after a successful import.
+
+### Completed
+- Reviewed authoritative architecture, visualization/performance, workflow, handoff, task, and repository-state docs before editing.
+- Added Save Normalized File controls to the Import Complete page: format selector, metadata sidecar checkbox, overwrite checkbox, save action, and export status summary.
+- Added QFileDialog save flow with CSV default and ExportPlan-derived `{source}_normalized.csv` suggestions.
+- Added `_ExportWorker` QRunnable so export writing uses the backend writer off the UI thread.
+- Wired export to `plan_export()`, `write_from_export_plan()`, `write_normalized_export()`, `ExportWriteOptions`, and `ExportWriteResult`.
+- Added export result summary display with path, rows, columns, format, metadata sidecar path, and validation messages.
+- Kept waveform handoff independent; export does not replace or mutate the imported DisturbanceRecord lifecycle.
+- Added unit and runtime tests for export enablement, default filenames, CSV success, sidecar creation, overwrite behavior, unsupported format/dependency errors, worker completion, graceful failure, repeatability, and waveform handoff after export.
+
+### Files Modified
+- app/ui/import_wizard/import_wizard_dialog.py
+- app/ui/import_wizard/wizard_pages.py
+- tests/unit/test_export_ui.py
+- tests/runtime/test_export_ui_runtime.py
+- agent/HANDOFF.md
+- agent/TASK.md
+- agent/REPOSITORY_STATE.md
+
+### Architecture Impact
+No backend writer or visualization redesign. The GUI remains a thin orchestration layer and delegates export work to existing import_wizard export APIs. Export is an optional workflow after import completion and does not alter DisturbanceRecord rendering handoff.
+
+### Performance Impact
+Export runs through QRunnable/QThreadPool and does not block the UI thread. No additional normalized DataFrame copy is introduced in the GUI; writer-owned serialization behavior remains centralized in `export_writer.py`.
+
+### Risks / Concerns
+- Parquet/Feather remain dependent on optional backend dependencies; missing dependency errors are surfaced through ExportWriteResult.
+- Export UI is intentionally lightweight and does not yet include advanced CSV formatting options, batch export, or export history.
+- Existing stale Windows temp directories still produce git status warnings but do not block the verified pytest slices.
+
+### Test Results
+- `.venv\\Scripts\\python.exe -m pytest tests\\unit\\test_export_ui.py tests\\runtime\\test_export_ui_runtime.py -q` -> 16 passed.
+- `.venv\\Scripts\\python.exe -m pytest tests\\unit\\test_export_writer.py tests\\unit\\test_export_planning.py tests\\integration\\test_normalized_export_e2e.py tests\\unit\\test_export_ui.py tests\\runtime\\test_export_ui_runtime.py -q` -> 83 passed, 5 skipped.
+- Broad Import Wizard/runtime slice with export UI -> 87 passed.
+- `py_compile` passed for touched UI/test files.
+
+### Next Recommended Step
+Proceed to a small export UX hardening phase only if needed: optional timestamp/float formatting controls, clearer dependency guidance for Parquet/Feather, and save-location persistence. Avoid adding batch/report/cloud export until explicitly scoped.
+
+---
+
+## 2026-05-19 - Phase 8.55M - Real-World Import Hardening & Large Dataset Stress Testing
+
+### Agent
+Codex
+
+### Task
+Harden the Import Wizard against realistic operational CSV files and validate
+large-dataset import/export/visualization handoff behavior without adding new
+features.
+
+### Completed
+- Reviewed authoritative architecture, visualization/performance, workflow, handoff, task, and repository-state docs before editing.
+- Added deterministic stress CSV generator with configurable row count, delimiter, timestamp format, sampling interval, metadata rows, malformed/missing/duplicate timestamp ratios, analog columns, digital/status columns, and unknown columns.
+- Added practical benchmark tool for generation, profiling, total import, export, channel counts, validation codes, file sizes, and lightweight tracemalloc memory.
+- Added stress tests for small/medium generated imports, export after import, metadata/header noise, malformed timestamps, duplicate/non-monotonic timestamps, mixed timestamp formats, delimiter variants, text digital states, unknown columns, and graceful unrecoverable timestamp failure.
+- Added runtime tests for pending import worker responsiveness, failed import dialog stability, Open Waveform availability, Save Normalized File after import, metadata sidecar export, and dialog close behavior around workers.
+- Created `docs/IMPORT_WIZARD_HARDENING_REPORT.md` with covered scenarios, measured benchmark results, known limits, and operational guidance.
+- Fixed direct execution of `tools/benchmark_import_pipeline.py` by adding the repository root to `sys.path` when run from `tools/`.
+
+### Files Modified
+- tools/generate_import_stress_samples.py
+- tools/benchmark_import_pipeline.py
+- tests/stress/test_import_wizard_large_csv.py
+- tests/stress/test_import_wizard_malformed_files.py
+- tests/runtime/test_import_wizard_realistic_workflows.py
+- docs/IMPORT_WIZARD_HARDENING_REPORT.md
+- agent/HANDOFF.md
+- agent/TASK.md
+- agent/REPOSITORY_STATE.md
+
+### Architecture Impact
+No production import, export, or visualization architecture was redesigned.
+Stress generation and benchmarking live in `tools/`; tests exercise the existing
+Import Wizard pipeline, export writer, DisturbanceRecord bridge, and Qt worker
+orchestration. Visualization handoff remains limited to contract verification.
+
+### Performance Impact
+Default tests generate data in runtime temp directories and keep row counts modest
+for repeatability. The generator streams rows to disk. Benchmarking uses lightweight
+`time.perf_counter()` and `tracemalloc` only. No heavy dependencies were added.
+
+Measured local benchmark results:
+- 1,000 rows: profile 0.736 s, import 0.946 s, CSV export 0.177 s, peak traced memory 1.94 MiB.
+- 25,000 rows: profile 0.674 s, import 5.767 s, CSV export 3.995 s, peak traced memory 18.40 MiB.
+
+### Risks / Concerns
+- Normal test coverage uses 25,000 rows for medium coverage; 100,000 and 1,000,000 row runs are supported by the tooling but should be explicit stress runs because runtime depends on local machine capacity.
+- `tracemalloc` memory is Python allocation telemetry, not full process RSS.
+- Mixed timestamp formats are not repaired into a single canonical format; rows that do not match the active detected/user format are dropped with diagnostics.
+- Ragged CSV rows currently fail gracefully as `PIPELINE_LOAD_FAILED` instead of being partially repaired.
+- Existing stale Windows temp directories still appear in `git status` warnings but do not block the verified runtime slices.
+
+### Test Results
+- `.venv\\Scripts\\python.exe -m pytest tests\\stress\\test_import_wizard_large_csv.py tests\\stress\\test_import_wizard_malformed_files.py tests\\runtime\\test_import_wizard_realistic_workflows.py -q` -> 19 passed.
+- `.venv\\Scripts\\python.exe -m pytest tests\\stress\\test_import_wizard_large_csv.py tests\\stress\\test_import_wizard_malformed_files.py tests\\runtime\\test_import_wizard_realistic_workflows.py tests\\runtime\\test_export_ui_runtime.py tests\\runtime\\test_runtime_environment.py -q` -> 30 passed.
+- `.venv\\Scripts\\python.exe -m pytest tests\\unit\\test_import_pipeline.py tests\\unit\\test_disturbance_record_bridge.py tests\\unit\\test_export_writer.py tests\\unit\\test_export_ui.py tests\\runtime\\test_timestamp_override_execution.py tests\\runtime\\test_import_wizard_authoritative_flow.py tests\\runtime\\test_import_wizard_realistic_workflows.py tests\\stress -q` -> 230 passed, 2 skipped.
+
+### Next Recommended Step
+Phase 8.55N should add compact user-facing import diagnostics: row-drop counts,
+timestamp warning summaries, and large-file operational guidance surfaced in the
+wizard without changing the pipeline contract.
+
+---
+
+## 2026-05-19 - Phase 8.55O - Import Wizard Final UX & Workflow Hardening
+
+### Agent
+Codex
+
+### Task
+Harden the Import Wizard workflow for operational engineering usability:
+state safety, action gating, stale-state invalidation, override visibility,
+discard protection, navigation stability, and concise user guidance.
+
+### Completed
+- Reviewed authoritative architecture, visualization/performance, workflow, handoff, task, and repository-state docs before editing.
+- Added `app/ui/import_wizard/workflow_state.py`, a small UI workflow-state evaluator for button enablement and status guidance.
+- Hardened ImportWizardDialog state invalidation:
+  - timestamp selection changes invalidate plan/import/export state.
+  - timestamp override changes invalidate plan/import/export state.
+  - column mapping edits invalidate plan/import/export state.
+  - new file selection resets previous profile, diagnostics, import result, export result, and models.
+- Added explicit re-import-required guidance after settings change.
+- Tightened action enablement for Next, Back, Run Import, Open Waveform, Save Normalized File, and Close.
+- Added explicit Close action discard protection for user overrides, completed unexported imports, dirty settings, and active worker state.
+- Kept window close deterministic for runtime teardown while preserving the in-wizard Close prompt.
+- Improved override visibility:
+  - timestamp page shows `User Override` when manual format is active.
+  - column mapping model marks overridden output name/type/unit values with `(User Override)`.
+  - confidence column and tooltips expose user overrides/excluded rows.
+- Added concise workflow guidance to load, preview, timestamp, mapping, review, and export pages.
+- Added `docs/IMPORT_WORKFLOW_GUIDE.md` describing workflow states, action enablement, override markers, stale invalidation, import/export flow, discard protection, and known limits.
+- Added deterministic unit/runtime tests for action state, invalidation, reset behavior, discard prompt, override visibility, repeated import/export, worker completion after close, navigation stability, and graceful failed import state.
+
+### Files Modified
+- app/ui/import_wizard/workflow_state.py
+- app/ui/import_wizard/__init__.py
+- app/ui/import_wizard/column_mapping_model.py
+- app/ui/import_wizard/import_wizard_dialog.py
+- app/ui/import_wizard/wizard_pages.py
+- tests/unit/test_import_workflow_ux.py
+- tests/runtime/test_import_workflow_runtime.py
+- docs/IMPORT_WORKFLOW_GUIDE.md
+- agent/HANDOFF.md
+- agent/TASK.md
+- agent/REPOSITORY_STATE.md
+
+### Architecture Impact
+No backend pipeline, diagnostics engine, export writer, or visualization architecture was redesigned. Workflow logic remains UI orchestration only and reuses existing ValidationMessage, diagnostics, plan-aware execution, export writer, and worker infrastructure.
+
+### Performance Impact
+Workflow state evaluation is constant-time and uses already-available UI/backend result state. No source files are re-read, no full datasets are reparsed, and no heavy validation was added to the UI thread. Existing QRunnable import/export execution remains intact.
+
+### Risks / Concerns
+- Discard protection is lightweight and not a persisted session manager.
+- Close-window teardown accepts immediately for deterministic test/runtime cleanup; the in-wizard Close button provides the user-facing discard prompt.
+- Override markers are text-based rather than icon-based.
+- Existing stale Windows temp directories still appear in git status warnings but did not block verified test slices.
+
+### Test Results
+- `.venv\\Scripts\\python.exe -m pytest tests\\unit\\test_import_workflow_ux.py tests\\runtime\\test_import_workflow_runtime.py -q` -> 11 passed.
+- `.venv\\Scripts\\python.exe -m pytest tests\\unit\\test_import_workflow_ux.py tests\\runtime\\test_import_workflow_runtime.py tests\\unit\\test_import_wizard_gui.py tests\\unit\\test_export_ui.py tests\\unit\\test_timestamp_override_ui.py tests\\runtime\\test_timestamp_override_execution.py tests\\runtime\\test_export_ui_runtime.py tests\\runtime\\test_import_wizard_realistic_workflows.py tests\\unit\\test_import_diagnostics.py tests\\runtime\\test_import_diagnostics_runtime.py -q` -> 100 passed.
+- `.venv\\Scripts\\python.exe -m pytest tests\\unit\\test_import_pipeline.py tests\\unit\\test_plan_aware_pipeline.py tests\\unit\\test_disturbance_record_bridge.py tests\\unit\\test_export_writer.py tests\\runtime\\test_runtime_environment.py tests\\stress -q` -> 236 passed, 2 skipped.
+
+### Next Recommended Step
+Proceed to a final Import Wizard acceptance pass or Phase 8.55P focused on packaging/CI command documentation and standard verification slices. Avoid new features until the workflow is reviewed in a real interactive run.
+
+---
+
+## 2026-05-19 - Phase 8.55P - Acceptance Validation & Developer Operations
+
+### Agent
+Codex
+
+### Task
+Stabilize the Import Wizard subsystem for long-term development, repeatable
+acceptance validation, regression protection, and developer operations.
+
+### Completed
+- Reviewed authoritative core architecture, visualization/performance, Import Wizard diagnostics/workflow/hardening, workflow-agent, handoff, task, and repository-state docs before editing.
+- Added concise operational acceptance documentation for CSV/XLSX import, malformed timestamps, timestamp override, export, duplicate timestamps, unknown columns, large generated CSV behavior, repeated cycles, and worker-close stability.
+- Added developer workflow documentation with standard validation slices, benchmark commands, stress sample generation, troubleshooting, and merge guidance.
+- Added an Import Wizard test matrix mapping feature areas to unit, runtime, stress, and acceptance coverage.
+- Added lightweight runner scripts:
+  - `tools/run_import_acceptance.py` for `unit`, `runtime`, `stress`, `acceptance`, and `import-full` slices.
+  - `tools/run_import_runtime_slice.py` for repeated runtime validation passes.
+- Added acceptance tests covering CSV import to waveform handoff, XLSX import to normalized CSV export with sidecar, authoritative timestamp override, malformed diagnostics, repeated import/export, and worker completion after close.
+- Added `tests/acceptance/conftest.py` with Qt cleanup matching runtime hygiene expectations.
+
+### Files Modified
+- docs/IMPORT_ACCEPTANCE_CHECKLIST.md
+- docs/IMPORT_DEV_WORKFLOW.md
+- docs/IMPORT_TEST_MATRIX.md
+- tools/run_import_acceptance.py
+- tools/run_import_runtime_slice.py
+- tests/acceptance/conftest.py
+- tests/acceptance/test_import_acceptance.py
+- agent/HANDOFF.md
+- agent/TASK.md
+- agent/REPOSITORY_STATE.md
+
+### Architecture Impact
+No product runtime, import pipeline, export writer, diagnostics engine, or
+visualization architecture was changed. This phase adds developer operations,
+documentation, and acceptance tests around existing Import Wizard contracts.
+
+### Performance Impact
+Validation tooling is subprocess-based and opt-in. Default acceptance tests use
+small deterministic runtime-temp files. Large-file checks remain explicit via the
+existing stress generator and benchmark tool.
+
+### Risks / Concerns
+- Runner pass-through pytest arguments must be supplied as `--pytest-arg=-q` for options beginning with `-`.
+- Acceptance tests use small deterministic files and complement, rather than replace, stress and benchmark runs.
+- Optional Parquet/Feather coverage remains dependency-gated in existing export tests; acceptance uses CSV as the baseline.
+
+### Test Results
+- `.venv\\Scripts\\python.exe -m py_compile tools\\run_import_acceptance.py tools\\run_import_runtime_slice.py tests\\acceptance\\test_import_acceptance.py tests\\acceptance\\conftest.py` -> passed.
+- `.venv\\Scripts\\python.exe -m pytest tests\\acceptance\\test_import_acceptance.py -q` -> 6 passed.
+- `.venv\\Scripts\\python.exe tools\\run_import_acceptance.py --slice acceptance --pytest-arg=-q` -> 6 passed.
+- `.venv\\Scripts\\python.exe tools\\run_import_runtime_slice.py --repeat 1 --pytest-arg=-q` -> 49 passed.
+- `.venv\\Scripts\\python.exe tools\\run_import_acceptance.py --slice import-full --pytest-arg=-q` -> 387 passed, 2 skipped.
+
+### Next Recommended Step
+Use the new acceptance/dev workflow as the standard gate for Import Wizard
+maintenance. Next phase can move toward Phase 9 planning or CI wiring around
+these documented slices; avoid new Import Wizard features until the operational
+acceptance workflow is reviewed interactively.

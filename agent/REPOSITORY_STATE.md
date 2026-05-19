@@ -1092,3 +1092,358 @@ Phase 8.55G Import Wizard Qt GUI Skeleton: COMPLETE 2026-05-18
       Full suite: 3633 passed, 12 skipped.
   - Known environment caveat: offscreen PyQtGraph OpenGL warnings still appear in
     runtime visualization tests, but assertions pass.
+
+Phase 8.55I Timestamp Format Override UI: COMPLETE 2026-05-19
+  Key points:
+  - app/import_wizard/timestamp_format_validator.py added:
+      validate_user_timestamp_format() validates a user strptime format against
+      bounded profiler candidate samples only (max 50). It returns structured
+      TimestampFormatValidationResult plus ValidationMessage entries:
+      PLAN_TIMESTAMP_FORMAT_VALID, PLAN_TIMESTAMP_PARSE_FAILED,
+      PLAN_PARTIAL_TIMESTAMP_PARSE, PLAN_USING_DETECTED_FORMAT.
+  - app/ui/import_wizard/wizard_pages.py timestamp page now displays:
+      selected timestamp column, detected format, manual format override field,
+      reset-to-detected button, and parse preview feedback.
+  - app/ui/import_wizard/import_wizard_dialog.py now synchronizes override edits
+      into ImportWizardSession.timestamp_repair_plan. Non-empty overrides create
+      TimestampRepairStrategy.PARSE_USER_FORMAT with user_format set exactly to
+      the entered format. Clearing the override restores detected-format behavior.
+      Override changes invalidate stale plan/pipeline state.
+  - app/import_wizard/pipeline_plan_builder.py validates PARSE_USER_FORMAT plans
+      before execution. Complete sample parse failure adds an ERROR and blocks;
+      partial parse success adds a WARNING and remains executable.
+  - app/import_wizard/import_pipeline.py run_import_pipeline_with_plan() now
+      rejects unvalidated timestamp repair plans before full file load, returning
+      a graceful ImportPipelineResult with PLAN_INVALID_TIMESTAMP_FORMAT.
+  - Runtime validation confirms detected format is ignored while user override is
+      active and DisturbanceRecord timing starts from the user-parsed timestamp.
+  - Verification:
+      12 passed: tests/unit/test_timestamp_override_ui.py and
+      tests/runtime/test_timestamp_override_execution.py.
+      py_compile passed for touched backend/UI files.
+  - Caveat:
+      Broader import-wizard slice was attempted but tests using pytest tmp_path
+      currently fail during setup due Windows PermissionError in the pytest temp
+      directory, before assertions run.
+
+Phase 8.55J Test Environment Stabilization & Runtime Hygiene: COMPLETE 2026-05-19
+  Key points:
+  - app/testing/temp_runtime.py added deterministic test/runtime temp helpers:
+      runtime_temp_root(), isolated_runtime_dir(), runtime_temp_dir(),
+      safe_rmtree(), cleanup_runtime_children(), CleanupResult.
+  - tests/conftest.py now sets QT_QPA_PLATFORM=offscreen and redirects
+      tempfile/pytest temp roots to `.powerwave_runtime_tmp`.
+  - Windows-only pytest shim relaxes pytest-created temp dirs from mode 0o700
+      to inherited writable permissions. This is required in the current
+      Windows/Python 3.14 sandbox because 0o700 directories become unreadable.
+  - tests/runtime/conftest.py adds runtime_qapp teardown that waits for
+      QThreadPool work, closes top-level widgets, deletes Qt objects, and
+      processes posted events.
+  - tests/runtime/test_runtime_environment.py added runtime hygiene coverage:
+      isolated temp creation/cleanup, CSV cleanup, XLSX cleanup, Qt worker
+      cleanup, repeated Import Wizard runtime import, repeated timestamp
+      override runtime execution, and locked-path cleanup reporting.
+  - .gitignore now excludes repo-local pytest/runtime temp artifacts.
+  - pyproject.toml sets pytest cache_dir under `.powerwave_runtime_tmp`.
+  - Verification:
+      7 passed: tests/runtime/test_runtime_environment.py.
+      71 passed: import-wizard/runtime slice.
+      71 passed: same import-wizard/runtime slice repeated immediately.
+  - Remaining caveat:
+      pre-existing stale temp directories with Windows AccessDenied ACLs still
+      exist in the checkout, but the new temp-root strategy avoids depending on
+      them.
+
+Phase 8.55L Export UI Integration: COMPLETE 2026-05-19
+  Key points:
+  - Import Wizard completion page now includes Save Normalized File controls:
+      format selector (CSV/Parquet/Feather), include metadata sidecar checkbox,
+      overwrite checkbox, save button, and export status summary.
+  - app/ui/import_wizard/import_wizard_dialog.py adds:
+      `_ExportWorker(QRunnable)`, `save_normalized_file()`, QFileDialog save flow,
+      ExportPlan default path suggestions, extension enforcement for selected
+      format, and ExportWriteResult completion/error handling.
+  - Export UI delegates to existing backend APIs:
+      plan_export(), write_from_export_plan(), write_normalized_export(),
+      ExportWriteOptions, ExportWriteResult.
+  - Save action is enabled only after successful import with an export-ready
+      NormalizedDataset.
+  - Export result summary shows:
+      success/failure, diagnostics summary, format, rows, columns, output path,
+      metadata sidecar path, and validation messages.
+  - Export is independent of visualization:
+      Open Waveform handoff remains available after export and the imported
+      DisturbanceRecord lifecycle is unchanged.
+  - Tests added:
+      tests/unit/test_export_ui.py
+      tests/runtime/test_export_ui_runtime.py
+  - Verification:
+      16 passed: export UI unit/runtime tests.
+      83 passed, 5 skipped: export writer/planning/E2E + export UI.
+      87 passed: broad Import Wizard/runtime slice including export UI.
+      py_compile passed for touched UI/test files.
+  - Limitations:
+      advanced export formatting settings, batch export, export history, and
+      save-location persistence remain future work.
+
+Phase 8.55M Real-World Import Hardening & Large Dataset Stress Testing: COMPLETE 2026-05-19
+  Key points:
+  - tools/generate_import_stress_samples.py added deterministic streaming CSV
+      generation for Import Wizard stress samples. Configurable fields include
+      row count, timestamp format, sampling interval, delimiter, metadata rows,
+      malformed/missing/duplicate timestamp ratios, analog columns, digital
+      status columns, unknown/text-noise columns, and text digital values.
+      Presets support small 1,000, medium 100,000, and large 1,000,000 row
+      targets for explicit runtime-temp generation.
+  - tools/benchmark_import_pipeline.py added a direct developer benchmark for
+      generation, profile_import_file(), run_import_pipeline(), optional CSV
+      export, validation code collection, file-size reporting, channel counts,
+      and tracemalloc current/peak memory.
+  - tests/stress/ added:
+      test_import_wizard_large_csv.py for generated small/medium imports,
+      export after import, metadata sidecar, visualization handoff, and
+      timestamp gap diagnostics.
+      test_import_wizard_malformed_files.py for metadata rows before header,
+      semicolon/tab/pipe delimiters, blank/malformed timestamps, duplicate and
+      non-monotonic timestamps, mixed timestamp formats, ragged CSV rows, text
+      digital/status values, unknown columns, and unrecoverable timestamp files.
+  - tests/runtime/test_import_wizard_realistic_workflows.py added Qt runtime
+      hardening around pending import workers, failed import stability, Open
+      Waveform enablement, export availability after import, sidecar export, and
+      dialog close behavior around workers.
+  - docs/IMPORT_WIZARD_HARDENING_REPORT.md added measured results and practical
+      operational guidance.
+  - Direct benchmark execution was hardened so running from tools/ works by
+      adding the repository root to sys.path before importing app modules.
+  - No production import/export/visualization architecture was redesigned.
+      Tests and tools reuse the existing Import Wizard pipeline, export writer,
+      DisturbanceRecord bridge, and Qt worker orchestration.
+  - Verification:
+      19 passed: new stress/runtime hardening tests.
+      30 passed: stress + runtime hygiene/export runtime slice.
+      230 passed, 2 skipped: broader import pipeline, bridge, export UI/writer,
+      timestamp override, authoritative flow, runtime hardening, and stress slice.
+  - Local benchmark results:
+      1,000 rows: profile 0.736 s, import 0.946 s, CSV export 0.177 s, peak traced memory 1.94 MiB.
+      25,000 rows: profile 0.674 s, import 5.767 s, CSV export 3.995 s, peak traced memory 18.40 MiB.
+  - Limitations:
+      normal tests keep medium coverage at 25,000 rows; 100,000/1,000,000 row
+      stress runs should be explicit. Tracemalloc is not full process RSS.
+      Mixed timestamp formats drop unmatched rows under the active format.
+      Ragged CSV rows fail gracefully as load errors rather than being repaired.
+
+Phase 8.55N Import Diagnostics Panel & User Guidance: COMPLETE 2026-05-19
+  Key points:
+  - app/import_wizard/diagnostics_summary.py CREATED (pure Python, no Qt):
+      ImportDiagnosticsSummary dataclass — 27 fields covering source file, timestamp,
+        data quality, channels, validation messages, guidance, and timing.
+      build_import_diagnostics(result, export_result=None) — aggregates existing
+        ImportPipelineResult fields into an engineering-readable summary without
+        re-reading the source file or re-running backend computation.
+      _confidence_label(confidence) — tiered label: ≥0.85 → High, ≥0.60 → Medium,
+        <0.60 → Low, None → N/A.
+      _build_repair_actions() — aggregates dropped rows, duplicate timestamps,
+        interpolation, reconstruction, combine-columns, Excel serial, and user-format
+        override into plain-language action strings.
+      _build_large_file_guidance() — triggers above 100,000 rows: Parquet/Feather
+        recommendation and viewport rendering note.
+      _build_export_guidance() — sidecar purpose note, rows written, sidecar confirmation.
+      Computed properties: has_errors, has_warnings, data_completeness_pct, has_data_loss.
+  - app/ui/import_wizard/diagnostics_panel.py CREATED:
+      render_diagnostics_text(summary) — pure function producing plain text with 7
+        sections: status line, DATA SUMMARY, TIMESTAMP, CHANNEL CLASSIFICATION,
+        VALIDATION (errors/warnings/infos grouped), EXPORT, PERFORMANCE GUIDANCE.
+        Data loss marked inline: "N  ← data loss".
+      DiagnosticsPanel(QWidget) — wraps QPlainTextEdit; set_summary(), set_failure_text(),
+        clear(), plain_text() API.
+  - app/ui/import_wizard/wizard_pages.py UPDATED:
+      ImportCompletePage now uses DiagnosticsPanel instead of bare QPlainTextEdit.
+        set_result() calls build_import_diagnostics(result) on success;
+        set_failure_text() on pipeline errors.
+        _last_pipeline_result stored for export-guidance refresh.
+      set_export_result() refreshes the diagnostics panel via
+        build_import_diagnostics(last_result, export_result) so export rows and sidecar
+        status appear in the panel after a normalized export completes.
+      ReviewImportPage.refresh() now includes a timestamp-confidence line:
+        "Timestamp confidence: High (92%)" using _confidence_label().
+  - app/import_wizard/__init__.py UPDATED:
+      ImportDiagnosticsSummary and build_import_diagnostics exported under
+      Phase 8.55N — diagnostics comment.
+  - app/ui/import_wizard/__init__.py UPDATED:
+      DiagnosticsPanel added to package exports.
+  - docs/IMPORT_DIAGNOSTICS_GUIDE.md CREATED:
+      Covers all 7 panel sections, confidence threshold tables, repair strategy
+      descriptions, row-drop reporting, engineering guidance philosophy, and
+      known limitations.
+  - Tests added:
+      tests/unit/test_import_diagnostics.py — 25 unit tests.
+      tests/runtime/test_import_diagnostics_runtime.py — 10 Qt runtime test scenarios.
+  - Verification:
+      3815 passed, 17 skipped, 0 failures (up from 3731 baseline — 84 new tests).
+  - No backend pipeline logic was duplicated or re-implemented.
+      All diagnostics derive from reading existing ImportPipelineResult fields.
+  - Limitations:
+      Diagnostics are generated once per import; editing column mappings after
+      the fact requires re-running the import.
+      Large-file threshold (100,000 rows) is row-count based, not byte-size based.
+      Classification confidence reflects the auto-classifier; user overrides do
+      not retroactively update the confidence score shown.
+
+Phase 8.55O Import Wizard Final UX & Workflow Hardening: COMPLETE 2026-05-19
+  Key points:
+  - app/ui/import_wizard/workflow_state.py CREATED:
+      WorkflowActionState dataclass and evaluate_workflow_actions() centralize
+      Import Wizard action enablement for Next, Back, Run Import, Open Waveform,
+      Save Normalized File, Close, and status guidance.
+  - app/ui/import_wizard/import_wizard_dialog.py UPDATED:
+      added workflow status label;
+      connected column mapping edits to state invalidation;
+      timestamp selection/override changes invalidate stale plan/import/export state;
+      new file selection resets profile, diagnostics, pipeline result, export result,
+      and table models;
+      action enablement now derives from workflow-state evaluation;
+      explicit Close button uses a discard prompt for dirty settings, user overrides,
+      unexported successful imports, and active worker state;
+      window close remains deterministic for runtime teardown.
+  - app/ui/import_wizard/column_mapping_model.py UPDATED:
+      display text marks user-overridden output name/type/unit values with
+      "(User Override)";
+      confidence column marks rows with user overrides or exclusion;
+      tooltips explain overridden/excluded fields.
+  - app/ui/import_wizard/wizard_pages.py UPDATED:
+      load/preview/timestamp/mapping/review/export pages now provide concise
+      operational guidance;
+      timestamp page shows format source as Auto-detected or User Override;
+      mapping page summarizes user override count;
+      export page reiterates metadata sidecar audit guidance.
+  - app/ui/import_wizard/__init__.py UPDATED:
+      exports WorkflowActionState and evaluate_workflow_actions.
+  - docs/IMPORT_WORKFLOW_GUIDE.md CREATED:
+      documents workflow states, action enablement, override visibility, stale
+      invalidation, import/export flow, discard protection, error states, and
+      performance philosophy.
+  - Tests added:
+      tests/unit/test_import_workflow_ux.py
+      tests/runtime/test_import_workflow_runtime.py
+  - Verification:
+      11 passed: workflow UX unit/runtime tests.
+      100 passed: Import Wizard UX/export/diagnostics/runtime slice.
+      236 passed, 2 skipped: backend import/plan-aware/bridge/export/runtime/stress slice.
+  - Architecture impact:
+      no backend pipeline, diagnostics engine, export writer, or visualization
+      architecture redesign. UX hardening remains thin Qt orchestration over
+      existing backend systems.
+  - Limitations:
+      discard protection is not persisted session management;
+      override markers are text-based;
+      close-window teardown is prompt-free by design while the in-wizard Close
+      button provides discard protection.
+
+Phase 8.55P Acceptance Validation & Developer Operations: COMPLETE 2026-05-19
+  Key points:
+  - docs/IMPORT_ACCEPTANCE_CHECKLIST.md CREATED:
+      practical operational acceptance scenarios for CSV/XLSX import, malformed
+      timestamps, timestamp override, export sidecars, duplicate/unknown columns,
+      repeated cycles, and worker-close stability.
+  - docs/IMPORT_DEV_WORKFLOW.md CREATED:
+      standard validation commands, runtime/stress/benchmark workflow, stress
+      sample generation, troubleshooting, and merge guidance.
+  - docs/IMPORT_TEST_MATRIX.md CREATED:
+      maps Import Wizard feature areas to unit, runtime, stress, and acceptance
+      coverage, including regression-risk guards.
+  - tools/run_import_acceptance.py CREATED:
+      lightweight pytest slice runner for `unit`, `runtime`, `stress`,
+      `acceptance`, and `import-full`.
+  - tools/run_import_runtime_slice.py CREATED:
+      repeatable runtime validation wrapper.
+  - tests/acceptance/ CREATED:
+      conftest.py provides Qt cleanup fixture; test_import_acceptance.py covers
+      CSV import to waveform handoff, XLSX import to normalized CSV + sidecar,
+      timestamp override authority, malformed import diagnostics, repeated
+      import/export, and dialog close during pending worker.
+  - Verification:
+      6 passed: tests/acceptance/test_import_acceptance.py.
+      6 passed: tools/run_import_acceptance.py --slice acceptance.
+      49 passed: tools/run_import_runtime_slice.py --repeat 1.
+      387 passed, 2 skipped: tools/run_import_acceptance.py --slice import-full.
+      py_compile passed for new scripts and acceptance tests.
+  - Architecture impact:
+      no import pipeline, export writer, diagnostics engine, Qt wizard runtime,
+      or visualization architecture changes. This phase is documentation,
+      developer tooling, and acceptance coverage only.
+  - Limitations:
+      acceptance uses small deterministic files; large-file validation remains
+      explicit through stress/benchmark tooling. Optional Parquet/Feather
+      coverage remains dependency-gated in existing export tests.
+
+Phase 9A Event Session Data Model: COMPLETE 2026-05-19
+  Key points:
+  - app/sessions/ package CREATED (new package, not previously present):
+      session_models.py — 7 public symbols:
+          ALIGNMENT_METHODS (frozenset): {'none','manual','auto_trigger','correlation','imported'}
+          SessionSource(dataclass): source_id, display_name, record (DisturbanceRecord ref),
+            provider_type, origin_path, time_offset_s, is_active,
+            alignment_method, alignment_confidence — immutable identity fields; mutable
+            time_offset_s / is_active / alignment fields managed by EventAnalysisSession.
+          SessionChannel(dataclass): source_id, channel_name, channel_type,
+            display_name, color_hex, line_style, is_visible, panel_id.
+          PanelConfig(dataclass): panel_id, title, channel_refs, panel_type, is_visible.
+          AlignedChannelData(dataclass): render-ready output — offset already applied,
+            time_is_uniform flag for PMU readiness.
+          AlignmentResult(dataclass): suggested_offset_s, alignment_method,
+            alignment_confidence, reference_time, notes.
+          SourceQualityMetrics(dataclass): sample_count, inferred_sample_rate_hz,
+            sample_rate_stability, missing_data_pct, duplicate_timestamp_pct,
+            interpolated_pct, resampling_ratio, time_is_uniform.
+      alignment_engine.py — 7 pure stateless functions, PMU-safe (non-uniform time):
+          apply_time_offset(time_array, offset_s) → new array; input never mutated.
+          resample_to_grid(time_src, values_src, time_grid) → interp1d, NaN outside coverage.
+          build_common_time_grid(time_arrays, t_start, t_end, max_points) → median dt, not mean.
+          detect_trigger_time(time_array, values_array, threshold_factor=3.0):
+            RMS of first 20% baseline; falls back to global RMS when baseline is near-zero
+            (handles quiet pre-event windows). Returns actual time value, not index.
+          suggest_alignment_offsets(sources, threshold_factor) → list[AlignmentResult]:
+            aligns all triggers to t=0; confidence = clamp(peak_ratio/(factor*4), 0, 1).
+          assess_time_uniformity(time_array) → (is_uniform, stability_score):
+            is_uniform: CoV(diff) < 0.01; stability_score: 1.0 − CoV clipped to [0, 1].
+          compute_source_quality(source_id, time_array, values_array) → SourceQualityMetrics:
+            interpolated_pct and resampling_ratio remain 0.0/1.0 placeholders; populated
+            by build_aligned_data after resampling (Phase 9B).
+      event_session.py — EventAnalysisSession class:
+          SESSION_VERSION = 1; created_at = datetime.now(UTC).
+          add_source(record, display_name, provider_type, ...) → UUID string.
+          remove_source(source_id) — removes source + its channels from all panels.
+          list_sources(active_only) — view of current sources.
+          set_source_active, list_analog_channels, list_digital_channels.
+          set_time_offset(source_id, offset_s, method, confidence) — validates method
+            against ALIGNMENT_METHODS; raises ValueError on unknown method.
+          reset_all_offsets() — resets all sources to offset=0.0, method='none'.
+          get_global_time_range() → (t_start, t_end): intersection of active source
+            ranges; gracefully falls back to union if no overlap (no invalid start > end).
+          set_channel_display_name / set_channel_colour / set_channel_visibility /
+            set_channel_panel — panel channel_refs updated atomically on reassignment.
+          create_default_layout() — groups channels by name heuristics into 6 panels:
+            voltage, current, power, frequency, digital, other.
+          merge_panels(panel_a_id, panel_b_id) — merges B into A; removes B.
+          build_aligned_data(source_id, channel_name, t_start, t_end, max_points=4000):
+            non-destructive — offset applied via apply_time_offset() to new array;
+            DisturbanceRecord.waveform_data never mutated.
+          get_source_quality_metrics(source_id) → SourceQualityMetrics (lazy cached).
+      __init__.py — clean public surface re-exports all 7 model symbols +
+          EventAnalysisSession + alignment_engine module.
+  - Tests added:
+      tests/unit/test_alignment_engine.py — 42 tests covering all 7 engine functions.
+      tests/unit/test_event_session.py — 42 tests covering all EventAnalysisSession behaviors.
+      Key fix applied: detect_trigger_time now falls back to global RMS when baseline is
+        near-zero to correctly detect events in quiet pre-event waveform windows.
+  - Verification:
+      3916 passed, 17 skipped, 0 failures (baseline was 3832 — 84 new tests, 0 regressions).
+  - Design constraints honoured:
+      Input arrays never mutated (non-destructive invariant enforced throughout).
+      Non-uniform time arrays fully supported (median dt, interp1d, actual time values).
+      No Qt dependencies anywhere in app/sessions/ — package is pure Python + NumPy/SciPy.
+  - Limitations:
+      interpolated_pct and resampling_ratio in SourceQualityMetrics are placeholder 0.0/1.0
+        values; populated by build_aligned_data in Phase 9B after resampling is wired.
+      Auto-trigger alignment only (Phase 9B adds cross-correlation and manual UI offset).
+      No session persistence (load/save) — Phase 9C scope.

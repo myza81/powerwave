@@ -50,6 +50,20 @@ End-to-end pipeline (Phase 8.55F):
     ImportPipelineResult              Complete pipeline result with all intermediate outputs.
     PipelineDiagnostics               Serializable pipeline summary.
     run_import_pipeline(...)          Full CSV/Excel → DisturbanceRecord pipeline.
+
+Plan-aware pipeline (Phase 8.55H):
+    PlanBuildResult                   Result of build_execution_plan().
+    build_execution_plan(...)         GUI/session state → validated PlanBuildResult.
+    run_import_pipeline_with_plan(...)  Authoritative plan → DisturbanceRecord pipeline.
+
+Normalized export writer (Phase 8.55K):
+    ExportWriteOptions                Fine-grained write options (format, overwrite, sidecar).
+    ExportWriteResult                 Result of write_normalized_export().
+    ExportMetadata                    Audit sidecar model with full traceability.
+    write_normalized_export(...)      Serialize NormalizedDataset → CSV/Parquet/Feather + sidecar.
+    write_from_export_plan(...)       Write using paths suggested by an ExportPlan.
+    build_export_metadata(...)        Build audit metadata without writing.
+    metadata_sidecar_path(...)        Derive sidecar path from a data file path.
 """
 from __future__ import annotations
 
@@ -63,12 +77,32 @@ from app.import_wizard.disturbance_record_bridge import (
     build_disturbance_record,
     convert_normalized_dataset_to_record,
 )
+from app.import_wizard.export_metadata import (
+    ExportMetadata,
+    build_export_metadata,
+    metadata_sidecar_path,
+)
+from app.import_wizard.diagnostics_summary import (
+    ImportDiagnosticsSummary,
+    build_import_diagnostics,
+)
 from app.import_wizard.export_planner import ExportPlan, plan_export
+from app.import_wizard.export_writer import (
+    ExportWriteOptions,
+    ExportWriteResult,
+    write_from_export_plan,
+    write_normalized_export,
+)
 from app.import_wizard.import_pipeline import (
     ImportPipelineOptions,
     ImportPipelineResult,
     PipelineDiagnostics,
     run_import_pipeline,
+    run_import_pipeline_with_plan,
+)
+from app.import_wizard.pipeline_plan_builder import (
+    PlanBuildResult,
+    build_execution_plan,
 )
 from app.import_wizard.file_profiler import FileProfileResult, populate_session, profile_import_file
 from app.import_wizard.models import (
@@ -84,6 +118,10 @@ from app.import_wizard.normalized_dataset import (
     ParameterMetadata,
 )
 from app.import_wizard.timestamp_contracts import TimestampRepairPlan, TimestampRepairStrategy
+from app.import_wizard.timestamp_format_validator import (
+    TimestampFormatValidationResult,
+    validate_user_timestamp_format,
+)
 from app.import_wizard.wizard_state import (
     WizardStep,
     can_transition,
@@ -112,15 +150,18 @@ __all__ = [
     "TimestampCandidate",
     "TimestampRepairPlan",
     "TimestampRepairStrategy",
+    "TimestampFormatValidationResult",
     "ValidationMessage",
     "ValidationSeverity",
     "WizardStep",
     # Functions
     "assemble_normalized_dataset",
     "build_disturbance_record",
+    "build_execution_plan",
     "can_transition",
     "convert_normalized_dataset_to_record",
     "run_import_pipeline",
+    "run_import_pipeline_with_plan",
     "next_step",
     "plan_export",
     "populate_session",
@@ -128,4 +169,18 @@ __all__ = [
     "step_index",
     "steps_before",
     "validate_normalized_dataset",
+    "validate_user_timestamp_format",
+    # Phase 8.55H
+    "PlanBuildResult",
+    # Phase 8.55N — diagnostics
+    "ImportDiagnosticsSummary",
+    "build_import_diagnostics",
+    # Phase 8.55K — export writer
+    "ExportMetadata",
+    "ExportWriteOptions",
+    "ExportWriteResult",
+    "build_export_metadata",
+    "metadata_sidecar_path",
+    "write_from_export_plan",
+    "write_normalized_export",
 ]

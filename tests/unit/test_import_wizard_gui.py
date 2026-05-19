@@ -144,8 +144,10 @@ def test_dialog_builds_normalization_plan(monkeypatch, qapp, tmp_path) -> None:
         dlg.set_source_path(str(path))
         dlg.profile_selected_file()
         dlg._set_step(dialog_module.WizardStep.COLUMN_MAPPING)
-        plan = dlg._build_normalization_plan()
+        plan_result = dlg._rebuild_execution_plan()
 
+        assert plan_result is not None
+        plan = plan_result.normalization_plan
         assert plan is not None
         assert "VA" in plan.selected_columns
         assert "Trip" in plan.selected_columns
@@ -208,7 +210,7 @@ def test_dialog_pipeline_success_emits_record(monkeypatch, qapp, tmp_path) -> No
         validation_messages=[],
     )
     monkeypatch.setattr(dialog_module, "profile_import_file", lambda *a, **k: profile)
-    monkeypatch.setattr(dialog_module, "run_import_pipeline", lambda *a, **k: pipeline_result)
+    monkeypatch.setattr(dialog_module, "run_import_pipeline_with_plan", lambda *a, **k: pipeline_result)
 
     dlg = ImportWizardDialog(thread_pool=ImmediateThreadPool())
     emitted = []

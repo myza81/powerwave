@@ -45,6 +45,7 @@ from app.import_wizard.file_profiler import (
     profile_import_file,
 )
 from app.import_wizard.models import (
+    ColumnMappingCandidate,
     ImportWizardSession,
     RawPreviewModel,
     TimestampCandidate,
@@ -537,6 +538,184 @@ def _build_diagnostics(
         warning_count=sum(1 for m in messages if m.severity == ValidationSeverity.WARNING),
         error_count=sum(1 for m in messages if m.severity == ValidationSeverity.ERROR),
         elapsed_seconds=elapsed,
+    )
+
+
+def run_import_pipeline_with_plan(
+    path: str,
+    session: ImportWizardSession,
+    normalization_plan: NormalizationPlan,
+    column_mappings: list[ColumnMappingCandidate],
+    options: ImportPipelineOptions | None = None,
+) -> ImportPipelineResult:
+    """Execute the import pipeline using GUI-authoritative plans.
+
+    Unlike run_import_pipeline(), this function does NOT re-profile the file,
+    re-select the timestamp candidate, or regenerate the normalization plan.
+    It executes exactly the plans provided by the caller.
+
+    Use build_execution_plan() (pipeline_plan_builder) to construct the plans
+    from live GUI/session state before calling this function.
+
+    Parameters
+    ----------
+    path                Absolute path to the source file.
+    session             Active ImportWizardSession with user selections.
+                        Must carry: source_path, provider_type, sheet_name,
+                        delimiter, raw_preview, selected_timestamp_column,
+                        timestamp_repair_plan, and timestamp_candidates.
+    normalization_plan  Authoritative plan built from the GUI state.
+    column_mappings     Current column mapping candidates from the GUI model
+                        (passed through to assemble_normalized_dataset for
+                        traceability enrichment).
+    options             Pipeline configuration; defaults used when None.
+
+    Returns
+    -------
+    ImportPipelineResult — always returns, never raises.
+    """
+    start_t = time.monotonic()
+    opts = options or ImportPipelineOptions()
+    messages: list[ValidationMessage] = list(normalization_plan.validation_messages)
+
+    # ── Reconstruct a FileProfileResult from session (no re-profiling) ────────
+    raw_preview = session.raw_preview or RawPreviewModel(column_names=[], preview_rows=[])
+    profile = FileProfileResult(
+        raw_preview=raw_preview,
+        provider_type=session.provider_type,
+        sheet_name=session.sheet_name,
+        delimiter=session.delimiter,
+        timestamp_candidates=list(session.timestamp_candidates),
+        column_mappings=list(column_mappings),
+    )
+
+    effective_provider = session.provider_type or "csv"
+
+    # ── Resolve the authoritative timestamp candidate ─────────────────────────
+    candidate = session.best_timestamp_candidate()
+    if candidate is None:
+        messages.append(ValidationMessage(
+            severity=ValidationSeverity.ERROR,
+            code="PIPELINE_NO_TIMESTAMP",
+            message="Session has no selected timestamp candidate.",
+        ))
+        diag = PipelineDiagnostics(
+            source_file_path=path,
+            provider_type=effective_provider,
+            error_count=1,
+            elapsed_seconds=time.monotonic() - start_t,
+        )
+        return _make_result(
+            session, profile, None, None, None, None, None, None, diag, False, messages,
+        )
+
+    # The authoritative repair plan lives inside the normalization_plan.
+    repair_plan = normalization_plan.timestamp_plan
+    if repair_plan is None:
+        repair_plan = session.timestamp_repair_plan or _build_repair_plan(candidate)
+
+    if not repair_plan.repair_validated or any(
+        message.severity == ValidationSeverity.ERROR
+        for message in normalization_plan.validation_messages
+    ):
+        if not repair_plan.repair_validated:
+            messages.append(ValidationMessage(
+                severity=ValidationSeverity.ERROR,
+                code="PLAN_INVALID_TIMESTAMP_FORMAT",
+                message="Timestamp repair plan is not validated; import execution is blocked.",
+                affected_column=candidate.column_name,
+            ))
+        diag = _build_diagnostics(
+            path, effective_provider, profile, candidate, None, None, messages,
+            time.monotonic() - start_t,
+        )
+        return _make_result(
+            session, profile, candidate, repair_plan, None, None, None, None,
+            diag, False, messages,
+        )
+
+    # ── Load full raw DataFrame ────────────────────────────────────────────────
+    try:
+        raw_df = _load_full_dataframe(path, effective_provider, profile)
+    except Exception as exc:
+        messages.append(ValidationMessage(
+            severity=ValidationSeverity.ERROR,
+            code="PIPELINE_LOAD_FAILED",
+            message=f"Failed to load full dataset: {exc}",
+        ))
+        diag = _build_diagnostics(
+            path, effective_provider, profile, candidate, None, None, messages,
+            time.monotonic() - start_t,
+        )
+        return _make_result(
+            session, profile, candidate, repair_plan, None, None, None, None,
+            diag, False, messages,
+        )
+
+    if candidate.column_name not in raw_df.columns:
+        messages.append(ValidationMessage(
+            severity=ValidationSeverity.ERROR,
+            code="PIPELINE_TS_COLUMN_MISSING",
+            message=(
+                f"Timestamp column '{candidate.column_name}' was not found "
+                "in the loaded data."
+            ),
+        ))
+        diag = _build_diagnostics(
+            path, effective_provider, profile, candidate, None, None, messages,
+            time.monotonic() - start_t,
+        )
+        return _make_result(
+            session, profile, candidate, repair_plan, None, None, None, None,
+            diag, False, messages,
+        )
+
+    # ── Normalize timestamps using the authoritative repair plan ──────────────
+    norm_result = normalize_timestamps(raw_df[candidate.column_name], repair_plan)
+    messages.extend(norm_result.validation_messages)
+
+    # ── Assemble NormalizedDataset using the authoritative normalization plan ──
+    dataset = assemble_normalized_dataset(
+        raw_df,
+        normalization_plan,
+        norm_result,
+        column_mappings=column_mappings,
+        source_path=path,
+        drop_nat_rows=opts.drop_nat_rows,
+    )
+    messages.extend(dataset.validation_messages)
+
+    # ── Convert to DisturbanceRecord ──────────────────────────────────────────
+    bridge_opts = ConversionOptions(
+        nominal_frequency=opts.nominal_frequency,
+        station_name=opts.station_name,
+    )
+    bridge_result = build_disturbance_record(dataset, options=bridge_opts)
+
+    for w in bridge_result.warnings:
+        messages.append(ValidationMessage(
+            severity=ValidationSeverity.INFO,
+            code="BRIDGE_WARNING",
+            message=w,
+        ))
+    for e in bridge_result.validation_errors:
+        messages.append(ValidationMessage(
+            severity=ValidationSeverity.ERROR,
+            code="BRIDGE_VALIDATION_ERROR",
+            message=e,
+        ))
+
+    record = bridge_result.record if bridge_result.success else None
+    success = bridge_result.success and dataset.is_valid
+
+    elapsed = time.monotonic() - start_t
+    diag = _build_diagnostics(
+        path, effective_provider, profile, candidate, dataset, bridge_result, messages, elapsed,
+    )
+
+    return _make_result(
+        session, profile, candidate, repair_plan, norm_result,
+        dataset, bridge_result, record, diag, success, messages,
     )
 
 

@@ -19,3 +19,4 @@ venv = ".venv"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "src", "tools"]
+cache_dir = ".powerwave_runtime_tmp/system-temp/pytest_cache"

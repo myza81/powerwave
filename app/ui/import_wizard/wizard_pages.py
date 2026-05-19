@@ -3,15 +3,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
@@ -20,11 +19,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.import_wizard.contracts import ValidationMessage, ValidationSeverity
+from app.import_wizard.contracts import ValidationMessage
+from app.import_wizard.diagnostics_summary import build_import_diagnostics, _confidence_label
+from app.import_wizard.export_writer import ExportWriteResult
 from app.import_wizard.import_pipeline import ImportPipelineResult
 from app.import_wizard.models import ImportWizardSession
 from app.import_wizard.normalization_plan import NormalizationPlan
 from app.ui.import_wizard.column_mapping_model import ColumnMappingTableModel
+from app.ui.import_wizard.diagnostics_panel import DiagnosticsPanel
 from app.ui.import_wizard.preview_table_model import PreviewTableModel
 from app.ui.import_wizard.timestamp_candidate_model import TimestampCandidateTableModel
 
@@ -64,6 +66,9 @@ class LoadFilePage(QWidget):
         self.message_view.setReadOnly(True)
         self.message_view.setMaximumHeight(120)
         layout.addWidget(self.message_view)
+        guidance = QLabel("Preview uses sampled rows for large files; full normalization runs during import.")
+        guidance.setWordWrap(True)
+        layout.addWidget(guidance)
         layout.addStretch(1)
 
     def set_path(self, path: str) -> None:
@@ -84,6 +89,9 @@ class RawPreviewPage(QWidget):
         layout = QVBoxLayout(self)
         self.summary_label = QLabel("No file profiled.")
         layout.addWidget(self.summary_label)
+        self.guidance_label = QLabel("Confirm the detected header and sampled rows before continuing.")
+        self.guidance_label.setWordWrap(True)
+        layout.addWidget(self.guidance_label)
         self.table = QTableView()
         self.table.setModel(model)
         self.table.setAlternatingRowColors(True)
@@ -98,6 +106,7 @@ class RawPreviewPage(QWidget):
         preview = session.raw_preview if session else None
         if preview is None:
             self.summary_label.setText("No file profiled.")
+            self.guidance_label.setText("Profile a file to inspect sampled rows.")
             self.message_view.clear()
             return
         sheet = f" | sheet: {preview.sheet_name}" if preview.sheet_name else ""
@@ -105,6 +114,9 @@ class RawPreviewPage(QWidget):
             f"{len(preview.column_names)} columns | "
             f"{len(preview.preview_rows)} preview rows | "
             f"estimated rows: {preview.row_count_estimate}{sheet}"
+        )
+        self.guidance_label.setText(
+            "Preview is sampled for responsiveness. Import uses the full dataset after review."
         )
         warnings = "\n".join(preview.parse_warnings)
         self.message_view.setPlainText(warnings or format_messages(session.validation_messages))
@@ -122,6 +134,26 @@ class TimestampSelectPage(QWidget):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         layout.addWidget(self.table, 1)
+
+        override_group = QGroupBox("Format Override")
+        form = QFormLayout(override_group)
+        self.selected_column_label = QLabel("None")
+        self.detected_format_label = QLabel("auto")
+        self.override_status_label = QLabel("Auto-detected")
+        self.override_edit = QLineEdit()
+        self.override_edit.setPlaceholderText("%Y-%m-%d %H:%M:%S")
+        self.reset_button = QPushButton("Reset to detected")
+        override_row = QWidget()
+        override_layout = QHBoxLayout(override_row)
+        override_layout.setContentsMargins(0, 0, 0, 0)
+        override_layout.addWidget(self.override_edit, 1)
+        override_layout.addWidget(self.reset_button)
+        form.addRow("Selected column", self.selected_column_label)
+        form.addRow("Detected format", self.detected_format_label)
+        form.addRow("Format source", self.override_status_label)
+        form.addRow("Manual format", override_row)
+        layout.addWidget(override_group)
+
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
         layout.addWidget(self.message_label)
@@ -129,8 +161,23 @@ class TimestampSelectPage(QWidget):
     def refresh(self, session: ImportWizardSession | None) -> None:
         count = len(session.timestamp_candidates) if session else 0
         self.message_label.setText(
-            "No timestamp candidate detected." if count == 0 else f"{count} candidate(s) detected."
+            "No timestamp candidate detected. Choose another file or provide a source with a timestamp column."
+            if count == 0
+            else f"{count} candidate(s) detected. Manual override becomes authoritative when entered."
         )
+
+    def set_candidate_details(
+        self,
+        column_name: str | None,
+        detected_format: str | None,
+        feedback: str,
+    ) -> None:
+        self.selected_column_label.setText(column_name or "None")
+        self.detected_format_label.setText(detected_format or "auto")
+        has_override = bool(self.override_edit.text().strip())
+        self.override_status_label.setText("User Override" if has_override else "Auto-detected")
+        if feedback:
+            self.message_label.setText(feedback)
 
 
 class ColumnMappingPage(QWidget):
@@ -139,7 +186,7 @@ class ColumnMappingPage(QWidget):
     def __init__(self, model: ColumnMappingTableModel, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Review detected mappings. Basic include, name, type, and unit edits are supported."))
+        layout.addWidget(QLabel("Review detected mappings. User edits require re-import before export or waveform handoff."))
         self.table = QTableView()
         self.table.setModel(model)
         self.table.setAlternatingRowColors(True)
@@ -152,7 +199,11 @@ class ColumnMappingPage(QWidget):
     def refresh(self, session: ImportWizardSession | None) -> None:
         mappings = session.column_mappings if session else []
         included = sum(1 for mapping in mappings if not mapping.excluded)
-        self.message_label.setText(f"{included} included column(s), {len(mappings) - included} excluded.")
+        overrides = sum(1 for mapping in mappings if mapping.has_user_override or mapping.excluded)
+        self.message_label.setText(
+            f"{included} included column(s), {len(mappings) - included} excluded. "
+            f"{overrides} user override(s)."
+        )
 
 
 class ReviewImportPage(QWidget):
@@ -179,20 +230,27 @@ class ReviewImportPage(QWidget):
         warnings = len(session.warnings())
         errors = len(session.errors())
         executable = plan.is_executable if plan is not None else False
-        self.summary.setPlainText(
-            "\n".join([
-                f"File: {session.source_path}",
-                f"Provider: {session.provider_type}",
-                f"Timestamp column: {selected}",
-                f"Timestamp format: {fmt or 'auto'}",
-                f"Analog-like columns: {len(included) - len(digital)}",
-                f"Digital columns: {len(digital)}",
-                f"Excluded columns: {', '.join(excluded) if excluded else 'None'}",
-                f"Warnings: {warnings}",
-                f"Errors: {errors}",
-                f"Plan executable: {'yes' if executable else 'no'}",
-            ])
-        )
+
+        lines = [
+            f"File: {session.source_path}",
+            f"Provider: {session.provider_type}",
+            f"Timestamp column: {selected}",
+            f"Timestamp format: {fmt or 'auto'}",
+        ]
+        if candidate is not None:
+            conf_label = _confidence_label(candidate.confidence)
+            conf_pct = f"{candidate.confidence * 100:.0f}%"
+            lines.append(f"Timestamp confidence: {conf_label} ({conf_pct})")
+        lines += [
+            "Guidance: verify this plan before importing. Later mapping or timestamp changes require re-import.",
+            f"Analog-like columns: {len(included) - len(digital)}",
+            f"Digital columns: {len(digital)}",
+            f"Excluded columns: {', '.join(excluded) if excluded else 'None'}",
+            f"Warnings: {warnings}",
+            f"Errors: {errors}",
+            f"Plan executable: {'yes' if executable else 'no'}",
+        ]
+        self.summary.setPlainText("\n".join(lines))
 
 
 class ImportRunningPage(QWidget):
@@ -215,34 +273,110 @@ class ImportRunningPage(QWidget):
 
 
 class ImportCompletePage(QWidget):
-    """Final success/failure page."""
+    """Final success/failure page with engineering diagnostics panel."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._last_pipeline_result: ImportPipelineResult | None = None
+
         layout = QVBoxLayout(self)
-        self.summary = QPlainTextEdit()
-        self.summary.setReadOnly(True)
-        layout.addWidget(self.summary, 1)
+        self.diagnostics_panel = DiagnosticsPanel()
+        layout.addWidget(self.diagnostics_panel, 1)
+
+        export_group = QGroupBox("Save Normalized File")
+        export_layout = QFormLayout(export_group)
+        self.export_format_combo = QComboBox()
+        self.export_format_combo.addItem("CSV (.csv)", "csv")
+        self.export_format_combo.addItem("Parquet (.parquet)", "parquet")
+        self.export_format_combo.addItem("Feather (.feather)", "feather")
+        self.include_metadata_sidecar = QCheckBox("Include metadata sidecar")
+        self.include_metadata_sidecar.setChecked(True)
+        self.overwrite_existing = QCheckBox("Overwrite existing file")
+        self.overwrite_existing.setChecked(False)
+        self.save_normalized_button = QPushButton("Save Normalized File...")
+        self.export_status = QLabel("Run a successful import before exporting.")
+        self.export_status.setWordWrap(True)
+        self.export_guidance = QLabel("Metadata sidecar is recommended for auditability.")
+        self.export_guidance.setWordWrap(True)
+        export_layout.addRow("Format", self.export_format_combo)
+        export_layout.addRow("", self.include_metadata_sidecar)
+        export_layout.addRow("", self.overwrite_existing)
+        export_layout.addRow("", self.save_normalized_button)
+        export_layout.addRow("Guidance", self.export_guidance)
+        export_layout.addRow("Status", self.export_status)
+        layout.addWidget(export_group)
+
         self.open_waveform = QCheckBox("Open waveform after closing")
         self.open_waveform.setChecked(True)
         layout.addWidget(self.open_waveform)
+        self.set_export_enabled(False)
 
     def set_result(self, result: ImportPipelineResult | None, error_text: str | None = None) -> None:
+        self._last_pipeline_result = result
+        dataset = result.dataset if result is not None else None
+        self.set_export_enabled(
+            result is not None
+            and result.success
+            and dataset is not None
+            and dataset.is_export_ready()
+        )
         if error_text:
-            self.summary.setPlainText(f"Import failed.\n\n{error_text}")
+            self.diagnostics_panel.set_failure_text(f"Import failed.\n\n{error_text}")
+            self.export_status.setText("Import failed; export is unavailable.")
             return
         if result is None:
-            self.summary.setPlainText("Import has not run.")
+            self.diagnostics_panel.clear()
+            self.export_status.setText("Run a successful import before exporting.")
             return
-        diagnostics = result.diagnostics
-        lines = [
-            "Import complete." if result.success else "Import failed.",
-            f"Rows: {diagnostics.normalized_row_count}",
-            f"Analog channels: {diagnostics.analog_channel_count}",
-            f"Digital channels: {diagnostics.digital_channel_count}",
-            f"Warnings: {diagnostics.warning_count}",
-            f"Errors: {diagnostics.error_count}",
-            "",
-            format_messages(result.validation_messages),
-        ]
-        self.summary.setPlainText("\n".join(lines))
+
+        # Build and display rich engineering diagnostics.
+        summary = build_import_diagnostics(result)
+        self.diagnostics_panel.set_summary(summary)
+
+        if result.success and dataset is not None and dataset.is_export_ready():
+            self.export_status.setText("Normalized dataset is ready to export.")
+        elif result.success:
+            self.export_status.setText("Import succeeded, but no export-ready normalized dataset is available.")
+        else:
+            self.export_status.setText("Import failed; export is unavailable.")
+
+    def selected_export_format(self) -> str:
+        return str(self.export_format_combo.currentData())
+
+    def set_export_enabled(self, enabled: bool) -> None:
+        self.save_normalized_button.setEnabled(enabled)
+        self.export_format_combo.setEnabled(enabled)
+        self.include_metadata_sidecar.setEnabled(enabled)
+        self.overwrite_existing.setEnabled(enabled)
+        if not enabled and "Writing normalized export" not in self.export_status.text():
+            self.save_normalized_button.setToolTip("Run a successful import before saving normalized data.")
+        else:
+            self.save_normalized_button.setToolTip("Save the normalized dataset using the selected format.")
+
+    def set_export_running(self, running: bool) -> None:
+        self.save_normalized_button.setEnabled(not running)
+        if running:
+            self.export_status.setText("Writing normalized export...")
+
+    def set_export_result(self, result: ExportWriteResult | None, error_text: str | None = None) -> None:
+        if error_text:
+            self.export_status.setText(f"Export failed: {error_text}")
+        elif result is None:
+            self.export_status.setText("No export has run.")
+        else:
+            lines = [
+                "Export complete." if result.success else "Export failed.",
+                result.diagnostics_summary,
+                f"Output: {result.output_path or 'not written'}",
+            ]
+            if result.metadata_path:
+                lines.append(f"Metadata: {result.metadata_path}")
+            if result.validation_messages:
+                lines.extend(["", format_messages(result.validation_messages)])
+            self.export_status.setText("\n".join(lines))
+
+        # Refresh diagnostics panel to include export guidance.
+        if self._last_pipeline_result is not None and self._last_pipeline_result.success:
+            export_write_result = result if (result is not None and error_text is None) else None
+            summary = build_import_diagnostics(self._last_pipeline_result, export_write_result)
+            self.diagnostics_panel.set_summary(summary)

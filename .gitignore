@@ -27,8 +27,12 @@ build/
 # Test & coverage
 .pytest_cache/
 .pytest-tmp/
+.pytest_tmp*/
+.powerwave_runtime_tmp/
 agent/pytest-tmp*/
 pytest-tmp*/
+tmp_pytest*/
+test_artifacts/
 .coverage
 htmlcov/
 

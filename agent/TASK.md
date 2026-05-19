@@ -1577,3 +1577,216 @@ Next phase: Phase 8.55D — Import Wizard UI or DisturbanceRecord integration.
 - The timestamp-repair page is not exposed yet; selected candidate repair is represented by a validated repair plan for this skeleton.
 
 Next phase: Phase 8.55H - Plan-aware Import Wizard execution and timestamp repair controls, or Phase 9 visualization/event workflow planning.
+
+---
+
+## Phase 8.55I - Timestamp Format Override UI - COMPLETED 2026-05-19
+
+### Status: COMPLETED
+
+### Deliverables
+- app/import_wizard/timestamp_format_validator.py - lightweight sampled strptime validation for manual overrides
+- app/import_wizard/pipeline_plan_builder.py - user-format validation integrated into executable plan building
+- app/import_wizard/import_pipeline.py - plan-aware execution blocks unvalidated timestamp repair plans before full load
+- app/ui/import_wizard/wizard_pages.py - timestamp selection page now shows selected column, detected format, manual format field, reset button, and parse feedback
+- app/ui/import_wizard/import_wizard_dialog.py - manual override state sync, stale plan invalidation, and PARSE_USER_FORMAT plan creation
+- tests/unit/test_timestamp_override_ui.py - deterministic UI/model validation coverage
+- tests/runtime/test_timestamp_override_execution.py - plan-aware runtime timing and failure coverage
+
+### Outcome
+- Empty override uses detected-format behavior.
+- Non-empty override creates TimestampRepairPlan(strategy=PARSE_USER_FORMAT) and preserves detected_format only as metadata.
+- Override validation uses timestamp candidate samples only, emits INFO/WARNING/ERROR messages, and blocks complete parse failure.
+- Plan-aware execution uses the exact user format and ignores the detected format while override is active.
+- Invalid unvalidated timestamp plans fail gracefully without full pipeline execution.
+
+### Validation
+- 12 passed: timestamp override unit/runtime tests.
+- py_compile passed for touched import wizard backend and UI files.
+- Broader import-wizard slice was attempted, but repository/environment temp permissions currently break tests using pytest tmp_path before assertions run.
+
+### Known Limitations
+- Override validation is intentionally sampled from profiler candidate examples, not the full dataset.
+- UI feedback is a single lightweight message label; no advanced repair UI, timezone editor, or batch correction was added.
+
+---
+
+## Phase 8.55J - Test Environment Stabilization & Runtime Hygiene - COMPLETED 2026-05-19
+
+### Status: COMPLETED
+
+### Deliverables
+- app/testing/__init__.py - public exports for runtime temp test helpers
+- app/testing/temp_runtime.py - isolated runtime temp dirs, safe cleanup, retry-on-lock cleanup, immediate-child cleanup
+- tests/conftest.py - repo-local pytest/tempfile root, offscreen Qt default, runtime_tmp_path fixture, Windows pytest temp-mode shim
+- tests/runtime/conftest.py - runtime_qapp fixture with bounded QThreadPool and widget cleanup
+- tests/runtime/test_runtime_environment.py - deterministic runtime hygiene and repeatability tests
+- pyproject.toml - pytest cache dir moved under repo-local runtime temp area
+- .gitignore - runtime/temp artifact patterns added
+
+### Outcome
+- Pytest no longer depends on the user-profile temp root for tmp_path/runtime slices.
+- Runtime tests use isolated directories under `.powerwave_runtime_tmp` and clean them with bounded retry behavior.
+- CSV/XLSX runtime temp files are created inside isolated test roots and removed after execution.
+- Qt runtime tests close dialogs/widgets and wait for QThreadPool workers before teardown.
+- Import Wizard runtime, visualization handoff, timestamp override execution, and CSV/XLSX runtime slices are repeatable in consecutive runs.
+
+### Validation
+- 7 passed: tests/runtime/test_runtime_environment.py.
+- 71 passed: broad import-wizard/runtime slice.
+- 71 passed: same broad import-wizard/runtime slice repeated immediately.
+
+### Known Limitations
+- Pre-existing stale temp directories with Windows AccessDenied ACLs remain in the checkout and were not forcibly removed.
+- The pytest temp-mode shim is Windows-only and limited to pytest's private temp-dir creation; it is not product runtime behavior.
+
+Next phase: continue Import Wizard/runtime feature expansion with the new runtime hygiene slice included in standard verification.
+
+---
+
+## Phase 8.55L - Export UI Integration - COMPLETED 2026-05-19
+
+### Status: COMPLETED
+
+### Deliverables
+- app/ui/import_wizard/wizard_pages.py - Import Complete page export controls and ExportWriteResult summary display
+- app/ui/import_wizard/import_wizard_dialog.py - QFileDialog save flow, ExportPlan default suggestions, QRunnable export worker, export completion/error handling
+- tests/unit/test_export_ui.py - deterministic unit coverage for export UI contract and worker completion
+- tests/runtime/test_export_ui_runtime.py - runtime Import Wizard import-to-export coverage using Phase 8.55J temp/Qt hygiene
+
+### Outcome
+- Save Normalized File is available only after successful import with an export-ready NormalizedDataset.
+- Supported GUI formats: CSV, Parquet, Feather. CSV is the default.
+- Default save filename comes from ExportPlan suggestions, e.g. `{source}_normalized.csv`.
+- Export options are intentionally lightweight: include metadata sidecar and overwrite existing file.
+- Export execution runs off the UI thread using QRunnable/QThreadPool.
+- Export success/failure/warning details are shown in the completion page, including output path, rows, columns, format, and metadata sidecar path.
+- Export remains independent from waveform rendering and does not interfere with the imported DisturbanceRecord handoff.
+
+### Validation
+- 16 passed: export UI unit + runtime tests.
+- 83 passed, 5 skipped: backend export writer/planning/E2E + export UI tests.
+- 87 passed: broad Import Wizard/runtime slice including export UI.
+- py_compile passed for touched UI/test files.
+
+### Known Limitations
+- No advanced export settings dialog yet.
+- Optional Parquet/Feather formats still depend on backend pandas/pyarrow availability and surface missing dependencies as validation errors.
+- Save-location persistence and export history are not implemented.
+
+Next phase: optional export UX hardening or proceed to the next Import Wizard feature phase.
+
+---
+
+## Phase 8.55M - Real-World Import Hardening & Large Dataset Stress Testing - COMPLETED 2026-05-19
+
+### Status: COMPLETED
+
+### Deliverables
+- tools/generate_import_stress_samples.py - deterministic streaming CSV stress sample generator.
+- tools/benchmark_import_pipeline.py - practical import/export benchmark runner with lightweight timing and tracemalloc memory reporting.
+- tests/stress/test_import_wizard_large_csv.py - generated small/medium import, export, metadata sidecar, and timestamp-gap stress coverage.
+- tests/stress/test_import_wizard_malformed_files.py - malformed timestamp, delimiter, metadata/header, ragged row, digital text, unknown column, and unrecoverable timestamp coverage.
+- tests/runtime/test_import_wizard_realistic_workflows.py - Qt runtime responsiveness, failure stability, export-after-import, waveform handoff, and worker close behavior coverage.
+- docs/IMPORT_WIZARD_HARDENING_REPORT.md - measured results, covered scenarios, known limits, and operational guidance.
+
+### Outcome
+- Import Wizard backend and GUI runtime were exercised against realistic generated historian-style CSV files.
+- Generated files are written only into runtime temp directories during tests/benchmarks.
+- Semicolon, tab, and pipe delimiter variants import successfully.
+- Metadata rows before headers are detected and skipped.
+- Missing/malformed timestamp rows drop with timestamp diagnostics instead of crashing.
+- Duplicate and non-monotonic timestamp rows warn without blocking recoverable imports.
+- Text digital states such as OPEN/CLOSED route through the existing digital channel path and coerce to 0/1.
+- Unknown/text noise columns are preserved as analog with warnings.
+- Export after generated medium import writes CSV and metadata sidecar successfully.
+- Visualization handoff remains compatible: waveform_data["time"] exists and channel descriptors match waveform columns.
+
+### Validation
+- 19 passed: new stress/runtime hardening tests.
+- 30 passed: stress + runtime hygiene/export runtime slice.
+- 230 passed, 2 skipped: broader import pipeline, bridge, export UI/writer, timestamp override, authoritative flow, runtime hardening, and stress slice.
+- Benchmarks measured locally:
+  - 1,000 rows: profile 0.736 s, import 0.946 s, export 0.177 s, peak traced memory 1.94 MiB.
+  - 25,000 rows: profile 0.674 s, import 5.767 s, export 3.995 s, peak traced memory 18.40 MiB.
+
+### Known Limitations
+- Default tests use 25,000 rows for medium coverage; 100,000 and 1,000,000 row files are supported by tools but should be explicit stress runs.
+- Tracemalloc memory is not full process RSS.
+- Mixed timestamp formats are not unified automatically; unmatched rows are dropped under the active format.
+- Ragged CSV rows fail gracefully as load errors rather than being repaired.
+- Large Excel stress testing was not added in this phase.
+
+Next phase: Phase 8.55N - user-facing import diagnostics summary and operational guidance in the wizard, without changing the import pipeline contract.
+
+---
+
+## Phase 8.55O - Import Wizard Final UX & Workflow Hardening - COMPLETED 2026-05-19
+
+### Status: COMPLETED
+
+### Deliverables
+- app/ui/import_wizard/workflow_state.py - small workflow action-state evaluator.
+- app/ui/import_wizard/import_wizard_dialog.py - explicit state invalidation, action gating, discard protection, workflow guidance status.
+- app/ui/import_wizard/wizard_pages.py - concise operational guidance and timestamp override visibility.
+- app/ui/import_wizard/column_mapping_model.py - user override markers and tooltips.
+- tests/unit/test_import_workflow_ux.py - deterministic unit coverage for enablement, invalidation, reset, discard prompt, and override visibility.
+- tests/runtime/test_import_workflow_runtime.py - runtime coverage for repeated import/export, worker completion after close, rapid navigation, and failed import states.
+- docs/IMPORT_WORKFLOW_GUIDE.md - workflow state/action/override/stale-state guidance.
+
+### Outcome
+- Next, Run Import, Open Waveform, Save Normalized File, Back, and Close now follow explicit current-state rules.
+- Timestamp and mapping edits invalidate stale plan/import/export state and show re-import-required guidance.
+- New file selection clears prior profile/import/export/diagnostics state.
+- User overrides are visible in timestamp format controls and column mapping rows.
+- Explicit Close action prompts before discarding user overrides, dirty settings, unexported successful imports, or worker state.
+- Runtime teardown remains deterministic because window close itself accepts without modal prompts.
+- Diagnostics/export workflow remains intact and still uses existing backend result objects.
+
+### Validation
+- 11 passed: new workflow UX unit/runtime tests.
+- 100 passed: broader Import Wizard UX/export/diagnostics/runtime slice.
+- 236 passed, 2 skipped: backend import pipeline, plan-aware execution, bridge, export writer, runtime hygiene, and stress slice.
+
+### Known Limitations
+- Discard protection is not persistent session management.
+- Override markers are text-based, not icon-based.
+- Close-window behavior is intentionally prompt-free for stable runtime teardown; use the wizard Close button for discard protection.
+- No advanced import history, save-location persistence, drag/drop, or multi-file workflow was added.
+
+Next phase: final Import Wizard acceptance pass, or Phase 8.55P for CI/developer command documentation and standard verification slices.
+
+---
+
+## Phase 8.55P - Acceptance Validation & Developer Operations - COMPLETED 2026-05-19
+
+### Status: COMPLETED
+
+### Deliverables
+- docs/IMPORT_ACCEPTANCE_CHECKLIST.md - operational acceptance checklist for CSV/XLSX import, diagnostics, timestamp override, export, large files, repeated cycles, and worker-close stability.
+- docs/IMPORT_DEV_WORKFLOW.md - developer validation commands, runtime/stress/benchmark workflow, troubleshooting, and merge guidance.
+- docs/IMPORT_TEST_MATRIX.md - mapping of Import Wizard feature areas to unit, runtime, stress, and acceptance coverage.
+- tools/run_import_acceptance.py - standard validation runner with `unit`, `runtime`, `stress`, `acceptance`, and `import-full` slices.
+- tools/run_import_runtime_slice.py - repeatable runtime slice wrapper.
+- tests/acceptance/conftest.py - acceptance Qt cleanup fixture.
+- tests/acceptance/test_import_acceptance.py - lightweight operational acceptance workflows.
+
+### Outcome
+- Import Wizard validation is now documented as stable developer operations instead of scattered pytest knowledge.
+- Future contributors can run narrow unit/runtime/stress/acceptance slices or the combined `import-full` gate.
+- Acceptance tests cover CSV waveform handoff, XLSX import/export with metadata sidecar, authoritative timestamp override, malformed diagnostics, repeated import/export cycles, and pending worker close safety.
+- Benchmark and stress workflows are documented using existing Phase 8.55M tooling.
+
+### Validation
+- 6 passed: acceptance tests.
+- 6 passed: acceptance runner slice.
+- 49 passed: runtime runner slice.
+- 387 passed, 2 skipped: `import-full` runner slice.
+- py_compile passed for new scripts and acceptance tests.
+
+### Known Limitations
+- Acceptance coverage intentionally uses small deterministic files; explicit stress and benchmark tooling remain the large-file path.
+- Optional Parquet/Feather validation remains dependency-gated in existing export tests.
+- No CI cloud infrastructure or packaging workflow was added in this phase.
+
+Next phase: Phase 9 planning or CI wiring around the documented validation slices. Avoid new Import Wizard feature work until the acceptance workflow is reviewed by a human operator.
