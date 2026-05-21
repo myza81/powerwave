@@ -91,6 +91,8 @@ class EventAnalysisSession:
         # key: (source_id, channel_name)
         self._panels: dict[str, PanelConfig] = {}         # panel_id → PanelConfig
         self._quality_cache: dict[str, SourceQualityMetrics] = {}
+        # Phase 9C: human-readable alignment notes from the last auto-align result
+        self._alignment_notes: dict[str, str] = {}        # source_id → notes
 
     # -------------------------------------------------------------------------
     # Source management
@@ -127,6 +129,7 @@ class EventAnalysisSession:
             return
         del self._sources[source_id]
         self._quality_cache.pop(source_id, None)
+        self._alignment_notes.pop(source_id, None)
         # Remove all channels belonging to this source
         keys_to_remove = [k for k in self._channels if k[0] == source_id]
         for k in keys_to_remove:
@@ -183,6 +186,16 @@ class EventAnalysisSession:
             source.time_offset_s = 0.0
             source.alignment_method = "none"
             source.alignment_confidence = None
+        self._alignment_notes.clear()
+
+    def set_alignment_notes(self, source_id: str, notes: str) -> None:
+        """Store human-readable notes from the latest alignment operation."""
+        if source_id in self._sources:
+            self._alignment_notes[source_id] = notes
+
+    def get_alignment_notes(self, source_id: str) -> str:
+        """Return the latest alignment notes for a source, or empty string."""
+        return self._alignment_notes.get(source_id, "")
 
     def get_global_time_range(self) -> tuple[float, float]:
         """Return the intersection of all active source time ranges after offsets.

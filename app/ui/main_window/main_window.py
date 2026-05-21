@@ -49,6 +49,7 @@ from app.visualization.performance import timed_section
 from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
 from app.visualization.widgets.digital_event_timeline import DigitalEventTimeline
 from app.ui.import_wizard import ImportWizardDialog
+from app.ui.session import SessionCanvasController, SessionPanel
 from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
 
 _FILE_FILTER = (
@@ -368,6 +369,12 @@ class PowerwaveMainWindow(QMainWindow):
         self._signal_browser = SignalBrowserDock(self)
         self._signal_entry_targets: dict[str, tuple[str, str, str]] = {}
 
+        # Session workspace (Phase 9B/9D)
+        self._active_session = None                              # EventAnalysisSession | None
+        self._session_panel: SessionPanel | None = None
+        self._session_canvas_controller: SessionCanvasController | None = None
+        self._session_canvas_active: bool = False
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
@@ -610,11 +617,48 @@ class PowerwaveMainWindow(QMainWindow):
         manifest_action.setShortcut("Ctrl+E")
         manifest_action.triggered.connect(self._open_manifest_dialog)
         file_menu.addSeparator()
+        # Session actions (Phase 9B)
+        new_session_action = file_menu.addAction("&New Session")
+        new_session_action.setShortcut("Ctrl+Shift+N")
+        new_session_action.setToolTip("Start a new multi-source analysis session")
+        new_session_action.triggered.connect(self._on_new_session)
+        add_to_session_action = file_menu.addAction("Add to &Session…")
+        add_to_session_action.setShortcut("Ctrl+Shift+A")
+        add_to_session_action.setToolTip(
+            "Import a file and add it to the active session"
+        )
+        add_to_session_action.triggered.connect(self._on_add_to_session)
+        file_menu.addSeparator()
         exit_action = file_menu.addAction("E&xit")
         exit_action.triggered.connect(self.close)
 
         view_menu = menu_bar.addMenu("&View")
         view_menu.addAction(self._signal_browser.toggleViewAction())
+        # Session Panel toggle (Phase 9B) — created lazily on first use
+        self._session_panel_action = view_menu.addAction("Session &Panel")
+        self._session_panel_action.setCheckable(True)
+        self._session_panel_action.setChecked(False)
+        self._session_panel_action.triggered.connect(self._on_toggle_session_panel)
+
+        # Session Canvas (Phase 9D) — disabled until a session is active
+        self._session_canvas_action = view_menu.addAction("Session &Canvas")
+        self._session_canvas_action.setCheckable(True)
+        self._session_canvas_action.setChecked(False)
+        self._session_canvas_action.setEnabled(False)
+        self._session_canvas_action.setToolTip(
+            "Show the multi-source waveform canvas for the active session"
+        )
+        self._session_canvas_action.triggered.connect(self._on_toggle_session_canvas)
+
+        # Show Legend (Phase 9E) — only meaningful when session canvas is active
+        self._show_legend_action = view_menu.addAction("Show &Legend")
+        self._show_legend_action.setCheckable(True)
+        self._show_legend_action.setChecked(True)
+        self._show_legend_action.setToolTip(
+            "Show or hide the per-panel channel legend in the session canvas"
+        )
+        self._show_legend_action.triggered.connect(self._on_toggle_legend)
+
         view_menu.addSeparator()
         time_axis_menu = view_menu.addMenu("&Time Axis Mode")
         time_axis_group = QActionGroup(self)
@@ -1928,6 +1972,302 @@ class PowerwaveMainWindow(QMainWindow):
 
         self._refresh_signal_browser()
         self.statusBar().showMessage(f"{name}: {'visible' if visible else 'hidden'}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Session workspace (Phase 9B)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _ensure_session_panel(self) -> SessionPanel:
+        """Create the session panel on first use and dock it."""
+        if self._session_panel is None:
+            self._session_panel = SessionPanel(self)
+            self.addDockWidget(
+                Qt.DockWidgetArea.RightDockWidgetArea, self._session_panel
+            )
+            self._wire_session_panel(self._session_panel)
+            self._session_panel.visibilityChanged.connect(
+                self._session_panel_action.setChecked
+            )
+        return self._session_panel
+
+    def _wire_session_panel(self, panel: SessionPanel) -> None:
+        panel.source_add_requested.connect(self._on_session_add_source_requested)
+        panel.source_remove_requested.connect(self._on_session_remove_source)
+        panel.offset_changed.connect(self._on_session_offset_changed)
+        panel.offset_reset_requested.connect(self._on_session_offset_reset)
+        panel.auto_align_requested.connect(self._on_session_auto_align)
+        panel.channel_visibility_changed.connect(
+            self._on_session_channel_visibility
+        )
+        panel.channel_colour_change_requested.connect(
+            self._on_session_channel_colour
+        )
+        panel.channel_panel_changed.connect(self._on_session_channel_panel)
+        panel.session_cleared.connect(self._on_session_cleared)
+        panel.source_active_changed.connect(self._on_session_source_active)
+        panel.set_as_reference_requested.connect(self._on_session_set_as_reference)
+
+    def _on_toggle_session_panel(self, checked: bool) -> None:
+        panel = self._ensure_session_panel()
+        panel.setVisible(checked)
+
+    def _on_toggle_session_canvas(self, checked: bool) -> None:
+        if checked:
+            if self._active_session is None:
+                self._session_canvas_action.setChecked(False)
+                return
+            self._activate_session_canvas()
+        else:
+            self._deactivate_session_canvas()
+
+    def _activate_session_canvas(self) -> None:
+        """Build/rebuild the session canvas and make it the central widget."""
+        if self._active_session is None:
+            return
+        if self._session_canvas_controller is None:
+            self._session_canvas_controller = SessionCanvasController()
+
+        self._clear_sync_before_layout_switch()
+        splitter = self._session_canvas_controller.rebuild_layout(self._active_session)
+        self.setCentralWidget(splitter)
+        self._panel_canvases = {}
+        self._grouped_timeline = None
+        self._session_canvas_active = True
+        self._session_canvas_action.setChecked(True)
+
+        self._session_canvas_controller.register_with_sync(
+            self._vis_manager.synchronization_manager
+        )
+        self._session_canvas_controller.refresh_all(self._active_session)
+
+        n = len(self._active_session.list_sources())
+        self.statusBar().showMessage(f"Session canvas: {n} source(s) loaded.")
+
+    def _deactivate_session_canvas(self) -> None:
+        """Restore standard layout and exit session canvas mode."""
+        self._session_canvas_active = False
+        self._session_canvas_action.setChecked(False)
+        self._restore_standard_layout()
+
+    def _on_new_session(self) -> None:
+        """Start a fresh EventAnalysisSession and show the session panel."""
+        from app.sessions import EventAnalysisSession
+
+        self._active_session = EventAnalysisSession()
+        panel = self._ensure_session_panel()
+        panel.refresh_all(self._active_session)
+        panel.show()
+        self._session_panel_action.setChecked(True)
+        self._session_canvas_action.setEnabled(True)
+        if self._session_canvas_active:
+            self._deactivate_session_canvas()
+        self.statusBar().showMessage("New session started.")
+
+    def _on_add_to_session(self) -> None:
+        """Open Import Wizard; on success add the record to the active session."""
+        if self._active_session is None:
+            self._on_new_session()
+        dlg = ImportWizardDialog(self)
+        dlg.import_completed.connect(self._on_session_import_record_ready)
+        dlg.exec()
+
+    def _on_session_import_record_ready(self, record: object) -> None:
+        from app.models import DisturbanceRecord
+
+        if not isinstance(record, DisturbanceRecord):
+            return
+        if self._active_session is None:
+            return
+        source_path = _record_source_path(record)
+        display_name = source_path.stem or "source"
+        provider_type = str(
+            getattr(record.metadata, "provider_type", "") or "unknown"
+        )
+        origin_path = str(source_path) if source_path.name else None
+        self._active_session.add_source(
+            record, display_name, provider_type, origin_path
+        )
+        self._session_canvas_action.setEnabled(True)
+        panel = self._ensure_session_panel()
+        panel.refresh_all(self._active_session)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._activate_session_canvas()
+        n = len(self._active_session.list_sources())
+        self.statusBar().showMessage(
+            f"Session: {n} source(s) loaded — {display_name} added."
+        )
+
+    def _on_session_add_source_requested(self) -> None:
+        """Handle 'Add Source' button inside the session panel."""
+        self._on_add_to_session()
+
+    def _on_session_remove_source(self, source_id: str) -> None:
+        if self._active_session is None:
+            return
+        self._active_session.remove_source(source_id)
+        if self._session_panel is not None:
+            self._session_panel.remove_source_row(source_id)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.on_source_removed(source_id)
+        n = len(self._active_session.list_sources())
+        self.statusBar().showMessage(f"Source removed. Session: {n} source(s).")
+
+    def _on_session_offset_changed(self, source_id: str, offset_s: float) -> None:
+        if self._active_session is None:
+            return
+        self._active_session.set_time_offset(source_id, offset_s, method="manual")
+        self._active_session.set_alignment_notes(source_id, "")
+        self._refresh_session_source_row(source_id)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.on_offset_changed(
+                source_id, offset_s, self._active_session
+            )
+
+    def _on_session_offset_reset(self, source_id: str) -> None:
+        if self._active_session is None:
+            return
+        self._active_session.set_time_offset(source_id, 0.0, method="none")
+        self._active_session.set_alignment_notes(source_id, "")
+        self._refresh_session_source_row(source_id)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.on_offset_changed(
+                source_id, 0.0, self._active_session
+            )
+        self.statusBar().showMessage(f"Offset reset to 0.000 s for {source_id}.")
+
+    def _on_session_set_as_reference(self, source_id: str) -> None:
+        """Set one source as the time reference: its offset becomes 0.0 and all
+        other sources are shifted to maintain their relative positions."""
+        if self._active_session is None:
+            return
+        ref_source = self._active_session.get_source(source_id)
+        if ref_source is None:
+            return
+        ref_offset = ref_source.time_offset_s
+        for source in self._active_session.list_sources():
+            if source.source_id == source_id:
+                new_offset = 0.0
+            else:
+                new_offset = source.time_offset_s - ref_offset
+            self._active_session.set_time_offset(
+                source.source_id, new_offset, method="manual"
+            )
+            self._active_session.set_alignment_notes(source.source_id, "")
+            self._refresh_session_source_row(source.source_id)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.refresh_all(self._active_session)
+        self.statusBar().showMessage(
+            f"Set '{ref_source.display_name}' as reference (t=0)."
+        )
+
+    def _on_session_auto_align(self, source_id: str) -> None:
+        if self._active_session is None:
+            return
+        from app.sessions.alignment_engine import suggest_alignment_offsets
+
+        all_sources = self._active_session.list_sources()
+        if source_id == "all":
+            targets = [s for s in all_sources if s.is_active]
+        else:
+            targets = [s for s in all_sources if s.source_id == source_id]
+
+        if not targets:
+            self.statusBar().showMessage("Auto-align: no active sources to align.")
+            return
+
+        results = suggest_alignment_offsets(targets)
+        for result in results:
+            self._active_session.set_time_offset(
+                result.source_id,
+                result.suggested_offset_s,
+                method=result.alignment_method,
+                confidence=result.alignment_confidence,
+            )
+            self._active_session.set_alignment_notes(result.source_id, result.notes)
+            self._refresh_session_source_row(result.source_id)
+            if self._session_canvas_active and self._session_canvas_controller is not None:
+                self._session_canvas_controller.on_offset_changed(
+                    result.source_id, result.suggested_offset_s, self._active_session
+                )
+
+        n = len(results)
+        self.statusBar().showMessage(f"Auto-aligned {n} source(s).")
+
+    def _refresh_session_source_row(self, source_id: str) -> None:
+        """Pull current state from the session and refresh the corresponding panel row."""
+        if self._active_session is None or self._session_panel is None:
+            return
+        sources = {s.source_id: s for s in self._active_session.list_sources()}
+        source = sources.get(source_id)
+        if source is None:
+            return
+        try:
+            metrics = self._active_session.get_source_quality_metrics(source_id)
+        except Exception:  # noqa: BLE001
+            metrics = None
+        try:
+            notes = self._active_session.get_alignment_notes(source_id)
+        except AttributeError:
+            notes = ""
+        panels = self._active_session.list_panels()
+        self._session_panel.refresh_source_row(
+            source_id, source, metrics, panels, alignment_notes=notes
+        )
+
+    def _on_session_channel_visibility(
+        self, source_id: str, channel_name: str, visible: bool
+    ) -> None:
+        if self._active_session is None:
+            return
+        self._active_session.set_channel_visibility(source_id, channel_name, visible)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.on_channel_visibility_changed(
+                source_id, channel_name, visible, self._active_session
+            )
+
+    def _on_session_channel_colour(
+        self, source_id: str, channel_name: str
+    ) -> None:
+        if self._active_session is None:
+            return
+        from PyQt6.QtGui import QColor
+        from PyQt6.QtWidgets import QColorDialog
+        ch = self._active_session.get_channel(source_id, channel_name)
+        initial = QColor(ch.color_hex if (ch and ch.color_hex) else "#aaaaaa")
+        chosen = QColorDialog.getColor(initial, self, "Choose curve colour")
+        if not chosen.isValid():
+            return
+        new_hex = chosen.name()
+        self._active_session.set_channel_colour(source_id, channel_name, new_hex)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.on_colour_changed(source_id, channel_name, new_hex)
+
+    def _on_toggle_legend(self, checked: bool) -> None:
+        if self._session_canvas_controller is not None:
+            self._session_canvas_controller.set_legend_visible(checked)
+
+    def _on_session_channel_panel(
+        self, source_id: str, channel_name: str, panel_id: str
+    ) -> None:
+        if self._active_session is None:
+            return
+        self._active_session.set_channel_panel(source_id, channel_name, panel_id)
+
+    def _on_session_cleared(self) -> None:
+        from app.sessions import EventAnalysisSession
+
+        self._active_session = EventAnalysisSession()
+        if self._session_canvas_active:
+            self._deactivate_session_canvas()
+        self._session_canvas_action.setEnabled(False)
+        self.statusBar().showMessage("Session cleared.")
+
+    def _on_session_source_active(self, source_id: str, is_active: bool) -> None:
+        if self._active_session is None:
+            return
+        self._active_session.set_source_active(source_id, is_active)
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.refresh_all(self._active_session)
 
     def _load_manifest(self, manifest_path: Path) -> None:
         """Load a YAML manifest, show the data review dialog, then visualize."""
