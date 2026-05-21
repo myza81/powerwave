@@ -17,6 +17,7 @@ class AnalogChannel:
     offset: float = 0.0
     primary_ratio: float | None = None
     secondary_ratio: float | None = None
+    parameter_type: str | None = None   # ParameterType.value string; None for COMTRADE/unknown
 
 
 @dataclass(slots=True)

@@ -606,28 +606,31 @@ class PowerwaveMainWindow(QMainWindow):
         file_menu = menu_bar.addMenu("&File")
         open_action = file_menu.addAction("&Open…")
         open_action.setShortcut("Ctrl+O")
+        open_action.setToolTip("Open a COMTRADE, CSV, or Excel file")
         open_action.triggered.connect(self._open_file_dialog)
-        import_action = file_menu.addAction("&Import Wizard...")
+        import_action = file_menu.addAction("&Import Wizard…")
         import_action.setShortcut("Ctrl+I")
+        import_action.setToolTip(
+            "Open the Import Wizard for CSV or Excel files — "
+            "configure columns, timestamps and units before loading"
+        )
         import_action.triggered.connect(self._open_import_wizard)
-        multi_action = file_menu.addAction("Open &Multi-Source…")
-        multi_action.setShortcut("Ctrl+M")
-        multi_action.triggered.connect(self._open_multi_source_dialog)
+        open_session_action = file_menu.addAction("&Multi-Source Viewer…")
+        open_session_action.setShortcut("Ctrl+Shift+N")
+        open_session_action.setToolTip(
+            "Open a workspace to load and compare multiple recordings side by side"
+        )
+        open_session_action.triggered.connect(self._on_open_session)
         manifest_action = file_menu.addAction("Open &Event Manifest…")
         manifest_action.setShortcut("Ctrl+E")
         manifest_action.triggered.connect(self._open_manifest_dialog)
-        file_menu.addSeparator()
-        # Session actions (Phase 9B)
-        new_session_action = file_menu.addAction("&New Session")
-        new_session_action.setShortcut("Ctrl+Shift+N")
-        new_session_action.setToolTip("Start a new multi-source analysis session")
-        new_session_action.triggered.connect(self._on_new_session)
-        add_to_session_action = file_menu.addAction("Add to &Session…")
-        add_to_session_action.setShortcut("Ctrl+Shift+A")
-        add_to_session_action.setToolTip(
-            "Import a file and add it to the active session"
+        self._save_manifest_action = file_menu.addAction("&Save Session as Manifest…")
+        self._save_manifest_action.setShortcut("Ctrl+Shift+S")
+        self._save_manifest_action.setToolTip(
+            "Export the current session to a YAML manifest file that can be reopened later"
         )
-        add_to_session_action.triggered.connect(self._on_add_to_session)
+        self._save_manifest_action.setEnabled(False)
+        self._save_manifest_action.triggered.connect(self._on_save_session_as_manifest)
         file_menu.addSeparator()
         exit_action = file_menu.addAction("E&xit")
         exit_action.triggered.connect(self.close)
@@ -1273,6 +1276,14 @@ class PowerwaveMainWindow(QMainWindow):
     def _apply_time_axis_mode_to_visible(self) -> None:
         """Apply current time-axis display policy without changing X data."""
         self._vis_manager.set_time_axis_mode(self._time_display_mode)
+        if (
+            self._session_canvas_active
+            and self._session_canvas_controller is not None
+            and self._active_session is not None
+        ):
+            self._session_canvas_controller.set_time_axis_mode(
+                self._time_display_mode, self._active_session
+            )
 
     def _set_axis_mode_action_checked(self, mode: AxisDisplayMode) -> None:
         action = self._axis_mode_actions.get(mode)
@@ -1290,6 +1301,15 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _apply_axis_display_mode_to_visible(self) -> None:
         """Apply current Y-axis grouping without reloading records."""
+        if self._session_canvas_active:
+            if (
+                self._session_canvas_controller is not None
+                and self._active_session is not None
+            ):
+                self._session_canvas_controller.set_axis_display_mode(
+                    self._axis_display_mode, self._active_session
+                )
+            return
         canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
         for canvas in canvases:
             if self._qt_widget_alive(canvas):
@@ -2040,6 +2060,15 @@ class PowerwaveMainWindow(QMainWindow):
         )
         self._session_canvas_controller.refresh_all(self._active_session)
 
+        # Sync session canvas to the current time-axis and Y-axis modes so it
+        # matches whatever was already set in the single-source viewer.
+        self._session_canvas_controller.set_time_axis_mode(
+            self._time_display_mode, self._active_session
+        )
+        self._session_canvas_controller.set_axis_display_mode(
+            self._axis_display_mode, self._active_session
+        )
+
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(f"Session canvas: {n} source(s) loaded.")
 
@@ -2048,6 +2077,10 @@ class PowerwaveMainWindow(QMainWindow):
         self._session_canvas_active = False
         self._session_canvas_action.setChecked(False)
         self._restore_standard_layout()
+
+    def _on_open_session(self) -> None:
+        """Start a fresh session workspace. User adds sources via the Session Panel."""
+        self._on_new_session()
 
     def _on_new_session(self) -> None:
         """Start a fresh EventAnalysisSession and show the session panel."""
@@ -2064,12 +2097,34 @@ class PowerwaveMainWindow(QMainWindow):
         self.statusBar().showMessage("New session started.")
 
     def _on_add_to_session(self) -> None:
-        """Open Import Wizard; on success add the record to the active session."""
+        """Add one source to the active session.
+
+        Shows a single file dialog for all supported types.
+        COMTRADE files are loaded directly; CSV/Excel opens the Import Wizard
+        with the chosen path pre-filled so the user doesn't pick the file twice.
+        """
         if self._active_session is None:
             self._on_new_session()
-        dlg = ImportWizardDialog(self)
-        dlg.import_completed.connect(self._on_session_import_record_ready)
-        dlg.exec()
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Add Source to Session", "", _FILE_FILTER
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if path.suffix.lower() in _CSV_EXCEL_SUFFIXES:
+            dlg = ImportWizardDialog(self)
+            dlg.load_page.set_path(path_str)
+            # Trigger profiling once the dialog is visible so Next is enabled immediately.
+            QTimer.singleShot(0, dlg.profile_selected_file)
+            dlg.import_completed.connect(self._on_session_import_record_ready)
+            dlg.exec()
+        else:
+            self.statusBar().showMessage(f"Loading {path.name}…")
+            try:
+                record = self._provider_manager.load(path)
+                self._on_session_import_record_ready(record)
+            except Exception as exc:  # noqa: BLE001
+                self._on_load_error(str(exc))
 
     def _on_session_import_record_ready(self, record: object) -> None:
         from app.models import DisturbanceRecord
@@ -2087,11 +2142,12 @@ class PowerwaveMainWindow(QMainWindow):
         self._active_session.add_source(
             record, display_name, provider_type, origin_path
         )
+        self._active_session.default_layout()
         self._session_canvas_action.setEnabled(True)
+        self._save_manifest_action.setEnabled(True)
         panel = self._ensure_session_panel()
         panel.refresh_all(self._active_session)
-        if self._session_canvas_active and self._session_canvas_controller is not None:
-            self._activate_session_canvas()
+        self._activate_session_canvas()
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(
             f"Session: {n} source(s) loaded — {display_name} added."
@@ -2230,11 +2286,38 @@ class PowerwaveMainWindow(QMainWindow):
     ) -> None:
         if self._active_session is None:
             return
-        from PyQt6.QtGui import QColor
-        from PyQt6.QtWidgets import QColorDialog
+        from PyQt6.QtGui import QColor, QPalette
+        from PyQt6.QtWidgets import QColorDialog, QStyleFactory, QWidget
         ch = self._active_session.get_channel(source_id, channel_name)
         initial = QColor(ch.color_hex if (ch and ch.color_hex) else "#aaaaaa")
-        chosen = QColorDialog.getColor(initial, self, "Choose curve colour")
+
+        dlg = QColorDialog(initial, self)
+        dlg.setWindowTitle("Choose curve colour")
+        # DontUseNativeDialog forces Qt to render all parts itself so our
+        # palette/style can override Windows dark mode on every child widget.
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+
+        fusion = QStyleFactory.create("Fusion")
+        light = QPalette()
+        light.setColor(QPalette.ColorRole.Window,          QColor("#f0f0f0"))
+        light.setColor(QPalette.ColorRole.WindowText,      QColor("#1a1a1a"))
+        light.setColor(QPalette.ColorRole.Base,            QColor("#ffffff"))
+        light.setColor(QPalette.ColorRole.AlternateBase,   QColor("#e8e8e8"))
+        light.setColor(QPalette.ColorRole.Text,            QColor("#1a1a1a"))
+        light.setColor(QPalette.ColorRole.Button,          QColor("#e0e0e0"))
+        light.setColor(QPalette.ColorRole.ButtonText,      QColor("#1a1a1a"))
+        light.setColor(QPalette.ColorRole.Highlight,       QColor("#0078d4"))
+        light.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+
+        dlg.setStyle(fusion)
+        dlg.setPalette(light)
+        for child in dlg.findChildren(QWidget):
+            child.setStyle(fusion)
+            child.setPalette(light)
+
+        if dlg.exec() != QColorDialog.DialogCode.Accepted:
+            return
+        chosen = dlg.selectedColor()
         if not chosen.isValid():
             return
         new_hex = chosen.name()
@@ -2260,7 +2343,44 @@ class PowerwaveMainWindow(QMainWindow):
         if self._session_canvas_active:
             self._deactivate_session_canvas()
         self._session_canvas_action.setEnabled(False)
+        self._save_manifest_action.setEnabled(False)
         self.statusBar().showMessage("Session cleared.")
+
+    def _on_save_session_as_manifest(self) -> None:
+        """Export the active session to a YAML manifest file."""
+        if self._active_session is None or not self._active_session.list_sources():
+            return
+        from datetime import datetime as _dt
+        from PyQt6.QtWidgets import QInputDialog, QFileDialog
+        from app.data.manifest_generator import generate_manifest
+
+        event_id, ok = QInputDialog.getText(
+            self,
+            "Save Session as Manifest",
+            "Event ID (used as the manifest identifier):",
+            text="event_" + _dt.now().strftime("%Y%m%d_%H%M%S"),
+        )
+        if not ok or not event_id.strip():
+            return
+
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Event Manifest",
+            f"{event_id.strip()}.yaml",
+            "Event Manifests (*.yaml *.yml);;All Files (*)",
+        )
+        if not path_str:
+            return
+
+        try:
+            generate_manifest(
+                self._active_session,
+                event_id.strip(),
+                Path(path_str),
+            )
+            self.statusBar().showMessage(f"Manifest saved: {Path(path_str).name}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Save Failed", str(exc))
 
     def _on_session_source_active(self, source_id: str, is_active: bool) -> None:
         if self._active_session is None:

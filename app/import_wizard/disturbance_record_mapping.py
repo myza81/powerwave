@@ -125,6 +125,7 @@ def map_to_analog_channel(
         index=index,
         phase=infer_phase(pm.canonical_name),
         description=description,
+        parameter_type=pm.parameter_type.value if pm.parameter_type is not None else None,
     )
 
 

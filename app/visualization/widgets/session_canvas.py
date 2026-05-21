@@ -28,6 +28,7 @@ SynchronizationManager compatibility
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
@@ -41,6 +42,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.ui.session.legend_widget import ChannelLegendWidget
+from app.visualization.axis.datetime_axis import DatetimeAxisItem
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,13 @@ class _PanelHeader(QWidget):
 # ---------------------------------------------------------------------------
 
 
+_STYLE_MAP = {
+    "solid":  Qt.PenStyle.SolidLine,
+    "dashed": Qt.PenStyle.DashLine,
+    "dotted": Qt.PenStyle.DotLine,
+}
+
+
 @dataclasses.dataclass
 class _CurveMetadata:
     source_id: str
@@ -87,6 +96,9 @@ class _CurveMetadata:
     unit: str | None
     colour: str
     visible: bool
+    line_style: str = "solid"
+    line_width: float = 1.0
+    y_axis_side: str = "left"
 
 
 # ---------------------------------------------------------------------------
@@ -139,10 +151,23 @@ class SessionCanvasWidget(QWidget):
         self._header.customContextMenuRequested.connect(self._show_panel_menu)
         layout.addWidget(self._header)
 
-        self._plot_widget = pg.PlotWidget(background="#1E1E1E")
+        self._datetime_axis = DatetimeAxisItem(orientation="bottom")
+        self._plot_widget = pg.PlotWidget(
+            background="#1E1E1E",
+            axisItems={"bottom": self._datetime_axis},
+        )
         self._primary_plot: pg.PlotItem = self._plot_widget.getPlotItem()
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
-        self._primary_plot.setLabel("bottom", "Time (s)")
+        self._primary_plot.setLabel("bottom", "Time")
+
+        # Right-side secondary Y-axis (hidden until first right-axis curve is added)
+        self._right_vb = pg.ViewBox()
+        self._primary_plot.scene().addItem(self._right_vb)
+        self._primary_plot.showAxis("right")
+        self._primary_plot.getAxis("right").linkToView(self._right_vb)
+        self._right_vb.setXLink(self._primary_plot.vb)
+        self._primary_plot.getAxis("right").setStyle(showValues=False)
+        self._primary_plot.vb.sigResized.connect(self._sync_right_vb)
 
         # Legend below the plot (Phase 9E)
         self.legend = ChannelLegendWidget(self.panel_id, parent=self)
@@ -194,6 +219,19 @@ class SessionCanvasWidget(QWidget):
     def normalize_viewport(self, t_start: float, t_end: float) -> None:
         self._primary_plot.setXRange(t_start, t_end, padding=0)
 
+    def _sync_right_vb(self) -> None:
+        self._right_vb.setGeometry(self._primary_plot.vb.sceneBoundingRect())
+        self._right_vb.linkedViewChanged(self._primary_plot.vb, self._right_vb.XAxis)
+
+    def _right_axis_visible(self) -> bool:
+        return any(m.y_axis_side == "right" for m in self._metadata.values())
+
+    def _refresh_right_axis(self) -> None:
+        visible = self._right_axis_visible()
+        self._primary_plot.getAxis("right").setStyle(showValues=visible)
+        if visible:
+            self._sync_right_vb()
+
     def getViewBox(self) -> pg.ViewBox:
         return self._primary_plot.getViewBox()
 
@@ -213,20 +251,32 @@ class SessionCanvasWidget(QWidget):
         display_name: str | None = None,
         source_badge: str = "",
         unit: str | None = None,
+        line_style: str = "solid",
+        line_width: float = 1.0,
+        y_axis_side: str = "left",
     ) -> None:
         key = (source_id, channel_name)
+        pen = pg.mkPen(color, width=line_width, style=_STYLE_MAP.get(line_style, Qt.PenStyle.SolidLine))
+        existing_meta = self._metadata.get(key)
+        existing_side = existing_meta.y_axis_side if existing_meta else "left"
+
         if key not in self._curves:
-            curve = pg.PlotDataItem(
-                pen=pg.mkPen(color, width=1),
-                skipFiniteCheck=True,
-            )
+            curve = pg.PlotDataItem(pen=pen, skipFiniteCheck=True)
             curve.setClipToView(True)
             curve.setDownsampling(auto=True, method="peak")
-            self._primary_plot.addItem(curve)
+            vb = self._right_vb if y_axis_side == "right" else self._primary_plot.vb
+            vb.addItem(curve)
             self._curves[key] = curve
         else:
-            curve = self._curves[key]
+            self._curves[key].setPen(pen)
+            # Migrate ViewBox if axis side changed
+            if existing_side != y_axis_side:
+                old_vb = self._right_vb if existing_side == "right" else self._primary_plot.vb
+                new_vb = self._right_vb if y_axis_side == "right" else self._primary_plot.vb
+                old_vb.removeItem(self._curves[key])
+                new_vb.addItem(self._curves[key])
 
+        curve = self._curves[key]
         if len(time) > 0 and len(values) > 0:
             curve.setData(x=time, y=values)
         else:
@@ -234,7 +284,7 @@ class SessionCanvasWidget(QWidget):
         curve.setVisible(visible)
 
         eff_display = display_name if display_name is not None else channel_name
-        meta = _CurveMetadata(
+        self._metadata[key] = _CurveMetadata(
             source_id=source_id,
             channel_name=channel_name,
             display_name=eff_display,
@@ -242,22 +292,56 @@ class SessionCanvasWidget(QWidget):
             unit=unit,
             colour=color,
             visible=visible,
+            line_style=line_style,
+            line_width=line_width,
+            y_axis_side=y_axis_side,
         )
-        self._metadata[key] = meta
+        self._refresh_right_axis()
         self.legend.upsert_row(
             source_id, channel_name, eff_display, source_badge, unit, color, visible
         )
 
     def update_curve_pen(self, source_id: str, channel_name: str, color: str) -> None:
-        """Update pen colour only — no data copy, O(1)."""
+        """Update pen colour only — preserves existing line style and width."""
         key = (source_id, channel_name)
+        meta = self._metadata.get(key)
+        style = _STYLE_MAP.get(meta.line_style if meta else "solid", Qt.PenStyle.SolidLine)
+        width = meta.line_width if meta else 1.0
         curve = self._curves.get(key)
         if curve is not None:
-            curve.setPen(pg.mkPen(color, width=1))
-        meta = self._metadata.get(key)
+            curve.setPen(pg.mkPen(color, width=width, style=style))
         if meta is not None:
             meta.colour = color
         self.legend.update_row_colour(source_id, channel_name, color)
+
+    def update_curve_style(
+        self, source_id: str, channel_name: str, line_style: str, line_width: float
+    ) -> None:
+        """Update pen style and width only — no data copy, O(1)."""
+        key = (source_id, channel_name)
+        meta = self._metadata.get(key)
+        color = meta.colour if meta else "#AAAAAA"
+        pen = pg.mkPen(color, width=line_width, style=_STYLE_MAP.get(line_style, Qt.PenStyle.SolidLine))
+        curve = self._curves.get(key)
+        if curve is not None:
+            curve.setPen(pen)
+        if meta is not None:
+            meta.line_style = line_style
+            meta.line_width = line_width
+
+    def set_curve_y_axis(self, source_id: str, channel_name: str, side: str) -> None:
+        """Move a curve between left and right Y-axes, O(1)."""
+        key = (source_id, channel_name)
+        meta = self._metadata.get(key)
+        curve = self._curves.get(key)
+        if meta is None or curve is None or meta.y_axis_side == side:
+            return
+        old_vb = self._right_vb if meta.y_axis_side == "right" else self._primary_plot.vb
+        new_vb = self._right_vb if side == "right" else self._primary_plot.vb
+        old_vb.removeItem(curve)
+        new_vb.addItem(curve)
+        meta.y_axis_side = side
+        self._refresh_right_axis()
 
     def set_curve_visible(
         self, source_id: str, channel_name: str, visible: bool
@@ -274,8 +358,12 @@ class SessionCanvasWidget(QWidget):
     def remove_source(self, source_id: str) -> None:
         stale = [k for k in self._curves if k[0] == source_id]
         for key in stale:
-            self._primary_plot.removeItem(self._curves.pop(key))
-            self._metadata.pop(key, None)
+            meta = self._metadata.pop(key, None)
+            curve = self._curves.pop(key)
+            vb = self._right_vb if (meta and meta.y_axis_side == "right") else self._primary_plot.vb
+            vb.removeItem(curve)
+        if stale:
+            self._refresh_right_axis()
         self.legend.remove_source_rows(source_id)
         self.remove_zero_line(source_id)
 
@@ -312,6 +400,20 @@ class SessionCanvasWidget(QWidget):
     # ─────────────────────────────────────────────────────────────────────────
     # Panel metadata & housekeeping
     # ─────────────────────────────────────────────────────────────────────────
+
+    def set_time_reference(self, reference_time: datetime) -> None:
+        """Switch the X-axis to absolute wall-clock labels anchored at reference_time."""
+        bottom = self._primary_plot.getAxis("bottom")
+        if isinstance(bottom, DatetimeAxisItem):
+            self._datetime_axis = bottom
+            bottom.set_start_time(reference_time)
+
+    def clear_time_reference(self) -> None:
+        """Revert the X-axis to elapsed-seconds labels."""
+        bottom = self._primary_plot.getAxis("bottom")
+        if isinstance(bottom, DatetimeAxisItem):
+            self._datetime_axis = bottom
+            bottom.set_start_time(None)
 
     def set_panel_title(self, title: str) -> None:
         self._panel_title = title

@@ -80,7 +80,13 @@ class DatetimeAxisItem(pg.AxisItem):
         """
         self._start_time = start_time
         self.picture = None  # invalidate rendered-label cache
-        self.update()
+        try:
+            self.update()
+        except RuntimeError:
+            # C++ QGraphicsItem was destroyed (PyQt6 ownership transfer after
+            # PlotItem.clear()).  State is stored; tickStrings() will use it on
+            # the next repaint once the axis is re-parented.
+            pass
 
     def tickStrings(  # noqa: N802  (PyQtGraph API name)
         self,

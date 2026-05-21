@@ -106,6 +106,8 @@ class _LegendRow(QWidget):
         self.channel_name = channel_name
         self._display_name = display_name
         self._colour = colour
+        self._line_style = "solid"
+        self._line_width = 1.0
 
         # Callbacks wired by ChannelLegendWidget — keep as callables, not signals,
         # to avoid making _LegendRow a full QObject with its own signal table.
@@ -115,6 +117,10 @@ class _LegendRow(QWidget):
         self._cb_move: object = None
         self._cb_reset_colour: object = None
         self._cb_reset_name: object = None
+        self._cb_line_style: object = None
+        self._cb_line_width: object = None
+        self._cb_y_axis: object = None
+        self._y_axis_side = "left"
 
         self._build_ui(display_name, source_badge, unit, colour, visible)
 
@@ -189,29 +195,103 @@ class _LegendRow(QWidget):
 
     def _pick_colour(self) -> None:
         initial = QColor(self._colour)
-        chosen = QColorDialog.getColor(initial, self, "Choose curve colour")
-        if chosen.isValid() and self._cb_colour is not None:
-            self._cb_colour(self.source_id, self.channel_name, chosen.name())
+        dlg = QColorDialog(initial, self)
+        dlg.setWindowTitle("Choose curve colour")
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dlg.setStyleSheet(
+            "* { background-color: #f0f0f0; color: #1a1a1a; }"
+            "QPushButton { background-color: #e0e0e0; border: 1px solid #b0b0b0;"
+            " padding: 4px 10px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #d0d0d0; }"
+            "QLineEdit, QSpinBox { background-color: #ffffff; border: 1px solid #b0b0b0; }"
+        )
+        if dlg.exec() == QColorDialog.DialogCode.Accepted and self._cb_colour is not None:
+            self._cb_colour(self.source_id, self.channel_name, dlg.selectedColor().name())
 
     def _start_name_edit(self) -> None:
-        new_name, ok = QInputDialog.getText(
-            self, "Rename channel", "Display name:", text=self._display_name
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("Rename channel")
+        dlg.setLabelText("Display name:")
+        dlg.setTextValue(self._display_name)
+        dlg.setStyleSheet(
+            "* { background-color: #f0f0f0; color: #1a1a1a; }"
+            "QPushButton { background-color: #e0e0e0; border: 1px solid #b0b0b0;"
+            " padding: 4px 10px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #d0d0d0; }"
+            "QLineEdit { background-color: #ffffff; border: 1px solid #b0b0b0; }"
         )
-        if ok and new_name.strip() and new_name.strip() != self._display_name:
-            if self._cb_name is not None:
-                self._cb_name(self.source_id, self.channel_name, new_name.strip())
+        if dlg.exec() == QInputDialog.DialogCode.Accepted:
+            new_name = dlg.textValue().strip()
+            if new_name and new_name != self._display_name and self._cb_name is not None:
+                self._cb_name(self.source_id, self.channel_name, new_name)
+
+    def set_line_style(self, style: str) -> None:
+        self._line_style = style
+
+    def set_line_width(self, width: float) -> None:
+        self._line_width = width
+
+    def set_y_axis_side(self, side: str) -> None:
+        self._y_axis_side = side
 
     def _context_menu(self, pos) -> None:
+        _MENU_SS = (
+            "QMenu { background-color: #f0f0f0; color: #1a1a1a; border: 1px solid #b0b0b0; }"
+            "QMenu::item:selected { background-color: #0078d4; color: #ffffff; }"
+            "QMenu::separator { background-color: #c0c0c0; height: 1px; margin: 2px 4px; }"
+        )
         menu = QMenu(self)
+        menu.setStyleSheet(_MENU_SS)
+
         hide_act = menu.addAction("Hide")
         menu.addSeparator()
         move_act = menu.addAction("Move to panel…")
+        menu.addSeparator()
+
+        # Line style submenu
+        style_menu = menu.addMenu("Line Style")
+        style_menu.setStyleSheet(_MENU_SS)
+        for label, key in (("Solid", "solid"), ("Dashed", "dashed"), ("Dotted", "dotted")):
+            act = style_menu.addAction(("✓ " if self._line_style == key else "   ") + label)
+            act.setData(("style", key))
+
+        # Line width submenu
+        width_menu = menu.addMenu("Line Width")
+        width_menu.setStyleSheet(_MENU_SS)
+        for label, val in (
+            ("Thin (0.5)", 0.5), ("Normal (1.0)", 1.0),
+            ("Medium (1.5)", 1.5), ("Thick (2.0)", 2.0), ("Extra Thick (3.0)", 3.0),
+        ):
+            act = width_menu.addAction(("✓ " if self._line_width == val else "   ") + label)
+            act.setData(("width", val))
+
+        # Y-axis submenu
+        yaxis_menu = menu.addMenu("Y-Axis")
+        yaxis_menu.setStyleSheet(_MENU_SS)
+        for label, side in (("Left", "left"), ("Right", "right")):
+            act = yaxis_menu.addAction(("✓ " if self._y_axis_side == side else "   ") + label)
+            act.setData(("yaxis", side))
+
         menu.addSeparator()
         reset_c = menu.addAction("Reset colour")
         reset_n = menu.addAction("Reset name")
 
         chosen = menu.exec(self.mapToGlobal(pos))
-        if chosen == hide_act and self._cb_hide:
+        if chosen is None:
+            return
+        data = chosen.data()
+        if data is not None and isinstance(data, tuple):
+            kind, value = data
+            if kind == "style" and self._cb_line_style:
+                self._line_style = value
+                self._cb_line_style(self.source_id, self.channel_name, value)
+            elif kind == "width" and self._cb_line_width:
+                self._line_width = value
+                self._cb_line_width(self.source_id, self.channel_name, value)
+            elif kind == "yaxis" and self._cb_y_axis:
+                self._y_axis_side = value
+                self._cb_y_axis(self.source_id, self.channel_name, value)
+        elif chosen == hide_act and self._cb_hide:
             self._cb_hide(self.source_id, self.channel_name)
         elif chosen == move_act and self._cb_move:
             self._cb_move(self.source_id, self.channel_name)
@@ -241,6 +321,9 @@ class ChannelLegendWidget(QWidget):
     display_name_changed = pyqtSignal(str, str, str)
     visibility_changed = pyqtSignal(str, str, bool)
     move_to_panel_requested = pyqtSignal(str, str)
+    line_style_changed = pyqtSignal(str, str, str)    # source_id, channel_name, style
+    line_width_changed = pyqtSignal(str, str, float)  # source_id, channel_name, width
+    y_axis_changed = pyqtSignal(str, str, str)        # source_id, channel_name, side
 
     def __init__(self, panel_id: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -358,6 +441,13 @@ class ChannelLegendWidget(QWidget):
         if row is not None:
             row.set_visible_state(visible)
 
+    def update_row_y_axis_side(
+        self, source_id: str, channel_name: str, side: str
+    ) -> None:
+        row = self._rows.get((source_id, channel_name))
+        if row is not None:
+            row.set_y_axis_side(side)
+
     @property
     def row_count(self) -> int:
         return len(self._rows)
@@ -391,6 +481,9 @@ class ChannelLegendWidget(QWidget):
         row._cb_move = self._on_row_move
         row._cb_reset_colour = self._on_row_reset_colour
         row._cb_reset_name = self._on_row_reset_name
+        row._cb_line_style = self._on_row_line_style
+        row._cb_line_width = self._on_row_line_width
+        row._cb_y_axis = self._on_row_y_axis
 
     def _on_row_colour(self, source_id: str, channel_name: str, colour: str) -> None:
         row = self._rows.get((source_id, channel_name))
@@ -419,3 +512,12 @@ class ChannelLegendWidget(QWidget):
     def _on_row_reset_name(self, source_id: str, channel_name: str) -> None:
         # Reset to channel_name (canonical) — emit with empty string as sentinel
         self.display_name_changed.emit(source_id, channel_name, channel_name)
+
+    def _on_row_line_style(self, source_id: str, channel_name: str, style: str) -> None:
+        self.line_style_changed.emit(source_id, channel_name, style)
+
+    def _on_row_line_width(self, source_id: str, channel_name: str, width: float) -> None:
+        self.line_width_changed.emit(source_id, channel_name, width)
+
+    def _on_row_y_axis(self, source_id: str, channel_name: str, side: str) -> None:
+        self.y_axis_changed.emit(source_id, channel_name, side)

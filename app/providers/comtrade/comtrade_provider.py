@@ -29,6 +29,8 @@ _DEFAULT_NOMINAL_FREQ = 50.0
 _DEFAULT_TIMEMULT = 1.0
 _MICROSECONDS_PER_SECOND = 1_000_000.0
 _VALID_REV_YRS = {"1991", "1999", "2013"}
+# Non-standard revision years written by some IEDs — mapped silently to nearest standard.
+_NONSTANDARD_REV_YR_MAP = {"2005": "1999"}
 _VALID_DAT_FORMATS = {"ASCII", "BINARY", "BINARY32"}
 
 
@@ -279,6 +281,8 @@ def _parse_cfg(cfg_path: Path) -> _CfgData:
     rev_yr_raw = parts1[2] if len(parts1) > 2 else ""
     if rev_yr_raw in _VALID_REV_YRS:
         rev_yr = rev_yr_raw
+    elif rev_yr_raw in _NONSTANDARD_REV_YR_MAP:
+        rev_yr = _NONSTANDARD_REV_YR_MAP[rev_yr_raw]
     else:
         if rev_yr_raw:
             warnings.warn(

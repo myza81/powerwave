@@ -54,8 +54,10 @@ class SessionChannel:
     display_name: str        # user override; defaults to channel_name
     color_hex: str | None    # user override hex colour; None = auto-assign
     line_style: str          # 'solid' | 'dashed' | 'dotted'
+    line_width: float        # pen width in pixels (0.5 / 1.0 / 1.5 / 2.0 / 3.0)
     is_visible: bool
     panel_id: str            # which PanelConfig this channel is assigned to
+    y_axis_side: str = "left"  # 'left' | 'right'
 
 
 @dataclass

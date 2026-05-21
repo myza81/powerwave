@@ -379,9 +379,21 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         if axis_reference_time is not None:
             self._axis_reference_time = axis_reference_time
         self._time_axis_mode = display_mode
-        self._datetime_axis.set_start_time(
+        self._apply_datetime_axis_mode(
             self._axis_reference_time if display_mode == TimeDisplayMode.ABSOLUTE else None
         )
+
+    def _apply_datetime_axis_mode(self, start_time: datetime | None) -> None:
+        """Call set_start_time on the live bottom-axis object from the PlotItem.
+
+        Retrieving the axis through getAxis() each time avoids using a stale
+        Python wrapper whose underlying C++ QGraphicsItem may have been deleted
+        by PyQt6's ownership transfer during PlotItem.clear() calls.
+        """
+        bottom = self._primary_plot.getAxis("bottom")
+        if isinstance(bottom, DatetimeAxisItem):
+            self._datetime_axis = bottom  # keep our reference in sync
+            bottom.set_start_time(start_time)
 
     def set_axis_display_mode(self, mode: AxisDisplayMode | str) -> None:
         """Switch between shared and dedicated Y-axis grouping."""
@@ -533,7 +545,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         # Restore primary plot appearance (clear() strips labels and grid)
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
         self._primary_plot.setLabel("bottom", "Time")
-        self._datetime_axis.set_start_time(None)
+        self._apply_datetime_axis_mode(None)
         self._refresh_panel_title()
 
         # Fresh axis manager — its __init__ connects _sync_geometries FIRST
@@ -649,7 +661,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._primary_plot.clear()
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
         self._primary_plot.setLabel("bottom", "Time")
-        self._datetime_axis.set_start_time(
+        self._apply_datetime_axis_mode(
             self._axis_reference_time
             if self._time_axis_mode == TimeDisplayMode.ABSOLUTE
             else None

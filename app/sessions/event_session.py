@@ -41,9 +41,58 @@ _CURRENT_KEYWORDS = {"ia", "ib", "ic", "in", "current", "amp"}
 _POWER_KEYWORDS = {"mw", "mvar", "power", "p_", "q_", "apparent", "active", "reactive"}
 _FREQ_KEYWORDS = {"freq", "hz", "rocof", "df"}
 
+# Unit-based heuristics — exact match after lower+strip (more authoritative than name keywords)
+_VOLTAGE_UNITS = {"v", "kv", "mv", "pu", "p.u.", "volt", "volts"}
+_CURRENT_UNITS = {"a", "ka", "ma", "amp", "amps"}
+_POWER_UNITS   = {"w", "kw", "mw", "gw", "var", "kvar", "mvar", "gvar", "va", "kva", "mva"}
+_FREQ_UNITS    = {"hz", "rad/s", "hz/s", "rad/s2", "rad/s²"}
 
-def _infer_panel_for_channel(channel_name: str) -> tuple[str, str]:
-    """Return (panel_id, panel_type) for a channel name using name heuristics."""
+# ParameterType.value → panel_id (most authoritative — explicit user/import classification)
+_TYPE_TO_PANEL: dict[str, str] = {
+    "voltage":   _PANEL_VOLTAGE,
+    "current":   _PANEL_CURRENT,
+    "mw":        _PANEL_POWER,
+    "mvar":      _PANEL_POWER,
+    "frequency": _PANEL_FREQUENCY,
+    "rocof":     _PANEL_FREQUENCY,
+}
+
+
+def _infer_panel_for_type(param_type: str | None) -> str | None:
+    """Return panel_id from ParameterType string value, or None if not mapped."""
+    if not param_type:
+        return None
+    return _TYPE_TO_PANEL.get(param_type.lower())
+
+
+def _infer_panel_for_unit(unit: str | None) -> str | None:
+    """Return panel_id from engineering unit, or None if not deterministic."""
+    if not unit:
+        return None
+    u = unit.lower().strip()
+    if u in _VOLTAGE_UNITS:
+        return _PANEL_VOLTAGE
+    if u in _CURRENT_UNITS:
+        return _PANEL_CURRENT
+    if u in _POWER_UNITS:
+        return _PANEL_POWER
+    if u in _FREQ_UNITS:
+        return _PANEL_FREQUENCY
+    return None
+
+
+def _infer_panel_for_channel(
+    channel_name: str,
+    unit: str | None = None,
+    param_type: str | None = None,
+) -> tuple[str, str]:
+    """Return (panel_id, panel_type) using type → unit → name-keyword priority."""
+    pid = _infer_panel_for_type(param_type)
+    if pid is not None:
+        return pid, "analog"
+    pid = _infer_panel_for_unit(unit)
+    if pid is not None:
+        return pid, "analog"
     lower = channel_name.lower()
     for kw in _VOLTAGE_KEYWORDS:
         if kw in lower:
@@ -263,12 +312,13 @@ class EventAnalysisSession:
                 time_is_uniform=False,
             )
         else:
+            time_arr = np.asarray(time_arr, dtype=np.float64)
             # Pick the first analog channel's values for NaN analysis
             values_arr = None
             for ch in record.analog_channels:
                 v = record.waveform_data.get(ch.name)
                 if v is not None:
-                    values_arr = v
+                    values_arr = np.asarray(v, dtype=np.float64)
                     break
             if values_arr is None:
                 values_arr = np.zeros(len(time_arr), dtype=np.float64)
@@ -289,7 +339,11 @@ class EventAnalysisSession:
     ) -> None:
         """Populate the channel registry from a newly added DisturbanceRecord."""
         for ch in record.analog_channels:
-            panel_id, _ = _infer_panel_for_channel(ch.name)
+            panel_id, _ = _infer_panel_for_channel(
+                ch.name,
+                getattr(ch, "unit", None),
+                getattr(ch, "parameter_type", None),
+            )
             key = (source_id, ch.name)
             self._channels[key] = SessionChannel(
                 source_id=source_id,
@@ -298,6 +352,7 @@ class EventAnalysisSession:
                 display_name=ch.name,
                 color_hex=None,
                 line_style="solid",
+                line_width=1.0,
                 is_visible=True,
                 panel_id=panel_id,
             )
@@ -311,6 +366,7 @@ class EventAnalysisSession:
                 display_name=ch.name,
                 color_hex=None,
                 line_style="solid",
+                line_width=1.0,
                 is_visible=True,
                 panel_id=_PANEL_DIGITAL,
             )
@@ -360,6 +416,27 @@ class EventAnalysisSession:
         ch = self._channels.get((source_id, channel_name))
         if ch is not None:
             ch.is_visible = visible
+
+    def set_channel_line_style(
+        self, source_id: str, channel_name: str, style: str
+    ) -> None:
+        ch = self._channels.get((source_id, channel_name))
+        if ch is not None:
+            ch.line_style = style
+
+    def set_channel_line_width(
+        self, source_id: str, channel_name: str, width: float
+    ) -> None:
+        ch = self._channels.get((source_id, channel_name))
+        if ch is not None:
+            ch.line_width = width
+
+    def set_channel_y_axis_side(
+        self, source_id: str, channel_name: str, side: str
+    ) -> None:
+        ch = self._channels.get((source_id, channel_name))
+        if ch is not None:
+            ch.y_axis_side = side
 
     def set_channel_panel(
         self, source_id: str, channel_name: str, panel_id: str
@@ -440,13 +517,25 @@ class EventAnalysisSession:
         """
         self._panels.clear()
 
+        # Build unit + type lookup from source records
+        unit_lookup: dict[tuple[str, str], str | None] = {}
+        type_lookup: dict[tuple[str, str], str | None] = {}
+        for src_id, source in self._sources.items():
+            for ach in source.record.analog_channels:
+                key = (src_id, ach.name)
+                unit_lookup[key] = getattr(ach, "unit", None)
+                type_lookup[key] = getattr(ach, "parameter_type", None)
+
         # Determine which canonical panels are needed
         needed_panels: dict[str, str] = {}  # panel_id → panel_type
         for ch in self._channels.values():
             if ch.channel_type == "digital":
                 needed_panels[_PANEL_DIGITAL] = "digital"
             else:
-                pid, ptype = _infer_panel_for_channel(ch.channel_name)
+                key = (ch.source_id, ch.channel_name)
+                pid, ptype = _infer_panel_for_channel(
+                    ch.channel_name, unit_lookup.get(key), type_lookup.get(key)
+                )
                 needed_panels[pid] = ptype
 
         # Create panels in a fixed order
@@ -469,7 +558,10 @@ class EventAnalysisSession:
             if ch.channel_type == "digital":
                 ch.panel_id = _PANEL_DIGITAL
             else:
-                pid, _ = _infer_panel_for_channel(ch.channel_name)
+                key = (ch.source_id, ch.channel_name)
+                pid, _ = _infer_panel_for_channel(
+                    ch.channel_name, unit_lookup.get(key), type_lookup.get(key)
+                )
                 ch.panel_id = pid
             panel = self._panels.get(ch.panel_id)
             if panel is not None:
@@ -530,6 +622,10 @@ class EventAnalysisSession:
                 unit=unit,
                 time_is_uniform=True,
             )
+
+        # Convert DataFrame columns (Series) → ndarray after the None guard
+        raw_time = np.asarray(raw_time, dtype=np.float64)
+        raw_values = np.asarray(raw_values, dtype=np.float64)
 
         # Assess uniformity on the raw (pre-offset) time array
         is_uniform, _ = alignment_engine.assess_time_uniformity(raw_time)

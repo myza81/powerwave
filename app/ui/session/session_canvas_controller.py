@@ -20,6 +20,8 @@ Colour strategy (Phase 9E)
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import numpy as np
 from PyQt6 import sip
 from PyQt6.QtCore import Qt
@@ -71,6 +73,26 @@ def _session_window(session) -> tuple[float, float]:
     span = t_max - t_min
     margin = max(span * 0.02, 0.001)
     return t_min - margin, t_max + margin
+
+
+_RIGHT_AXIS_TYPES = frozenset({"current", "mw", "mvar"})
+_RIGHT_AXIS_KEYWORDS = frozenset({"_i", "ia", "ib", "ic", "in_", "3i0", "current", "mw", "mvar", "kw", "kvar"})
+
+
+def _auto_y_axis_side(channel_name: str, ch) -> str:
+    """Return 'left' or 'right' for dedicated-axis auto-assignment.
+
+    Channels identified as current or power go to the right axis; voltage,
+    frequency, and other types stay on the left.  Matches the grouping logic
+    used by FlexiblePlotCanvas when AxisDisplayMode.DEDICATED is active.
+    """
+    param_type = getattr(ch, "parameter_type", None) or ""
+    if param_type in _RIGHT_AXIS_TYPES:
+        return "right"
+    name_lower = channel_name.lower()
+    if any(kw in name_lower for kw in _RIGHT_AXIS_KEYWORDS):
+        return "right"
+    return "left"
 
 
 class SessionCanvasController:
@@ -129,6 +151,7 @@ class SessionCanvasController:
         self._current_panel_ids = new_ids
         self._splitter = splitter
         self._update_mergeable_panels()
+        self._apply_time_reference(session)
         return splitter
 
     def active_canvases(self) -> list[SessionCanvasWidget]:
@@ -155,6 +178,7 @@ class SessionCanvasController:
                 sources_by_id, t_start, t_end,
             )
 
+        self._apply_time_reference(session)
         self._refresh_zero_lines(session)
 
     def refresh_panel(self, panel_id: str, session) -> None:
@@ -336,6 +360,58 @@ class SessionCanvasController:
         sync_manager.register_many(canvases, master_canvas=canvases[0])
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Time axis mode (mirrors FlexiblePlotCanvas.set_time_axis_mode)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_time_axis_mode(self, mode, session) -> None:
+        """Switch all session canvases between relative and absolute time labels.
+
+        Matches the View → Time Axis Mode menu that controls FlexiblePlotCanvas.
+        ABSOLUTE re-derives the session origin from loaded sources; RELATIVE
+        clears the reference so raw elapsed-second values are shown.
+        """
+        from app.visualization.axis.datetime_axis import TimeDisplayMode
+        m = TimeDisplayMode.coerce(mode)
+        if m == TimeDisplayMode.ABSOLUTE:
+            self._apply_time_reference(session)
+        else:
+            for canvas in self._canvases.values():
+                canvas.clear_time_reference()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Y-axis display mode (mirrors FlexiblePlotCanvas.set_axis_display_mode)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_axis_display_mode(self, mode, session) -> None:
+        """Apply Shared or Dedicated Y-axis assignment to all session channels.
+
+        SHARED — every channel is placed on the left (primary) axis, resetting
+                 any per-channel overrides.
+        DEDICATED — channels are auto-assigned left/right by signal type:
+                    voltage and frequency → left; current and power → right.
+                    Users can still override individual channels via the legend.
+
+        Mirrors the View → Axis Mode menu that controls FlexiblePlotCanvas.
+        """
+        from app.visualization.axis_management import AxisDisplayMode
+        m = AxisDisplayMode.coerce(mode)
+        all_channels = self._channel_lookup(session)
+
+        for (source_id, channel_name), ch in all_channels.items():
+            if m == AxisDisplayMode.SHARED:
+                side = "left"
+            else:
+                side = _auto_y_axis_side(channel_name, ch)
+
+            try:
+                session.set_channel_y_axis_side(source_id, channel_name, side)
+            except Exception:  # noqa: BLE001
+                pass
+            for canvas in self._canvases.values():
+                canvas.set_curve_y_axis(source_id, channel_name, side)
+                canvas.legend.update_row_y_axis_side(source_id, channel_name, side)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -408,6 +484,9 @@ class SessionCanvasController:
                     display_name=ch.display_name if ch else channel_name,
                     source_badge=badge,
                     unit=aligned.unit,
+                    line_style=ch.line_style if ch else "solid",
+                    line_width=ch.line_width if ch else 1.0,
+                    y_axis_side=ch.y_axis_side if ch else "left",
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -430,6 +509,37 @@ class SessionCanvasController:
                     source.time_offset_s,
                     color,
                 )
+
+    def _compute_session_reference_time(self, session) -> datetime | None:
+        """Return the wall-clock time that corresponds to session t=0.
+
+        For each active source: session_origin = start_time − time_offset_s.
+        All properly aligned sources converge to the same origin; we return the
+        earliest one so the axis is never in the future relative to any source.
+        """
+        origin: datetime | None = None
+        for source in session.list_sources():
+            if not source.is_active:
+                continue
+            try:
+                start = source.record.timing_info.start_time
+                if start is None:
+                    continue
+                candidate = start - timedelta(seconds=source.time_offset_s)
+                if origin is None or candidate < origin:
+                    origin = candidate
+            except Exception:  # noqa: BLE001
+                continue
+        return origin
+
+    def _apply_time_reference(self, session) -> None:
+        """Push the session wall-clock origin to all canvas axes."""
+        ref = self._compute_session_reference_time(session)
+        for canvas in self._canvases.values():
+            if ref is not None:
+                canvas.set_time_reference(ref)
+            else:
+                canvas.clear_time_reference()
 
     def _update_mergeable_panels(self) -> None:
         """After a rebuild, tell each canvas what other panels exist for the merge menu."""
@@ -454,6 +564,15 @@ class SessionCanvasController:
         )
         legend.visibility_changed.connect(
             lambda sid, cname, vis: self._handle_legend_visibility(sid, cname, vis)
+        )
+        legend.line_style_changed.connect(
+            lambda sid, cname, style: self._handle_legend_line_style(sid, cname, style)
+        )
+        legend.line_width_changed.connect(
+            lambda sid, cname, width: self._handle_legend_line_width(sid, cname, width)
+        )
+        legend.y_axis_changed.connect(
+            lambda sid, cname, side: self._handle_legend_y_axis(sid, cname, side)
         )
 
         canvas.merge_with_requested.connect(self._handle_merge_panels)
@@ -490,3 +609,31 @@ class SessionCanvasController:
             self._session_ref.set_channel_visibility(source_id, channel_name, visible)
         for canvas in self._canvases.values():
             canvas.set_curve_visible(source_id, channel_name, visible)
+
+    def _handle_legend_line_style(
+        self, source_id: str, channel_name: str, style: str
+    ) -> None:
+        if self._session_ref is not None:
+            self._session_ref.set_channel_line_style(source_id, channel_name, style)
+        for canvas in self._canvases.values():
+            meta = canvas._metadata.get((source_id, channel_name))
+            width = meta.line_width if meta else 1.0
+            canvas.update_curve_style(source_id, channel_name, style, width)
+
+    def _handle_legend_line_width(
+        self, source_id: str, channel_name: str, width: float
+    ) -> None:
+        if self._session_ref is not None:
+            self._session_ref.set_channel_line_width(source_id, channel_name, width)
+        for canvas in self._canvases.values():
+            meta = canvas._metadata.get((source_id, channel_name))
+            style = meta.line_style if meta else "solid"
+            canvas.update_curve_style(source_id, channel_name, style, width)
+
+    def _handle_legend_y_axis(
+        self, source_id: str, channel_name: str, side: str
+    ) -> None:
+        if self._session_ref is not None:
+            self._session_ref.set_channel_y_axis_side(source_id, channel_name, side)
+        for canvas in self._canvases.values():
+            canvas.set_curve_y_axis(source_id, channel_name, side)

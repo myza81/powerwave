@@ -20,6 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, Qt, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -219,6 +220,7 @@ class ImportWizardDialog(QDialog):
         self._settings_dirty_since_import = False
         self._normalized_export_saved = False
         self._closing = False
+        self._max_reached_idx: int = 0  # furthest step index the user has reached
 
         self.preview_model = PreviewTableModel(parent=self)
         self.timestamp_model = TimestampCandidateTableModel(parent=self)
@@ -258,8 +260,9 @@ class ImportWizardDialog(QDialog):
         self.step_list.setFixedWidth(180)
         for step in _PAGE_STEPS:
             item = QListWidgetItem(_STEP_LABELS[step])
-            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)  # selectable flag added as steps are reached
             self.step_list.addItem(item)
+        self.step_list.itemClicked.connect(self._on_step_list_clicked)
         body.addWidget(self.step_list)
 
         self.stack = QStackedWidget()
@@ -353,6 +356,7 @@ class ImportWizardDialog(QDialog):
         self._export_result = None
         self._settings_dirty_since_import = False
         self._normalized_export_saved = False
+        self._max_reached_idx = 0
         self.preview_model.set_preview(None)
         self.timestamp_model.set_candidates([])
         self.column_model.set_mappings([])
@@ -811,16 +815,39 @@ class ImportWizardDialog(QDialog):
         self._update_buttons()
         return plan_result
 
+    def _on_step_list_clicked(self, item: QListWidgetItem) -> None:
+        if self._import_running or self._export_running:
+            return
+        row = self.step_list.row(item)
+        if 0 <= row <= self._max_reached_idx:
+            self._set_step(_PAGE_STEPS[row])
+
+    def _update_step_list(self) -> None:
+        """Refresh nav item selectability and dim unreachable steps."""
+        for i in range(self.step_list.count()):
+            item = self.step_list.item(i)
+            if item is None:
+                continue
+            if i <= self._max_reached_idx:
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setData(Qt.ItemDataRole.ForegroundRole, None)  # restore default colour
+            else:
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                item.setForeground(QBrush(QColor("#666666")))
+
     def _set_step(self, step: WizardStep) -> None:
         if step not in _PAGE_STEPS:
             return
         idx = _PAGE_STEPS.index(step)
         self.stack.setCurrentIndex(idx)
         self.step_list.setCurrentRow(idx)
+        if idx > self._max_reached_idx:
+            self._max_reached_idx = idx
         if self._session is not None:
             self._session.current_step = step
         self._refresh_pages()
         self._update_buttons()
+        self._update_step_list()
 
     def _refresh_pages(self) -> None:
         self.preview_page.refresh(self._session)

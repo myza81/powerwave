@@ -25,7 +25,7 @@ from app.import_wizard.export_writer import ExportWriteResult
 from app.import_wizard.import_pipeline import ImportPipelineResult
 from app.import_wizard.models import ImportWizardSession
 from app.import_wizard.normalization_plan import NormalizationPlan
-from app.ui.import_wizard.column_mapping_model import ColumnMappingTableModel
+from app.ui.import_wizard.column_mapping_model import ColumnMappingTableModel, ParameterTypeDelegate
 from app.ui.import_wizard.diagnostics_panel import DiagnosticsPanel
 from app.ui.import_wizard.preview_table_model import PreviewTableModel
 from app.ui.import_wizard.timestamp_candidate_model import TimestampCandidateTableModel
@@ -191,6 +191,7 @@ class ColumnMappingPage(QWidget):
         self.table.setModel(model)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.table.setItemDelegateForColumn(3, ParameterTypeDelegate(self.table))
         layout.addWidget(self.table, 1)
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)

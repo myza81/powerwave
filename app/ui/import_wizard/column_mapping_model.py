@@ -4,9 +4,30 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PyQt6.QtWidgets import QComboBox, QStyledItemDelegate, QStyleOptionViewItem
 
 from app.import_wizard.column_mapping import ParameterType
 from app.import_wizard.models import ColumnMappingCandidate
+
+_TYPE_VALUES = [pt.value for pt in ParameterType if pt != ParameterType.TIMESTAMP]
+
+
+class ParameterTypeDelegate(QStyledItemDelegate):
+    """Combobox delegate for the Type column in column mapping."""
+
+    def createEditor(self, parent, option: QStyleOptionViewItem, index: QModelIndex):  # noqa: N802
+        cb = QComboBox(parent)
+        cb.addItems(_TYPE_VALUES)
+        return cb
+
+    def setEditorData(self, editor: QComboBox, index: QModelIndex) -> None:  # noqa: N802
+        value = index.data(Qt.ItemDataRole.EditRole) or ""
+        idx = editor.findText(value)
+        if idx >= 0:
+            editor.setCurrentIndex(idx)
+
+    def setModelData(self, editor: QComboBox, model, index: QModelIndex) -> None:  # noqa: N802
+        model.setData(index, editor.currentText(), Qt.ItemDataRole.EditRole)
 
 
 class ColumnMappingTableModel(QAbstractTableModel):
