@@ -1,9 +1,19 @@
-"""SessionCanvasWidget — per-panel multi-source waveform view for Phase 9D/9E.
+"""SessionCanvasWidget — per-panel multi-source waveform view (Phase 9D/9E + S1).
 
 Architecture
 ------------
-Wraps a single pg.PlotWidget.  All channels assigned to one session panel
-share this widget; different sources are distinguished by colour.
+Wraps a ``pg.GraphicsLayoutWidget`` (GLW).  All channels assigned to one session
+panel share this widget; different sources are distinguished by colour.
+
+S1 additions
+------------
+- **N independent Y-axes** via ``_RightAxisManager``: each unit group that is
+  assigned to the right side gets its own independent ViewBox + AxisItem inside
+  the GLW layout.  Voltage (left) and current / frequency / power (right) can
+  therefore auto-scale independently — no more 110 kV overlapping 50 Hz.
+- **Trigger markers** (``set_trigger_marker`` / ``remove_trigger_marker``):
+  a per-source vertical DashDot InfiniteLine at the source's trigger time,
+  colour-matched to the source, labelled with the source display name.
 
 A ChannelLegendWidget sits below the plot and reflects the current set of
 curves, their colours, display names, and visibility (Phase 9E).
@@ -32,7 +42,7 @@ from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal  # pyqtSignal used by SessionCanvasWidget
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -73,6 +83,87 @@ class _PanelHeader(QWidget):
 
     def set_title(self, title: str) -> None:
         self._lbl.setText(title)
+
+
+# ---------------------------------------------------------------------------
+# Right-axis group manager (S1)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class _RightAxisEntry:
+    norm_unit: str
+    viewbox: pg.ViewBox
+    axis_item: pg.AxisItem
+
+
+class _RightAxisManager:
+    """Independent right-side ViewBox per unit group.
+
+    The first distinct unit passed to ``get_or_create()`` gets column 1 in the
+    parent GLW layout; subsequent units get columns 2, 3, … Each ViewBox is
+    added to the plot scene and kept geometry-synced with the primary ViewBox
+    via ``sigResized``.
+    """
+
+    def __init__(self, primary_plot: pg.PlotItem, glw: pg.GraphicsLayoutWidget) -> None:
+        self._primary = primary_plot
+        self._glw = glw
+        self._entries: dict[str, _RightAxisEntry] = {}
+        self._next_col: int = 1
+        self._primary.getViewBox().sigResized.connect(self._sync)
+
+    def get_or_create(self, norm_unit: str, label: str, color: str) -> pg.ViewBox:
+        """Return the ViewBox for this unit group, creating it if needed."""
+        if norm_unit in self._entries:
+            return self._entries[norm_unit].viewbox
+
+        vb = pg.ViewBox()
+        vb.setXLink(self._primary)
+        scene = self._primary.scene()
+        if scene is not None:
+            scene.addItem(vb)
+
+        ax = pg.AxisItem("right")
+        ax.enableAutoSIPrefix(False)
+        ax.setLabel(label)
+        ax.setPen(pg.mkPen(color))
+        ax.setTextPen(pg.mkPen(color))
+        ax.linkToView(vb)
+
+        self._glw.addItem(ax, row=0, col=self._next_col)
+        self._next_col += 1
+
+        # Align new ViewBox with the primary before the first resize
+        primary_rect = self._primary.getViewBox().sceneBoundingRect()
+        vb.setGeometry(primary_rect)
+        vb.linkedViewChanged(self._primary.getViewBox(), vb.XAxis)
+
+        self._entries[norm_unit] = _RightAxisEntry(norm_unit, vb, ax)
+        return vb
+
+    def get(self, norm_unit: str) -> pg.ViewBox | None:
+        e = self._entries.get(norm_unit)
+        return e.viewbox if e else None
+
+    def clear(self) -> None:
+        """Remove all secondary ViewBoxes and axes from the scene / layout."""
+        for entry in self._entries.values():
+            if entry.viewbox.scene() is not None:
+                entry.viewbox.scene().removeItem(entry.viewbox)
+            try:
+                self._glw.removeItem(entry.axis_item)
+            except Exception:  # noqa: BLE001
+                pass
+        self._entries.clear()
+        self._next_col = 1
+
+    def _sync(self) -> None:
+        primary_vb = self._primary.getViewBox()
+        rect = primary_vb.sceneBoundingRect()
+        for entry in self._entries.values():
+            entry.viewbox.setGeometry(rect)
+            entry.viewbox.linkedViewChanged(primary_vb, entry.viewbox.XAxis)
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +220,11 @@ class SessionCanvasWidget(QWidget):
         super().__init__(parent)
         self.panel_id = panel_id
         self._panel_title = title
-        self._mergeable_panels: list[tuple[str, str]] = []   # (panel_id, title)
+        self._mergeable_panels: list[tuple[str, str]] = []
 
         self._curves: dict[tuple[str, str], pg.PlotDataItem] = {}
         self._zero_lines: dict[str, pg.InfiniteLine] = {}
+        self._trigger_markers: dict[str, pg.InfiniteLine] = {}  # S1
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
 
         self._build_ui()
@@ -151,28 +243,23 @@ class SessionCanvasWidget(QWidget):
         self._header.customContextMenuRequested.connect(self._show_panel_menu)
         layout.addWidget(self._header)
 
+        # Main plot area: GraphicsLayoutWidget hosts PlotItem at col=0;
+        # _RightAxisManager adds secondary AxisItems at col=1, 2, …
         self._datetime_axis = DatetimeAxisItem(orientation="bottom")
-        self._plot_widget = pg.PlotWidget(
-            background="#1E1E1E",
-            axisItems={"bottom": self._datetime_axis},
+        self._glw = pg.GraphicsLayoutWidget(background="#1E1E1E")
+        self._primary_plot: pg.PlotItem = self._glw.addPlot(
+            row=0, col=0, axisItems={"bottom": self._datetime_axis}
         )
-        self._primary_plot: pg.PlotItem = self._plot_widget.getPlotItem()
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
         self._primary_plot.setLabel("bottom", "Time")
 
-        # Right-side secondary Y-axis (hidden until first right-axis curve is added)
-        self._right_vb = pg.ViewBox()
-        self._primary_plot.scene().addItem(self._right_vb)
-        self._primary_plot.showAxis("right")
-        self._primary_plot.getAxis("right").linkToView(self._right_vb)
-        self._right_vb.setXLink(self._primary_plot.vb)
-        self._primary_plot.getAxis("right").setStyle(showValues=False)
-        self._primary_plot.vb.sigResized.connect(self._sync_right_vb)
+        # N-axis manager for independent right-side Y-axes (S1)
+        self._right_mgr = _RightAxisManager(self._primary_plot, self._glw)
 
         # Legend below the plot (Phase 9E)
         self.legend = ChannelLegendWidget(self.panel_id, parent=self)
 
-        layout.addWidget(self._plot_widget, stretch=4)
+        layout.addWidget(self._glw, stretch=4)
         layout.addWidget(self.legend, stretch=0)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -219,20 +306,19 @@ class SessionCanvasWidget(QWidget):
     def normalize_viewport(self, t_start: float, t_end: float) -> None:
         self._primary_plot.setXRange(t_start, t_end, padding=0)
 
-    def _sync_right_vb(self) -> None:
-        self._right_vb.setGeometry(self._primary_plot.vb.sceneBoundingRect())
-        self._right_vb.linkedViewChanged(self._primary_plot.vb, self._right_vb.XAxis)
-
-    def _right_axis_visible(self) -> bool:
-        return any(m.y_axis_side == "right" for m in self._metadata.values())
-
-    def _refresh_right_axis(self) -> None:
-        visible = self._right_axis_visible()
-        self._primary_plot.getAxis("right").setStyle(showValues=visible)
-        if visible:
-            self._sync_right_vb()
-
     def getViewBox(self) -> pg.ViewBox:
+        return self._primary_plot.getViewBox()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ViewBox resolution helpers (S1)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _resolve_viewbox(self, y_axis_side: str, unit: str | None, color: str) -> pg.ViewBox:
+        """Return the ViewBox for a curve given its axis side and unit."""
+        if y_axis_side == "right":
+            norm_unit = (unit or "other").lower().strip() or "other"
+            label = unit or "Level"
+            return self._right_mgr.get_or_create(norm_unit, label, color)
         return self._primary_plot.getViewBox()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -257,24 +343,26 @@ class SessionCanvasWidget(QWidget):
     ) -> None:
         key = (source_id, channel_name)
         pen = pg.mkPen(color, width=line_width, style=_STYLE_MAP.get(line_style, Qt.PenStyle.SolidLine))
+
+        target_vb = self._resolve_viewbox(y_axis_side, unit, color)
         existing_meta = self._metadata.get(key)
-        existing_side = existing_meta.y_axis_side if existing_meta else "left"
 
         if key not in self._curves:
             curve = pg.PlotDataItem(pen=pen, skipFiniteCheck=True)
             curve.setClipToView(True)
             curve.setDownsampling(auto=True, method="peak")
-            vb = self._right_vb if y_axis_side == "right" else self._primary_plot.vb
-            vb.addItem(curve)
+            target_vb.addItem(curve)
             self._curves[key] = curve
         else:
             self._curves[key].setPen(pen)
-            # Migrate ViewBox if axis side changed
-            if existing_side != y_axis_side:
-                old_vb = self._right_vb if existing_side == "right" else self._primary_plot.vb
-                new_vb = self._right_vb if y_axis_side == "right" else self._primary_plot.vb
-                old_vb.removeItem(self._curves[key])
-                new_vb.addItem(self._curves[key])
+            # Migrate ViewBox if axis side or unit changed
+            if existing_meta is not None:
+                old_vb = self._resolve_viewbox(
+                    existing_meta.y_axis_side, existing_meta.unit, existing_meta.colour
+                )
+                if old_vb is not target_vb:
+                    old_vb.removeItem(self._curves[key])
+                    target_vb.addItem(self._curves[key])
 
         curve = self._curves[key]
         if len(time) > 0 and len(values) > 0:
@@ -296,7 +384,6 @@ class SessionCanvasWidget(QWidget):
             line_width=line_width,
             y_axis_side=y_axis_side,
         )
-        self._refresh_right_axis()
         self.legend.upsert_row(
             source_id, channel_name, eff_display, source_badge, unit, color, visible
         )
@@ -330,18 +417,18 @@ class SessionCanvasWidget(QWidget):
             meta.line_width = line_width
 
     def set_curve_y_axis(self, source_id: str, channel_name: str, side: str) -> None:
-        """Move a curve between left and right Y-axes, O(1)."""
+        """Move a curve between left and right Y-axes."""
         key = (source_id, channel_name)
         meta = self._metadata.get(key)
         curve = self._curves.get(key)
         if meta is None or curve is None or meta.y_axis_side == side:
             return
-        old_vb = self._right_vb if meta.y_axis_side == "right" else self._primary_plot.vb
-        new_vb = self._right_vb if side == "right" else self._primary_plot.vb
-        old_vb.removeItem(curve)
-        new_vb.addItem(curve)
+        old_vb = self._resolve_viewbox(meta.y_axis_side, meta.unit, meta.colour)
+        new_vb = self._resolve_viewbox(side, meta.unit, meta.colour)
+        if old_vb is not new_vb:
+            old_vb.removeItem(curve)
+            new_vb.addItem(curve)
         meta.y_axis_side = side
-        self._refresh_right_axis()
 
     def set_curve_visible(
         self, source_id: str, channel_name: str, visible: bool
@@ -360,15 +447,18 @@ class SessionCanvasWidget(QWidget):
         for key in stale:
             meta = self._metadata.pop(key, None)
             curve = self._curves.pop(key)
-            vb = self._right_vb if (meta and meta.y_axis_side == "right") else self._primary_plot.vb
+            vb = self._resolve_viewbox(
+                meta.y_axis_side if meta else "left",
+                meta.unit if meta else None,
+                meta.colour if meta else "#AAAAAA",
+            )
             vb.removeItem(curve)
-        if stale:
-            self._refresh_right_axis()
         self.legend.remove_source_rows(source_id)
         self.remove_zero_line(source_id)
+        self.remove_trigger_marker(source_id)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Zero-line markers
+    # Zero-line markers (source time-offset indicators)
     # ─────────────────────────────────────────────────────────────────────────
 
     def update_zero_line(
@@ -398,6 +488,38 @@ class SessionCanvasWidget(QWidget):
             self._primary_plot.removeItem(line)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Trigger markers (S1 — per-source vertical line at trigger time)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_trigger_marker(
+        self,
+        source_id: str,
+        t_s: float,
+        color: str,
+        label: str = "",
+    ) -> None:
+        """Add or replace the trigger marker for a source."""
+        self.remove_trigger_marker(source_id)
+        pen = pg.mkPen(color, width=1, style=Qt.PenStyle.DashDotLine)
+        lbl = label or "▲"
+        line = pg.InfiniteLine(
+            pos=t_s,
+            angle=90,
+            movable=False,
+            pen=pen,
+            label=lbl,
+            labelOpts={"position": 0.95, "color": color, "fill": (0, 0, 0, 80)},
+        )
+        self._primary_plot.addItem(line)
+        self._trigger_markers[source_id] = line
+
+    def remove_trigger_marker(self, source_id: str) -> None:
+        """Remove the trigger marker for a source if present."""
+        line = self._trigger_markers.pop(source_id, None)
+        if line is not None:
+            self._primary_plot.removeItem(line)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Panel metadata & housekeeping
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -423,13 +545,23 @@ class SessionCanvasWidget(QWidget):
         self.legend.setVisible(visible)
 
     def clear_all(self) -> None:
-        for curve in self._curves.values():
-            self._primary_plot.removeItem(curve)
+        for key, curve in list(self._curves.items()):
+            meta = self._metadata.get(key)
+            vb = self._resolve_viewbox(
+                meta.y_axis_side if meta else "left",
+                meta.unit if meta else None,
+                meta.colour if meta else "#AAAAAA",
+            )
+            vb.removeItem(curve)
         for line in self._zero_lines.values():
+            self._primary_plot.removeItem(line)
+        for line in self._trigger_markers.values():
             self._primary_plot.removeItem(line)
         self._curves.clear()
         self._zero_lines.clear()
+        self._trigger_markers.clear()
         self._metadata.clear()
+        self._right_mgr.clear()
         self.legend.clear_rows()
 
     @property
@@ -439,3 +571,7 @@ class SessionCanvasWidget(QWidget):
     @property
     def zero_line_count(self) -> int:
         return len(self._zero_lines)
+
+    @property
+    def trigger_marker_count(self) -> int:
+        return len(self._trigger_markers)

@@ -75,22 +75,25 @@ def _session_window(session) -> tuple[float, float]:
     return t_min - margin, t_max + margin
 
 
-_RIGHT_AXIS_TYPES = frozenset({"current", "mw", "mvar"})
+_RIGHT_AXIS_TYPES = frozenset({"current", "mw", "mvar", "frequency"})
 _RIGHT_AXIS_KEYWORDS = frozenset({"_i", "ia", "ib", "ic", "in_", "3i0", "current", "mw", "mvar", "kw", "kvar"})
+_FREQ_KEYWORDS = frozenset({"freq", "hz", "rocof", "df_dt"})
 
 
 def _auto_y_axis_side(channel_name: str, ch) -> str:
     """Return 'left' or 'right' for dedicated-axis auto-assignment.
 
-    Channels identified as current or power go to the right axis; voltage,
-    frequency, and other types stay on the left.  Matches the grouping logic
-    used by FlexiblePlotCanvas when AxisDisplayMode.DEDICATED is active.
+    Channels identified as current, power, or frequency go to the right axis
+    (each unit group gets its own independent ViewBox via _RightAxisManager).
+    Voltage and other types stay on the left primary axis.
     """
     param_type = getattr(ch, "parameter_type", None) or ""
     if param_type in _RIGHT_AXIS_TYPES:
         return "right"
     name_lower = channel_name.lower()
     if any(kw in name_lower for kw in _RIGHT_AXIS_KEYWORDS):
+        return "right"
+    if any(kw in name_lower for kw in _FREQ_KEYWORDS):
         return "right"
     return "left"
 
@@ -152,6 +155,8 @@ class SessionCanvasController:
         self._splitter = splitter
         self._update_mergeable_panels()
         self._apply_time_reference(session)
+        self._refresh_zero_lines(session)
+        self._refresh_trigger_markers(session)
         return splitter
 
     def active_canvases(self) -> list[SessionCanvasWidget]:
@@ -180,6 +185,7 @@ class SessionCanvasController:
 
         self._apply_time_reference(session)
         self._refresh_zero_lines(session)
+        self._refresh_trigger_markers(session)
 
     def refresh_panel(self, panel_id: str, session) -> None:
         self._session_ref = session
@@ -235,6 +241,7 @@ class SessionCanvasController:
                     pass
 
         self._refresh_zero_lines(session)
+        self._refresh_trigger_markers(session)
 
     def on_channel_visibility_changed(
         self,
@@ -509,6 +516,43 @@ class SessionCanvasController:
                     source.time_offset_s,
                     color,
                 )
+
+    def _source_trigger_t(self, source) -> float | None:
+        """Return the trigger time in session-relative seconds for a source.
+
+        Computes (trigger_time − start_time) from the record timing info, then
+        adds the source's current time offset so the marker stays aligned after
+        auto-alignment adjustments.  Returns None when timing info is absent.
+        """
+        try:
+            timing = source.record.timing_info
+            if timing.trigger_time is None or timing.start_time is None:
+                return None
+            trigger_offset = (timing.trigger_time - timing.start_time).total_seconds()
+            return trigger_offset + source.time_offset_s
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _refresh_trigger_markers(self, session) -> None:
+        """Add/update per-source trigger markers on all active canvases (S1)."""
+        sources_by_id = {s.source_id: s for s in session.list_sources()}
+        for canvas in self._canvases.values():
+            # Remove markers for deactivated or removed sources
+            for sid in list(canvas._trigger_markers.keys()):
+                source = sources_by_id.get(sid)
+                if source is None or not source.is_active:
+                    canvas.remove_trigger_marker(sid)
+
+            # Add/refresh markers for active sources
+            for source in sources_by_id.values():
+                if not source.is_active:
+                    continue
+                t_trigger = self._source_trigger_t(source)
+                if t_trigger is None:
+                    continue
+                color = self._source_color(source.source_id)
+                label = f"{source.display_name} ▲"
+                canvas.set_trigger_marker(source.source_id, t_trigger, color, label)
 
     def _compute_session_reference_time(self, session) -> datetime | None:
         """Return the wall-clock time that corresponds to session t=0.
