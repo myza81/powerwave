@@ -277,18 +277,28 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-### Phase 8 — Contextual Analytics Suggestions 🔴
+### Phase 8 — Contextual Analytics Suggestions ✅ [COMPLETE — commit d1bf093]
 
 **Goal:** Based on what the app detects, suggest relevant analytics actions.
 
 **Examples:**
-- Voltage dip detected → "Run RMS analysis? [Yes]"
-- High THD detected → "Open Harmonic Spectrum view? [Yes]"
-- Multiple sources with close trigger times → "Auto-align sources? [Yes]"
+- Voltage dip detected → "Fault/dip detected — view RMS envelope? [Enable]"
+- Fault characterised → "A-g fault — view symmetrical components? [Open]"
+- High clearing time detected → "Clearing time 85.3 ms detected — view protection timing? [Open]"
+- Multi-source correlation → "2 source pair(s) likely same event — view correlation? [Open]"
+- Data quality errors → "Data quality errors found — review quality report? [Open]"
+
+**Architecture:**
+- `suggestion_engine.py` — pure `SuggestionContext` + `generate_suggestions()` returning prioritised `Suggestion` objects
+- `suggestion_bar.py` — `SuggestionBar` QWidget, 44px scrollable chip strip; chips colour-coded by priority (amber=critical, blue=informational, grey=low); each chip has icon + text + [Act] + [×] dismiss
+- MainWindow: top-area dock with hidden title bar; maps action_ids to analytics toggles; collapses when all chips dismissed
 
 **Progress:**
-- [ ] Suggestion engine
-- [ ] Non-intrusive notification bar
+- [x] `Suggestion` dataclass + `SuggestionContext` + `generate_suggestions()` in `app/analytics/suggestions/suggestion_engine.py`
+- [x] Triggers: voltage dip→RMS, swell→RMS, freq→frequency, fault→phasors+fault panel, protection→timing panel, quality issues→quality panel, multi-source correlation→align
+- [x] `SuggestionBar` chip strip widget with dismiss + action signals
+- [x] MainWindow top-area dock, hidden title bar, `_build_suggestion_action_map()`
+- [x] Analytics pipeline caches events/fault/protection/correlation; `_run_suggestions()` fires after `_run_quality_check()` and after cross-correlation completes
 
 ---
 
