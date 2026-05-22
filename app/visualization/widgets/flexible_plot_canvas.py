@@ -196,6 +196,8 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
 
     cursor_moved = pyqtSignal(float)
     measurement_cursors_moved = pyqtSignal(float, float)  # t_a, t_b
+    # Emitted every cursor move: (t_seconds, [(name, value_or_None, unit, color), …])
+    cursor_values_changed = pyqtSignal(float, list)
 
     def __init__(
         self,
@@ -1190,9 +1192,51 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._primary_plot.addItem(self._cursor)
 
     def _on_cursor_moved(self, line: pg.InfiniteLine) -> None:
-        self.cursor_moved.emit(line.value())
+        t = float(line.value())
+        self.cursor_moved.emit(t)
         if self._measurement_mode:
             self._emit_measurement()
+        values = self._compute_cursor_values(t)
+        if values:
+            self.cursor_values_changed.emit(t, values)
+
+    def _compute_cursor_values(
+        self, t: float
+    ) -> list[tuple[str, float | None, str, str]]:
+        """Return interpolated channel values at time t.
+
+        Returns a list of (channel_name, value_or_None, unit, hex_color) for
+        every currently visible channel. Uses linear interpolation between the
+        two samples bracketing t.
+        """
+        if len(self._time_cache) < 2:
+            return []
+        idx = int(np.searchsorted(self._time_cache, t, side="left"))
+        results: list[tuple[str, float | None, str, str]] = []
+        for name, entry in self._axis_manager._axes.items():
+            data = self._get_display_data(name)
+            if data is None or len(data) < 1:
+                continue
+            if idx <= 0:
+                raw = data[0]
+                val = float(raw) if np.isfinite(raw) else None
+            elif idx >= len(data):
+                raw = data[-1]
+                val = float(raw) if np.isfinite(raw) else None
+            else:
+                t0 = float(self._time_cache[idx - 1])
+                t1 = float(self._time_cache[idx])
+                y0, y1 = float(data[idx - 1]), float(data[idx])
+                if np.isfinite(y0) and np.isfinite(y1) and abs(t1 - t0) > 1e-15:
+                    frac = (t - t0) / (t1 - t0)
+                    val = y0 + frac * (y1 - y0)
+                elif np.isfinite(y0):
+                    val = y0
+                else:
+                    val = None
+            unit = self._effective_units.get(name, "") or ""
+            results.append((name, val, unit, entry.color))
+        return results
 
     # ─────────────────────────────────────────────────────────────────────────
     # Engineering scaling (Phase 5B)

@@ -53,6 +53,7 @@ from app.ui.session import SessionCanvasController, SessionPanel
 from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
 from app.ui.widgets.measurement_panel import MeasurementPanel
 from app.ui.widgets.event_list_panel import EventListPanel
+from app.ui.widgets.cursor_readout_bar import CursorReadoutBar
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -384,6 +385,9 @@ class PowerwaveMainWindow(QMainWindow):
         # Event list panel (Phase 2 Enhancement)
         self._event_dock = self._build_event_dock()
 
+        # Cursor readout bar (Phase 3 Enhancement)
+        self._cursor_readout_dock = self._build_cursor_readout_dock()
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
@@ -391,7 +395,10 @@ class PowerwaveMainWindow(QMainWindow):
         self._measurement_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._event_dock)
         self._event_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._cursor_readout_dock)
+        self._cursor_readout_dock.hide()
         self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
+        self._canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
         self._build_menu()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -728,6 +735,34 @@ class PowerwaveMainWindow(QMainWindow):
             self._canvas._primary_plot.setXRange(t_lo, t_hi, padding=0)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Cursor readout dock (Phase 3 Enhancement)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_cursor_readout_dock(self):
+        from PyQt6.QtWidgets import QDockWidget
+        dock = QDockWidget("Cursor Readout", self)
+        dock.setObjectName("CursorReadoutDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea
+        )
+        self._cursor_readout_widget = CursorReadoutBar()
+        dock.setWidget(self._cursor_readout_widget)
+        dock.setMaximumHeight(60)
+        return dock
+
+    def _on_cursor_values_changed(self, t: float, values: list) -> None:
+        self._cursor_readout_widget.update_values(t, values)
+
+    def _connect_canvas_readout(self, canvas) -> None:
+        """Connect cursor_values_changed from a grouped-layout panel canvas."""
+        if hasattr(canvas, "cursor_values_changed"):
+            canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
+
+    def _show_cursor_readout(self) -> None:
+        """Make the cursor readout dock visible (called after a record loads)."""
+        self._cursor_readout_dock.show()
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Menu
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -848,6 +883,7 @@ class PowerwaveMainWindow(QMainWindow):
         self._measurement_mode_action.toggled.connect(self._on_toggle_measurement_mode)
         view_menu.addAction(self._measurement_dock.toggleViewAction())
         view_menu.addAction(self._event_dock.toggleViewAction())
+        view_menu.addAction(self._cursor_readout_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
@@ -1102,6 +1138,7 @@ class PowerwaveMainWindow(QMainWindow):
                 QTimer.singleShot(0, self._link_standard_x_axis)
                 self._refresh_signal_browser()
                 QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
+                self._show_cursor_readout()
                 self.statusBar().showMessage(_format_load_status(record))
                 title = (
                     record.metadata.station_name
@@ -1126,6 +1163,7 @@ class PowerwaveMainWindow(QMainWindow):
             QTimer.singleShot(0, self._link_standard_x_axis)
             self._refresh_signal_browser()
             QTimer.singleShot(0, lambda r=result: self._run_event_detection(r))
+            self._show_cursor_readout()
             self.statusBar().showMessage(_format_load_status(result))
             title = result.metadata.station_name or Path(result.metadata.source_file).name
             self.setWindowTitle(f"Powerwave — {title}")
@@ -1276,6 +1314,9 @@ class PowerwaveMainWindow(QMainWindow):
             QTimer.singleShot(0, self._apply_harmonic_display_mode)
 
         QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
+        self._show_cursor_readout()
+        for canvas in panel_canvases.values():
+            self._connect_canvas_readout(canvas)
         self.statusBar().showMessage(_format_load_status(record))
         self.setWindowTitle(f"Powerwave — {source_id}")
 
