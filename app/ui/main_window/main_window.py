@@ -1976,6 +1976,16 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _rebuild_rms_overlays_for_config_change(self) -> None:
         """Clear and rebuild per-canvas RMS curves for the selected window."""
+        if (
+            self._session_canvas_active
+            and self._session_canvas_controller is not None
+            and self._active_session is not None
+        ):
+            self._session_canvas_controller.set_rms_mode(
+                self._rms_display_mode, self._active_session, config=self._rms_config
+            )
+            return
+
         canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
         for canvas in canvases:
             if not self._qt_widget_alive(canvas):
@@ -1989,6 +1999,16 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _apply_rms_mode_to_all_canvases(self) -> None:
         """Push the current RMS mode to every visible canvas."""
+        if (
+            self._session_canvas_active
+            and self._session_canvas_controller is not None
+            and self._active_session is not None
+        ):
+            self._session_canvas_controller.set_rms_mode(
+                self._rms_display_mode, self._active_session, config=self._rms_config
+            )
+            return
+
         canvases = []
         if self._panel_canvases:
             canvases.extend(self._panel_canvases.values())

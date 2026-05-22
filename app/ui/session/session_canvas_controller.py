@@ -27,6 +27,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QSplitter, QWidget
 
+from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode
 from app.visualization.widgets.session_canvas import SessionCanvasWidget
 from app.ui.session.legend_widget import generate_source_variant_colour
 
@@ -109,6 +110,8 @@ class SessionCanvasController:
         self._splitter: QSplitter | None = None
         self._session_ref: object = None
         self._legend_visible: bool = True
+        self._rms_mode: RMSDisplayMode = RMSDisplayMode.OFF  # S2
+        self._rms_config: RMSConfig = RMSConfig()            # S2
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
@@ -242,6 +245,8 @@ class SessionCanvasController:
 
         self._refresh_zero_lines(session)
         self._refresh_trigger_markers(session)
+        if self._rms_mode != RMSDisplayMode.OFF:
+            self._refresh_rms_overlays(session)
 
     def on_channel_visibility_changed(
         self,
@@ -498,6 +503,10 @@ class SessionCanvasController:
             except Exception:  # noqa: BLE001
                 pass
 
+        # S2: compute RMS overlays for this panel after all raw curves are updated
+        if self._rms_mode != RMSDisplayMode.OFF:
+            self._compute_rms_for_panel(canvas, panel, session, all_channels, sources_by_id, t_start, t_end)
+
     def _refresh_zero_lines(self, session) -> None:
         sources_by_id = {s.source_id: s for s in session.list_sources()}
         for canvas in self._canvases.values():
@@ -553,6 +562,110 @@ class SessionCanvasController:
                 color = self._source_color(source.source_id)
                 label = f"{source.display_name} ▲"
                 canvas.set_trigger_marker(source.source_id, t_trigger, color, label)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RMS overlay (S2)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_rms_mode(
+        self,
+        mode: RMSDisplayMode,
+        session,
+        *,
+        config: RMSConfig | None = None,
+    ) -> None:
+        """Enable or disable RMS overlay on all session canvas panels.
+
+        OFF     — raw waveforms only; all RMS curves removed.
+        OVERLAY — raw waveform + dashed RMS envelope.
+        RMS_ONLY — RMS envelope only; raw waveform hidden for eligible channels.
+        """
+        self._rms_mode = mode
+        if config is not None:
+            self._rms_config = config
+
+        if mode == RMSDisplayMode.OFF:
+            for canvas in self._canvases.values():
+                canvas.clear_rms_curves()
+            return
+
+        self._refresh_rms_overlays(session)
+
+    def _refresh_rms_overlays(self, session) -> None:
+        """Recompute RMS overlays for all panels using the current mode/config."""
+        if self._rms_mode == RMSDisplayMode.OFF:
+            return
+        t_start, t_end = _session_window(session)
+        all_channels = self._channel_lookup(session)
+        sources_by_id = {s.source_id: s for s in session.list_sources()}
+        panels = {p.panel_id: p for p in session.list_panels()}
+        for panel_id, canvas in self._canvases.items():
+            panel = panels.get(panel_id)
+            if panel is None:
+                continue
+            self._compute_rms_for_panel(
+                canvas, panel, session, all_channels, sources_by_id, t_start, t_end
+            )
+
+    @staticmethod
+    def _estimate_sample_rate(source) -> float:
+        """Estimate sampling rate (Hz) from a source's waveform time column."""
+        try:
+            time_col = source.record.waveform_data.get("time")
+            if time_col is None or len(time_col) < 2:
+                return 0.0
+            arr = np.asarray(time_col[: min(200, len(time_col))], dtype=np.float64)
+            diffs = np.diff(arr)
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            return float(1.0 / np.median(valid)) if len(valid) > 0 else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _compute_rms_for_panel(
+        self,
+        canvas: SessionCanvasWidget,
+        panel,
+        session,
+        all_channels: dict,
+        sources_by_id: dict,
+        t_start: float,
+        t_end: float,
+    ) -> None:
+        """Compute sliding-RMS for eligible channels in one panel and push to canvas."""
+        from app.analytics.rms.rms_overlay import classify_rms_eligibility
+        from app.analytics.rms.sliding_rms import compute_rms_overlay
+
+        rms_only = (self._rms_mode == RMSDisplayMode.RMS_ONLY)
+
+        for source_id, channel_name in panel.channel_refs:
+            source = sources_by_id.get(source_id)
+            if source is None or not source.is_active:
+                continue
+            ch = all_channels.get((source_id, channel_name))
+            if ch is not None and not ch.is_visible:
+                continue
+
+            if not classify_rms_eligibility(channel_name).eligible:
+                continue
+
+            try:
+                sample_rate = self._estimate_sample_rate(source)
+                if sample_rate <= 0:
+                    continue
+                aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
+                rms_t, rms_d = compute_rms_overlay(
+                    aligned.time, aligned.values, sample_rate, config=self._rms_config
+                )
+                color = (
+                    (ch.color_hex if (ch and ch.color_hex) else None)
+                    or self._auto_colour(source_id, channel_name)
+                )
+                canvas.update_rms_curve(
+                    source_id, channel_name, rms_t, rms_d, color,
+                    unit=aligned.unit, rms_only=rms_only,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     def _compute_session_reference_time(self, session) -> datetime | None:
         """Return the wall-clock time that corresponds to session t=0.

@@ -1,4 +1,4 @@
-"""SessionCanvasWidget — per-panel multi-source waveform view (Phase 9D/9E + S1).
+"""SessionCanvasWidget — per-panel multi-source waveform view (Phase 9D/9E + S1/S2).
 
 Architecture
 ------------
@@ -14,6 +14,12 @@ S1 additions
 - **Trigger markers** (``set_trigger_marker`` / ``remove_trigger_marker``):
   a per-source vertical DashDot InfiniteLine at the source's trigger time,
   colour-matched to the source, labelled with the source display name.
+
+S2 additions
+------------
+- **RMS overlay** (``update_rms_curve`` / ``remove_rms_curve`` / ``clear_rms_curves``):
+  per-channel sliding-RMS envelope drawn as a lighter dashed line in the same
+  ViewBox as the raw waveform.  In RMS_ONLY mode the raw curve is hidden.
 
 A ChannelLegendWidget sits below the plot and reflects the current set of
 curves, their colours, display names, and visibility (Phase 9E).
@@ -178,6 +184,18 @@ _STYLE_MAP = {
 }
 
 
+def _rms_pen_color(hex_color: str) -> str:
+    """Blend *hex_color* 40 % toward white — lighter shade for RMS overlay curves."""
+    c = hex_color.lstrip("#")
+    if len(c) != 6:
+        return "#FFFFFF"
+    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    r2 = min(255, r + int((255 - r) * 0.4))
+    g2 = min(255, g + int((255 - g) * 0.4))
+    b2 = min(255, b + int((255 - b) * 0.4))
+    return f"#{r2:02X}{g2:02X}{b2:02X}"
+
+
 @dataclasses.dataclass
 class _CurveMetadata:
     source_id: str
@@ -225,6 +243,8 @@ class SessionCanvasWidget(QWidget):
         self._curves: dict[tuple[str, str], pg.PlotDataItem] = {}
         self._zero_lines: dict[str, pg.InfiniteLine] = {}
         self._trigger_markers: dict[str, pg.InfiniteLine] = {}  # S1
+        self._rms_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # S2
+        self._rms_raw_hidden: set[tuple[str, str]] = set()             # S2
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
 
         self._build_ui()
@@ -436,7 +456,11 @@ class SessionCanvasWidget(QWidget):
         key = (source_id, channel_name)
         curve = self._curves.get(key)
         if curve is not None:
-            curve.setVisible(visible)
+            # Don't un-hide a raw curve that RMS_ONLY mode is suppressing
+            if visible and key in self._rms_raw_hidden:
+                pass
+            else:
+                curve.setVisible(visible)
         meta = self._metadata.get(key)
         if meta is not None:
             meta.visible = visible
@@ -453,6 +477,10 @@ class SessionCanvasWidget(QWidget):
                 meta.colour if meta else "#AAAAAA",
             )
             vb.removeItem(curve)
+        # Clean up RMS overlay curves for this source
+        rms_stale = [k for k in self._rms_curves if k[0] == source_id]
+        for key in rms_stale:
+            self.remove_rms_curve(key[0], key[1])
         self.legend.remove_source_rows(source_id)
         self.remove_zero_line(source_id)
         self.remove_trigger_marker(source_id)
@@ -520,6 +548,96 @@ class SessionCanvasWidget(QWidget):
             self._primary_plot.removeItem(line)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # RMS overlay curves (S2)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def update_rms_curve(
+        self,
+        source_id: str,
+        channel_name: str,
+        rms_time: np.ndarray,
+        rms_values: np.ndarray,
+        color: str,
+        unit: str | None = None,
+        *,
+        rms_only: bool = False,
+    ) -> None:
+        """Add or update a sliding-RMS overlay for one channel.
+
+        The envelope is drawn as a lighter dashed line in the same ViewBox as
+        the raw waveform.  When *rms_only* is True the raw curve is hidden so
+        only the envelope is visible.
+        """
+        key = (source_id, channel_name)
+        rms_color = _rms_pen_color(color)
+        pen = pg.mkPen(rms_color, width=2, style=Qt.PenStyle.DashLine)
+
+        meta = self._metadata.get(key)
+        vb = self._resolve_viewbox(
+            meta.y_axis_side if meta else "left",
+            meta.unit if meta else unit,
+            color,
+        )
+
+        if key not in self._rms_curves:
+            rms_curve = pg.PlotDataItem(pen=pen, skipFiniteCheck=True)
+            rms_curve.setClipToView(True)
+            vb.addItem(rms_curve)
+            self._rms_curves[key] = rms_curve
+        else:
+            self._rms_curves[key].setPen(pen)
+
+        rms_curve = self._rms_curves[key]
+        if len(rms_time) > 0 and len(rms_values) > 0:
+            rms_curve.setData(x=rms_time, y=rms_values)
+        else:
+            rms_curve.setData(x=np.array([]), y=np.array([]))
+        rms_curve.setVisible(True)
+
+        # RMS_ONLY: suppress the raw curve without touching legend visibility
+        raw_curve = self._curves.get(key)
+        if raw_curve is not None:
+            if rms_only:
+                raw_curve.setVisible(False)
+                self._rms_raw_hidden.add(key)
+            else:
+                raw_curve.setVisible(meta.visible if meta else True)
+                self._rms_raw_hidden.discard(key)
+
+    def remove_rms_curve(self, source_id: str, channel_name: str) -> None:
+        """Remove the RMS overlay for one channel and restore raw curve visibility."""
+        key = (source_id, channel_name)
+        rms_curve = self._rms_curves.pop(key, None)
+        if rms_curve is not None:
+            try:
+                vb = rms_curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(rms_curve)
+            except Exception:  # noqa: BLE001
+                pass
+        self._rms_raw_hidden.discard(key)
+        raw_curve = self._curves.get(key)
+        if raw_curve is not None:
+            meta = self._metadata.get(key)
+            raw_curve.setVisible(meta.visible if meta else True)
+
+    def clear_rms_curves(self) -> None:
+        """Remove all RMS overlays and restore raw curve visibility."""
+        for key, rms_curve in list(self._rms_curves.items()):
+            try:
+                vb = rms_curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(rms_curve)
+            except Exception:  # noqa: BLE001
+                pass
+            raw_curve = self._curves.get(key)
+            if raw_curve is not None:
+                meta = self._metadata.get(key)
+                raw_curve.setVisible(meta.visible if meta else True)
+        self._rms_curves.clear()
+        self._rms_raw_hidden.clear()
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Panel metadata & housekeeping
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -545,6 +663,16 @@ class SessionCanvasWidget(QWidget):
         self.legend.setVisible(visible)
 
     def clear_all(self) -> None:
+        # RMS overlays first (they hold ViewBox refs via getViewBox)
+        for rms_curve in self._rms_curves.values():
+            try:
+                vb = rms_curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(rms_curve)
+            except Exception:  # noqa: BLE001
+                pass
+        self._rms_curves.clear()
+        self._rms_raw_hidden.clear()
         for key, curve in list(self._curves.items()):
             meta = self._metadata.get(key)
             vb = self._resolve_viewbox(
