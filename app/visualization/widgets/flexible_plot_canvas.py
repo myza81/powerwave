@@ -195,6 +195,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
     """
 
     cursor_moved = pyqtSignal(float)
+    measurement_cursors_moved = pyqtSignal(float, float)  # t_a, t_b
 
     def __init__(
         self,
@@ -218,6 +219,8 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
 
         self._resize_pending = False
         self._cursor: pg.InfiniteLine | None = None
+        self._cursor_b: pg.InfiniteLine | None = None      # second measurement cursor
+        self._measurement_mode: bool = False
         self._trigger_line: pg.InfiniteLine | None = None
         self._reserved_right_axes: list[pg.AxisItem] = []
 
@@ -517,6 +520,100 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             self._cursor.setValue(t)
             self._cursor.blockSignals(False)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Measurement mode (Phase 1)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_measurement_mode(self, enabled: bool) -> None:
+        """Enable or disable two-cursor measurement mode.
+
+        When enabled, a second cyan cursor (B) appears. Both cursors emit
+        measurement_cursors_moved(t_a, t_b) whenever either moves.
+        When disabled, cursor B is hidden and removed.
+        """
+        if enabled == self._measurement_mode:
+            return
+        self._measurement_mode = enabled
+        if enabled:
+            self._add_cursor_b()
+        else:
+            self._remove_cursor_b()
+
+    def measurement_mode(self) -> bool:
+        return self._measurement_mode
+
+    def cursor_positions(self) -> tuple[float, float] | None:
+        """Return (t_a, t_b) or None if either cursor is missing."""
+        if self._cursor is None or self._cursor_b is None:
+            return None
+        return float(self._cursor.value()), float(self._cursor_b.value())
+
+    def compute_current_measurements(self) -> object | None:
+        """Compute and return a MeasurementResult for the current cursor pair.
+
+        Returns None when measurement mode is off or no record is loaded.
+        """
+        if not self._measurement_mode or self._record is None:
+            return None
+        positions = self.cursor_positions()
+        if positions is None:
+            return None
+        from app.visualization.interaction.measurement_engine import compute_measurements
+        t_a, t_b = positions
+        data_by_channel: dict[str, tuple] = {}
+        for ch in self._record.analog_channels:
+            if ch.name not in self._visible_channel_names:
+                continue
+            arr = self._get_display_data(ch.name)
+            if arr is not None:
+                unit = self._effective_units.get(ch.name, ch.unit or "")
+                data_by_channel[ch.name] = (arr, unit)
+        nominal = None
+        if self._record is not None:
+            nominal = getattr(self._record.metadata, "nominal_frequency", None)
+            try:
+                nominal = float(nominal)
+            except (TypeError, ValueError):
+                nominal = None
+        return compute_measurements(
+            t_a, t_b, self._time_cache, data_by_channel, nominal_hz=nominal
+        )
+
+    def _add_cursor_b(self) -> None:
+        if self._cursor_b is not None:
+            return
+        t_ref = float(self._cursor.value()) + 0.02 if self._cursor is not None else 0.02
+        self._cursor_b = pg.InfiniteLine(
+            pos=t_ref,
+            angle=90,
+            movable=True,
+            pen=pg.mkPen("#00CCFF", width=1.5, style=Qt.PenStyle.DashLine),
+            label="B",
+            labelOpts={"color": "#00CCFF", "position": 0.85},
+        )
+        self._cursor_b.sigPositionChanged.connect(self._on_cursor_b_moved)
+        self._primary_plot.addItem(self._cursor_b)
+        self._emit_measurement()
+
+    def _remove_cursor_b(self) -> None:
+        if self._cursor_b is not None:
+            try:
+                self._primary_plot.removeItem(self._cursor_b)
+            except Exception:
+                pass
+            self._cursor_b = None
+
+    def _on_cursor_b_moved(self, _line: pg.InfiniteLine) -> None:
+        self._emit_measurement()
+
+    def _emit_measurement(self) -> None:
+        if self._cursor is None or self._cursor_b is None:
+            return
+        self.measurement_cursors_moved.emit(
+            float(self._cursor.value()),
+            float(self._cursor_b.value()),
+        )
+
     def _clear_canvas(self) -> None:
         """Remove all parameters, cursor, and trigger line. Reset to blank state.
 
@@ -564,6 +661,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._axis_reference_time = None
         self._visible_channel_names.clear()
         self._cursor = None
+        self._cursor_b = None  # removed by PlotItem.clear() above
         self._trigger_line = None
         self._curve_data_signatures.clear()
 
@@ -671,6 +769,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._axis_manager = MultiAxisManager(self._primary_plot, self)
         vb.sigResized.connect(self._on_plot_resized)
         self._cursor = None
+        self._cursor_b = None  # removed by PlotItem.clear() above
         self._trigger_line = None
 
     def _rebuild_visible_channel_axes(self) -> None:
@@ -679,6 +778,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             return
         x_range = self._primary_plot.getViewBox().viewRange()[0]
         cursor_pos = float(self._cursor.value()) if self._cursor is not None else 0.0
+        cursor_b_pos = float(self._cursor_b.value()) if self._cursor_b is not None else None
 
         self._reset_plot_for_axis_rebuild()
         for ch in self._record.analog_channels:
@@ -688,6 +788,12 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._add_trigger_line()
         self._add_cursor()
         self.set_cursor_pos(cursor_pos)
+        if self._measurement_mode:
+            self._add_cursor_b()
+            if cursor_b_pos is not None and self._cursor_b is not None:
+                self._cursor_b.blockSignals(True)
+                self._cursor_b.setValue(cursor_b_pos)
+                self._cursor_b.blockSignals(False)
         self._primary_plot.setXRange(float(x_range[0]), float(x_range[1]), padding=0)
 
         if self._rms_display_mode != RMSDisplayMode.OFF:
@@ -1037,6 +1143,8 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
 
     def _on_cursor_moved(self, line: pg.InfiniteLine) -> None:
         self.cursor_moved.emit(line.value())
+        if self._measurement_mode:
+            self._emit_measurement()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Engineering scaling (Phase 5B)

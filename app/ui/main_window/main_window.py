@@ -51,6 +51,7 @@ from app.visualization.widgets.digital_event_timeline import DigitalEventTimelin
 from app.ui.import_wizard import ImportWizardDialog
 from app.ui.session import SessionCanvasController, SessionPanel
 from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
+from app.ui.widgets.measurement_panel import MeasurementPanel
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -375,9 +376,16 @@ class PowerwaveMainWindow(QMainWindow):
         self._session_canvas_controller: SessionCanvasController | None = None
         self._session_canvas_active: bool = False
 
+        # Measurement panel (Phase 1 Enhancement)
+        self._measurement_dock = self._build_measurement_dock()
+        self._measurement_mode: bool = False
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._measurement_dock)
+        self._measurement_dock.hide()
+        self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
         self._build_menu()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -597,6 +605,47 @@ class PowerwaveMainWindow(QMainWindow):
                 canvas._force_y_ranges()
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Measurement dock (Phase 1 Enhancement)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_measurement_dock(self):
+        from PyQt6.QtWidgets import QDockWidget
+        dock = QDockWidget("Measurements", self)
+        dock.setObjectName("MeasurementDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self._measurement_widget = MeasurementPanel()
+        dock.setWidget(self._measurement_widget)
+        dock.setMinimumHeight(120)
+        return dock
+
+    def _on_toggle_measurement_mode(self, checked: bool) -> None:
+        self._measurement_mode = checked
+        self._canvas.set_measurement_mode(checked)
+        for canvas in self._panel_canvases.values():
+            if self._qt_widget_alive(canvas):
+                canvas.set_measurement_mode(checked)
+                canvas.measurement_cursors_moved.connect(
+                    self._on_measurement_cursors_moved
+                )
+        if checked:
+            self._measurement_dock.show()
+            self._measurement_widget.update_measurements(None)
+        else:
+            self._measurement_dock.hide()
+            self._measurement_widget.update_measurements(None)
+
+    def _on_measurement_cursors_moved(self, t_a: float, t_b: float) -> None:
+        result = self._canvas.compute_current_measurements()
+        if result is None:
+            # Try panel canvases (grouped layout) — use the one that emitted
+            sender_canvas = self.sender()
+            if hasattr(sender_canvas, "compute_current_measurements"):
+                result = sender_canvas.compute_current_measurements()
+        self._measurement_widget.update_measurements(result)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Menu
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -704,6 +753,18 @@ class PowerwaveMainWindow(QMainWindow):
         )
         axis_mode_group.addAction(dedicated_axis)
         self._axis_mode_actions[AxisDisplayMode.DEDICATED] = dedicated_axis
+
+        view_menu.addSeparator()
+        self._measurement_mode_action = view_menu.addAction("&Measurement Mode")
+        self._measurement_mode_action.setCheckable(True)
+        self._measurement_mode_action.setChecked(False)
+        self._measurement_mode_action.setShortcut("Ctrl+M")
+        self._measurement_mode_action.setToolTip(
+            "Enable two-cursor measurement: drag cursor A (yellow) and cursor B (cyan) "
+            "to measure Δt, ΔY, RMS, frequency and energy between them"
+        )
+        self._measurement_mode_action.toggled.connect(self._on_toggle_measurement_mode)
+        view_menu.addAction(self._measurement_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
