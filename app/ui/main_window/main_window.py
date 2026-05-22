@@ -1188,24 +1188,15 @@ class PowerwaveMainWindow(QMainWindow):
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
 
+        # S9: unified File menu — single Open entry point for all formats
         file_menu = menu_bar.addMenu("&File")
         open_action = file_menu.addAction("&Open…")
         open_action.setShortcut("Ctrl+O")
-        open_action.setToolTip("Open a COMTRADE, CSV, or Excel file")
-        open_action.triggered.connect(self._open_file_dialog)
-        import_action = file_menu.addAction("&Import Wizard…")
-        import_action.setShortcut("Ctrl+I")
-        import_action.setToolTip(
-            "Open the Import Wizard for CSV or Excel files — "
-            "configure columns, timestamps and units before loading"
+        open_action.setToolTip(
+            "Open a COMTRADE, CSV, or Excel file — CSV/Excel launches the Import Wizard "
+            "automatically. Use 'Add Source' in the Session Panel to compare multiple files."
         )
-        import_action.triggered.connect(self._open_import_wizard)
-        open_session_action = file_menu.addAction("&Multi-Source Viewer…")
-        open_session_action.setShortcut("Ctrl+Shift+N")
-        open_session_action.setToolTip(
-            "Open a workspace to load and compare multiple recordings side by side"
-        )
-        open_session_action.triggered.connect(self._on_open_session)
+        open_action.triggered.connect(self._open_unified_file)
         manifest_action = file_menu.addAction("Open &Event Manifest…")
         manifest_action.setShortcut("Ctrl+E")
         manifest_action.triggered.connect(self._open_manifest_dialog)
@@ -1468,6 +1459,16 @@ class PowerwaveMainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
     # File loading (standard path)
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _open_unified_file(self) -> None:
+        """S9 unified entry point: open any file directly into a fresh session canvas.
+
+        Starts a fresh EventAnalysisSession then delegates to _on_add_to_session()
+        which handles the file dialog, Import Wizard auto-fire for CSV/Excel, and
+        session canvas activation. The user never needs to know about separate code paths.
+        """
+        self._on_new_session()
+        self._on_add_to_session()
 
     def _open_file_dialog(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
