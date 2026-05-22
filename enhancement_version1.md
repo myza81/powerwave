@@ -158,11 +158,11 @@ MeasurementPanel (QDockWidget)
 
 **Progress:**
 - [x] Enhancement document created
-- [ ] `MeasurementEngine` implemented
-- [ ] `MeasurementPanel` widget created
-- [ ] `FlexiblePlotCanvas` cursor B + measurement mode
-- [ ] `MainWindow` wiring (menu + dock)
-- [ ] Committed and tested
+- [x] `MeasurementEngine` implemented (`app/visualization/interaction/measurement_engine.py`)
+- [x] `MeasurementPanel` widget created (`app/ui/widgets/measurement_panel.py`)
+- [x] `FlexiblePlotCanvas` cursor B + measurement mode
+- [x] `MainWindow` wiring (View → Measurement Mode Ctrl+M, bottom dock)
+- [x] Committed: `1c46a3d`
 
 ---
 
@@ -276,6 +276,140 @@ MeasurementPanel (QDockWidget)
 
 ---
 
+---
+
+## File Menu Redesign (S9 — Gated on S1–S8 Feature Parity)
+
+### Problem with the Current Menu
+
+The current File menu presents three overlapping entry points that confuse the user about which one to use:
+
+```
+File
+ ├── Open…                ← loads into FlexiblePlotCanvas (single-source)
+ ├── Import Wizard…       ← CSV/Excel only, separate dialog
+ ├── Multi-Source Viewer… ← loads into SessionCanvas
+ ├── Open Event Manifest…
+ └── Exit
+```
+
+The core issue: "Open" and "Multi-Source Viewer" both display waveforms, but they are
+separate code paths leading to separate canvases with different feature sets. A user who
+opens a file with "Open" and later wants to compare it with another recording has to start
+over from "Multi-Source Viewer". There is no natural progression.
+
+### Target State — Unified Entry Point
+
+```
+File
+ ├── Open…                ← single entry point (see flow below)
+ ├── Save Session as Manifest…
+ ├── Open Event Manifest…
+ ├── ─────────────────
+ └── Exit
+```
+
+The "Import Wizard" and "Multi-Source Viewer" menu items are removed. Their functionality
+is absorbed into the unified Open flow and the session canvas itself.
+
+### Progressive Disclosure Flow
+
+```
+User clicks File → Open…
+        │
+        ▼
+   File picker (all supported formats)
+        │
+        ├── COMTRADE (.cfg/.comtrade) ──────────────┐
+        │                                            │
+        └── CSV / Excel (.csv/.xlsx) ────────────────┤
+                    │                                │
+                    ▼                                │
+          Import Wizard fires automatically          │
+          (no menu item needed — auto-detect)        │
+                    │                                │
+                    └────────────────────────────────┘
+                                 │
+                                 ▼
+                    Session Canvas opens with one source
+                    (full analytics: RMS, phasors, harmonics,
+                     measurement tool, engineering scaling)
+                                 │
+                          ┌──────┴──────┐
+                     User wants         User is done
+                    to compare          ↓
+                         │         Single-source analysis
+                         ▼         with all tools available
+                  "Add Source" button
+                  appears in Session Panel
+                         │
+                         ▼
+                   File picker again
+                         │
+                         ▼
+                   Multi-source session
+                   (both sources in session canvas,
+                    time-aligned, legend per source,
+                    cross-source correlation available)
+```
+
+### Key Behaviours
+
+| Behaviour | Detail |
+|---|---|
+| Import Wizard auto-fire | When user opens a `.csv` or `.xlsx` via Open, the Import Wizard dialog launches automatically. The user never has to know it's a separate flow. |
+| Single-source = session with one source | The session canvas always hosts the waveform. No separate `FlexiblePlotCanvas` path. `FlexiblePlotCanvas` becomes an internal implementation detail only. |
+| "Add Source" is always available | The Session Panel always shows an "Add Source" button. The user can go multi-source at any time without restarting. |
+| Session manifest preserved | File → Save Session as Manifest saves the current session (one or many sources) for later reopening. |
+| No data loss on Add Source | Adding a second source never reloads or disturbs the first source's analysis state (cursors, overlays, zoom position). |
+
+### Before / After Comparison
+
+| Scenario | Before | After |
+|---|---|---|
+| Open a COMTRADE file | File → Open | File → Open |
+| Open a CSV file | File → Import Wizard | File → Open (wizard auto-fires) |
+| Add a second recording | Restart via Multi-Source Viewer | Click "Add Source" in Session Panel |
+| Quick look at one file | File → Open → FlexiblePlotCanvas | File → Open → Session Canvas (same simplicity) |
+| Deep analysis (RMS + phasors + measurement) | Available in FlexiblePlotCanvas only | Available in Session Canvas (after S1–S5) |
+
+### Why S9 Must Wait for S1–S8
+
+Removing "Open" today would remove access to:
+
+| Missing from Session Canvas | Covered by |
+|---|---|
+| N independent Y-axes per channel | S1 |
+| RMS overlay | S2 |
+| Phasor overlay | S3 |
+| Harmonic magnitude overlay | S4 |
+| Engineering scaling | S5 |
+| Two-cursor measurement | S6 |
+| Signal browser | S7 |
+| Per-source trigger markers | S8 |
+
+Until all of these are present in the session canvas, the single-source canvas must remain
+accessible. S9 is the final step — flip the entry point and retire the old code path.
+
+### Implementation Notes (for when S9 is actioned)
+
+- Remove `_restore_standard_layout()` and `_rebuild_grouped_layout()` from `MainWindow`.
+- Remove `FlexiblePlotCanvas` from the central widget stack (keep the class — used by session canvas panels internally via S1).
+- Remove "Import Wizard…" and "Multi-Source Viewer…" from File menu.
+- Rename "Open…" trigger to call `_on_open_session()` instead of `_open_file_dialog()`.
+- `_on_open_session()` auto-fires Import Wizard when file suffix is `.csv`/`.xlsx`.
+- The `DigitalEventTimeline` becomes a panel within the session canvas (not a separate splitter widget).
+
+**Progress:**
+- [ ] S1–S8 complete (prerequisite)
+- [ ] File menu item changes
+- [ ] Unified Open handler
+- [ ] Import Wizard auto-fire integration
+- [ ] FlexiblePlotCanvas removed from main layout
+- [ ] Tested: COMTRADE, CSV, multi-source flows
+
+---
+
 ## Design Constraints
 
 1. **No silent assumptions** — every inferred value is labelled with its source (e.g., "nominal frequency: 50 Hz from record metadata").
@@ -286,20 +420,29 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-## Progress Summary (Phase 1 in flight)
+## Progress Summary
 
 ```
-Phase 1 — Two-Cursor Measurement    [░░░░░░░░░░] 0%   ← current
-Phase 2 — Event Detection           [░░░░░░░░░░] 0%
-Phase 3 — Live Value Readout        [░░░░░░░░░░] 0%
-Phase 4 — Data Quality Fingerprint  [░░░░░░░░░░] 0%
-Phase 5 — Fault Characterisation    [░░░░░░░░░░] 0%
-Phase 6 — Protection Timing         [░░░░░░░░░░] 0%
-Phase 7 — Cross-Source Correlation  [░░░░░░░░░░] 0%
-Phase 8 — Contextual Suggestions    [░░░░░░░░░░] 0%
+Intelligence Phases
+Phase 1 — Two-Cursor Measurement    [██████████] 100% ✅ commit 1c46a3d
+Phase 2 — Event Detection           [░░░░░░░░░░]   0%
+Phase 3 — Live Value Readout        [░░░░░░░░░░]   0%
+Phase 4 — Data Quality Fingerprint  [░░░░░░░░░░]   0%
+Phase 5 — Fault Characterisation    [░░░░░░░░░░]   0%
+Phase 6 — Protection Timing         [░░░░░░░░░░]   0%
+Phase 7 — Cross-Source Correlation  [░░░░░░░░░░]   0%
+Phase 8 — Contextual Suggestions    [░░░░░░░░░░]   0%
 
-Session Canvas Migration
-S1 — N-axis + trigger               [░░░░░░░░░░] 0%
-S2–S5 — Overlays                    [░░░░░░░░░░] 0%
-S6–S9 — Measurement + File menu     [░░░░░░░░░░] 0%
+Session Canvas Migration (prerequisite for File menu redesign)
+S1 — N-axis + trigger markers       [░░░░░░░░░░]   0%
+S2 — RMS overlay                    [░░░░░░░░░░]   0%
+S3 — Phasor overlay                 [░░░░░░░░░░]   0%
+S4 — Harmonic overlay               [░░░░░░░░░░]   0%
+S5 — Engineering scaling            [░░░░░░░░░░]   0%
+S6 — Two-cursor measurement port    [░░░░░░░░░░]   0%
+S7 — Signal browser                 [░░░░░░░░░░]   0%
+S8 — Per-source trigger markers     [░░░░░░░░░░]   0%
+
+File Menu Redesign
+S9 — Unified entry point            [░░░░░░░░░░]   0%  (gated on S1–S8)
 ```
