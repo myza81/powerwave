@@ -460,8 +460,8 @@ Phase 7 — Cross-Source Correlation  [██████████] 100% ✅ 
 Phase 8 — Contextual Suggestions    [██████████] 100% ✅ commit d1bf093
 
 Session Canvas Migration (prerequisite for File menu redesign)
-S1 — N-axis + trigger markers       [░░░░░░░░░░]   0%  ← current
-S2 — RMS overlay                    [░░░░░░░░░░]   0%
+S1 — N-axis + trigger markers       [██████████] 100% ✅ commit 45d7c8c
+S2 — RMS overlay                    [░░░░░░░░░░]   0%  ← current
 S3 — Phasor overlay                 [░░░░░░░░░░]   0%
 S4 — Harmonic overlay               [░░░░░░░░░░]   0%
 S5 — Engineering scaling            [░░░░░░░░░░]   0%
