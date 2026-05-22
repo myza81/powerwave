@@ -465,7 +465,7 @@ S2 — RMS overlay                    [██████████] 100% ✅ 
 S3 — Phasor overlay                 [██████████] 100% ✅ commit 22eaf94
 S4 — Harmonic overlay               [██████████] 100% ✅ commit bcef567
 S5 — Engineering scaling            [██████████] 100% ✅ commit 5864ffa
-S6 — Two-cursor measurement port    [██████████] 100% ✅ commit (pending)
+S6 — Two-cursor measurement port    [██████████] 100% ✅ commit 45c6cde
 S7 — Signal browser                 [░░░░░░░░░░]   0%  ← current
 S8 — Per-source trigger markers     [░░░░░░░░░░]   0%
 
