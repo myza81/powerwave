@@ -2546,6 +2546,32 @@ class PowerwaveMainWindow(QMainWindow):
         entries: list[SignalBrowserEntry] = []
         targets: dict[str, tuple[str, str, str]] = {}
 
+        # S7: session canvas — build entries directly from the session model
+        if self._session_canvas_active and self._active_session is not None:
+            session = self._active_session
+            sources_by_id = {s.source_id: s for s in session.list_sources()}
+            panels_by_id = {p.panel_id: p for p in session.list_panels()}
+            for ch in session.list_analog_channels(active_only=False):
+                source = sources_by_id.get(ch.source_id)
+                if source is None or not source.is_active:
+                    continue
+                panel = panels_by_id.get(ch.panel_id)
+                group_label = panel.title if panel is not None else "Analog"
+                key = f"signal-{len(targets)}"
+                # panel_key is repurposed to carry source_id; name carries channel_name
+                targets[key] = ("session", ch.source_id, ch.channel_name)
+                entries.append(SignalBrowserEntry(
+                    key=key,
+                    source=source.display_name,
+                    group=group_label,
+                    name=ch.display_name or ch.channel_name,
+                    visible=ch.is_visible,
+                    kind="analog",
+                ))
+            self._signal_entry_targets = targets
+            self._signal_browser.set_entries(entries)
+            return
+
         def source_label(record: DisturbanceRecord | None, fallback: str) -> str:
             if record is None:
                 return fallback
@@ -2639,6 +2665,21 @@ class PowerwaveMainWindow(QMainWindow):
         if target is None:
             return
         kind, panel_key, name = target
+        # S7: session canvas — route through session model + controller
+        if kind == "session":
+            source_id = panel_key  # repurposed field carries source_id
+            channel_name = name    # canonical channel_name (not display name)
+            if self._active_session is not None:
+                self._active_session.set_channel_visibility(source_id, channel_name, visible)
+            if self._session_canvas_controller is not None:
+                self._session_canvas_controller.on_channel_visibility_changed(
+                    source_id, channel_name, visible
+                )
+            self._refresh_signal_browser()
+            self.statusBar().showMessage(
+                f"{channel_name}: {'visible' if visible else 'hidden'}"
+            )
+            return
         if kind == "analog":
             canvas = self._canvas if panel_key == "standard" else self._panel_canvases.get(panel_key)
             if not self._qt_widget_alive(canvas):
@@ -2754,6 +2795,7 @@ class PowerwaveMainWindow(QMainWindow):
 
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(f"Session canvas: {n} source(s) loaded.")
+        self._refresh_signal_browser()  # S7: populate signal browser with session channels
 
     def _deactivate_session_canvas(self) -> None:
         """Restore standard layout and exit session canvas mode."""
@@ -2850,6 +2892,7 @@ class PowerwaveMainWindow(QMainWindow):
             self._session_canvas_controller.on_source_removed(source_id)
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(f"Source removed. Session: {n} source(s).")
+        self._refresh_signal_browser()  # S7: reflect source removal in signal browser
 
     def _on_session_offset_changed(self, source_id: str, offset_s: float) -> None:
         if self._active_session is None:
