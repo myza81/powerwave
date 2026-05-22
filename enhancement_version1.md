@@ -262,15 +262,18 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-### Phase 7 — Cross-Source Correlation 🔴
+### Phase 7 — Cross-Source Correlation ✅ [COMPLETE — commit 87dbc27]
 
 **Goal:** In multi-source sessions, detect if two sources captured the same event and suggest auto-alignment.
 
-**Method:** Cross-correlation of voltage/current signatures; trigger-time comparison.
+**Method:** FFT cross-correlation of voltage/current signatures over the temporal overlap window.
 
 **Progress:**
-- [ ] Cross-correlation engine
-- [ ] Alignment suggestion UI
+- [x] `correlate_source_pair()` — resample to common grid → FFT xcorr → peak lag + confidence
+- [x] `correlate_all_pairs()` — all unique pairs in a multi-source session
+- [x] `CorrelationReportPanel` — pairwise table (Source A/B | Correlation | Lag | Confidence | Suggested Offset)
+- [x] Runs after every multi-source load + after session "Auto Align All"
+- [x] Auto-applies high-confidence (≥0.70) offsets to EventAnalysisSession with method='correlation'
 
 ---
 
@@ -443,8 +446,8 @@ Phase 3 — Live Value Readout        [██████████] 100% ✅ 
 Phase 4 — Data Quality Fingerprint  [██████████] 100% ✅ commit df923b9
 Phase 5 — Fault Characterisation    [██████████] 100% ✅ commit 848ac55
 Phase 6 — Protection Timing         [██████████] 100% ✅ commit 17d5f98
-Phase 7 — Cross-Source Correlation  [░░░░░░░░░░]   0%
-Phase 8 — Contextual Suggestions    [░░░░░░░░░░]   0%
+Phase 7 — Cross-Source Correlation  [██████████] 100% ✅ commit 87dbc27
+Phase 8 — Contextual Suggestions    [░░░░░░░░░░]   0%  ← current
 
 Session Canvas Migration (prerequisite for File menu redesign)
 S1 — N-axis + trigger markers       [░░░░░░░░░░]   0%
