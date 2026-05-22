@@ -71,7 +71,7 @@ The long-term UX goal is a **single unified canvas** — open a file, get the se
 | N-axis per channel (MultiAxisManager) | ✅ | ❌ | S1 |
 | RMS overlay | ✅ | ✅ | S2 |
 | Phasor magnitude/angle overlay | ✅ | ✅ | S3 |
-| Harmonic magnitude overlay | ✅ | ❌ | S4 |
+| Harmonic magnitude overlay | ✅ | ✅ | S4 |
 | Engineering scaling (kV, pu, etc.) | ✅ | ❌ | S5 |
 | Two-cursor measurement | 🔴 Phase 1 | ❌ | S6 (after Phase 1) |
 | Trigger marker line | ✅ | ❌ | S1 |
@@ -463,8 +463,8 @@ Session Canvas Migration (prerequisite for File menu redesign)
 S1 — N-axis + trigger markers       [██████████] 100% ✅ commit 45d7c8c
 S2 — RMS overlay                    [██████████] 100% ✅ commit db16f65
 S3 — Phasor overlay                 [██████████] 100% ✅ commit 22eaf94
-S4 — Harmonic overlay               [░░░░░░░░░░]   0%  ← current
-S5 — Engineering scaling            [░░░░░░░░░░]   0%
+S4 — Harmonic overlay               [██████████] 100% ✅ commit bcef567
+S5 — Engineering scaling            [░░░░░░░░░░]   0%  ← current
 S6 — Two-cursor measurement port    [░░░░░░░░░░]   0%
 S7 — Signal browser                 [░░░░░░░░░░]   0%
 S8 — Per-source trigger markers     [░░░░░░░░░░]   0%
