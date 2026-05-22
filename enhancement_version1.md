@@ -25,7 +25,7 @@ Direct interaction with the waveform: the engineer places markers and the app co
 
 | Capability | Status |
 |---|---|
-| Two-cursor measurement (Δt, ΔY, frequency, RMS, mean, peak, energy) | 🔴 Phase 1 |
+| Two-cursor measurement (Δt, ΔY, frequency, RMS, mean, peak, energy) | ✅ Phase 1 |
 | Single-cursor live value readout per channel | 🔴 Phase 3 |
 | Smart snapping (zero crossings, peaks, cycle boundaries, trigger) | 🔴 Phase 1 |
 
@@ -43,8 +43,8 @@ Finding events in the waveform without manual searching.
 
 | Capability | Status |
 |---|---|
-| Fault / disturbance detection (voltage dip, overcurrent spike) | 🔴 Phase 5 |
-| Event timeline markers on the X-axis | 🔴 Phase 5 |
+| Fault / disturbance detection (voltage dip, overcurrent spike) | ✅ Phase 2 |
+| Event timeline markers on the X-axis | ✅ Phase 2 |
 | Protection timing extraction (pickup → trip → clear) | 🔴 Phase 6 |
 | Digital channel event synchronisation | 🟡 Partial (DigitalEventTimeline) |
 
@@ -96,7 +96,7 @@ The long-term UX goal is a **single unified canvas** — open a file, get the se
 
 ## Enhancement Phases
 
-### Phase 1 — Two-Cursor Measurement Tool 🔴 [CURRENT]
+### Phase 1 — Two-Cursor Measurement Tool ✅
 
 **Priority:** Highest — highest daily-use value for every waveform engineer.
 
@@ -166,26 +166,31 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-### Phase 2 — Event Detection + Timeline Markers 🔴
+### Phase 2 — Event Detection + Timeline Markers ✅
 
 **Goal:** Automatically detect disturbance events in loaded waveforms and mark them on the time axis.
 
 **Detection targets:**
-- Voltage dip (>10% drop below nominal, >1 cycle duration)
-- Overcurrent spike (>120% of peak nominal)
-- Rapid frequency deviation (ROCOF > threshold)
-- Zero-sequence current injection (ground fault indicator)
+- Voltage dip (>10% drop below nominal, >0.5 cycle duration)
+- Voltage swell (>110% of nominal, >0.5 cycle duration)
+- Overcurrent spike (>120% of pre-fault peak, >0.5 cycle duration)
+- Frequency deviation (>0.5 Hz from nominal, >0.5 cycle duration)
+- Zero-sequence current injection (3I0 / neutral / earth current channels)
 
-**UI:** Event marker lines on the bottom X-axis (coloured, labelled). Click marker → jump to event + auto-fit Y range.
+**UI:** Color-coded DashDot InfiniteLine markers on each waveform panel at event start (+ DotLine end markers for events >20 ms). Detected Events dock (View menu) lists all events — click to jump canvas to event time.
 
 **Progress:**
-- [ ] Event detection engine
-- [ ] Timeline marker rendering
-- [ ] Event list panel (sortable)
+- [x] Event detection engine (`app/analytics/events/event_detector.py`)
+- [x] Channel role classifier (voltage/current/frequency/zero-sequence by name+unit)
+- [x] Pre-fault baseline estimation from trigger time
+- [x] Timeline marker rendering in `FlexiblePlotCanvas`
+- [x] Event list panel — sortable, click-to-jump (`app/ui/widgets/event_list_panel.py`)
+- [x] MainWindow wiring — all load paths, auto-show dock on events found
+- [x] Committed: `39a8f59`
 
 ---
 
-### Phase 3 — Single-Cursor Live Value Readout 🔴
+### Phase 3 — Single-Cursor Live Value Readout 🔴 [CURRENT]
 
 **Goal:** As the yellow cursor moves, show a floating readout bubble (or status bar) with the interpolated Y value for every visible channel.
 
@@ -425,8 +430,8 @@ accessible. S9 is the final step — flip the entry point and retire the old cod
 ```
 Intelligence Phases
 Phase 1 — Two-Cursor Measurement    [██████████] 100% ✅ commit 1c46a3d
-Phase 2 — Event Detection           [░░░░░░░░░░]   0%
-Phase 3 — Live Value Readout        [░░░░░░░░░░]   0%
+Phase 2 — Event Detection           [██████████] 100% ✅ commit 39a8f59
+Phase 3 — Live Value Readout        [░░░░░░░░░░]   0%  ← current
 Phase 4 — Data Quality Fingerprint  [░░░░░░░░░░]   0%
 Phase 5 — Fault Characterisation    [░░░░░░░░░░]   0%
 Phase 6 — Protection Timing         [░░░░░░░░░░]   0%
