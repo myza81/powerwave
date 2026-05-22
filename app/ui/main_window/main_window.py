@@ -62,6 +62,8 @@ from app.ui.widgets.protection_timing_panel import ProtectionTimingPanel
 from app.analytics.protection import extract_protection_timing
 from app.ui.widgets.correlation_report_panel import CorrelationReportPanel
 from app.analytics.correlation import correlate_all_pairs
+from app.ui.widgets.suggestion_bar import SuggestionBar
+from app.analytics.suggestions import SuggestionContext, generate_suggestions
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -409,6 +411,13 @@ class PowerwaveMainWindow(QMainWindow):
         # Cross-source correlation (Phase 7 Enhancement)
         self._correlation_dock = self._build_correlation_dock()
 
+        # Contextual suggestions (Phase 8 Enhancement)
+        self._suggestion_dock = self._build_suggestion_dock()
+        self._last_suggestion_events: list = []
+        self._last_suggestion_fault = None
+        self._last_suggestion_protection = None
+        self._last_suggestion_correlation: list = []
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
@@ -426,6 +435,8 @@ class PowerwaveMainWindow(QMainWindow):
         self._protection_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._correlation_dock)
         self._correlation_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self._suggestion_dock)
+        self._suggestion_dock.hide()
         self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
         self._canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
         self._build_menu()
@@ -529,6 +540,11 @@ class PowerwaveMainWindow(QMainWindow):
         self._fault_summary_widget.clear_fault()
         self._protection_timing_widget.clear_timing()
         self._correlation_widget.clear_results()
+        self._suggestion_widget.clear_suggestions()
+        self._last_suggestion_events = []
+        self._last_suggestion_fault = None
+        self._last_suggestion_protection = None
+        self._last_suggestion_correlation = []
         self._refresh_signal_browser()
         if self.isVisible() and not self._x_axis_linked:
             QTimer.singleShot(0, self._link_standard_x_axis)
@@ -754,6 +770,9 @@ class PowerwaveMainWindow(QMainWindow):
         if events:
             self._event_dock.show()
 
+        # Cache events for Phase 8 suggestion context
+        self._last_suggestion_events = list(events)
+
         # Fault characterisation (Phase 5) — runs on the same data already in scope
         self._run_fault_characterisation(record, events, time, data_by_channel, nominal)
 
@@ -839,6 +858,8 @@ class PowerwaveMainWindow(QMainWindow):
                 self._quality_dock.show()
         except Exception:  # noqa: BLE001
             pass
+        # Phase 8: generate contextual suggestions after all analytics are done
+        QTimer.singleShot(0, self._run_suggestions)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Fault characterisation dock (Phase 5 Enhancement)
@@ -869,12 +890,14 @@ class PowerwaveMainWindow(QMainWindow):
                 events, time, data_by_channel, record.analog_channels,
                 nominal_hz=nominal_hz,
             )
+            self._last_suggestion_fault = result
             if result is not None:
                 self._fault_summary_widget.load_fault(result)
                 self._fault_dock.show()
             else:
                 self._fault_summary_widget.clear_fault()
         except Exception:  # noqa: BLE001
+            self._last_suggestion_fault = None
             self._fault_summary_widget.clear_fault()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -922,11 +945,14 @@ class PowerwaveMainWindow(QMainWindow):
                 nominal_hz=nominal_hz,
             )
             if result is not None and len(result.events) > 1:
+                self._last_suggestion_protection = result
                 self._protection_timing_widget.load_timing(result)
                 self._protection_dock.show()
             else:
+                self._last_suggestion_protection = None
                 self._protection_timing_widget.clear_timing()
         except Exception:  # noqa: BLE001
+            self._last_suggestion_protection = None
             self._protection_timing_widget.clear_timing()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1015,6 +1041,7 @@ class PowerwaveMainWindow(QMainWindow):
 
             results = correlate_all_pairs(sources_data, max_lag_s=10.0)
             if results:
+                self._last_suggestion_correlation = results
                 self._correlation_widget.load_results(results)
                 self._correlation_dock.show()
 
@@ -1022,8 +1049,12 @@ class PowerwaveMainWindow(QMainWindow):
                 if self._active_session is not None:
                     self._apply_correlation_offsets(results)
             else:
+                self._last_suggestion_correlation = []
                 self._correlation_widget.clear_results()
+            # Refresh suggestions now that correlation results are available
+            QTimer.singleShot(0, self._run_suggestions)
         except Exception:  # noqa: BLE001
+            self._last_suggestion_correlation = []
             self._correlation_widget.clear_results()
 
     def _apply_correlation_offsets(self, results: list) -> None:
@@ -1054,6 +1085,90 @@ class PowerwaveMainWindow(QMainWindow):
                     )
             except Exception:  # noqa: BLE001
                 pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Contextual suggestion bar (Phase 8 Enhancement)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_suggestion_dock(self):
+        from PyQt6.QtWidgets import QDockWidget, QWidget
+        dock = QDockWidget("Suggestions", self)
+        dock.setObjectName("SuggestionBarDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.TopDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea
+        )
+        # Hide the title bar so the dock appears as a seamless banner strip
+        dock.setTitleBarWidget(QWidget())
+        self._suggestion_widget = SuggestionBar()
+        self._suggestion_widget.action_requested.connect(self._on_suggestion_action)
+        self._suggestion_widget.all_dismissed.connect(lambda: dock.hide())
+        dock.setWidget(self._suggestion_widget)
+        dock.setMaximumHeight(48)
+        return dock
+
+    def _build_suggestion_action_map(self) -> dict:
+        """Return mapping from action_id to callable."""
+        return {
+            "enable_rms": lambda: self._on_rms_mode_changed(RMSDisplayMode.OVERLAY),
+            "enable_phasors": lambda: self._on_phasor_display_mode_changed(
+                PhasorDisplayMode.SEQUENCE_COMPONENTS
+            ),
+            "enable_harmonics": lambda: self._on_harmonic_display_mode_changed(
+                HarmonicDisplayMode.SPECTRUM
+            ),
+            "enable_frequency": lambda: None,  # frequency display not yet toggleable via mode
+            "show_quality": lambda: self._quality_dock.show(),
+            "show_fault": lambda: self._fault_dock.show(),
+            "show_protection": lambda: self._protection_dock.show(),
+            "show_correlation": lambda: self._correlation_dock.show(),
+            "auto_align": self._on_suggestion_auto_align,
+        }
+
+    def _on_suggestion_action(self, action_id: str) -> None:
+        action_map = self._build_suggestion_action_map()
+        action = action_map.get(action_id)
+        if action is not None:
+            try:
+                action()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_suggestion_auto_align(self) -> None:
+        """Trigger auto-align on the active session (used by suggestion bar)."""
+        if self._active_session is None:
+            return
+        targets = list(self._active_session.sources)
+        if len(targets) >= 2:
+            QTimer.singleShot(0, lambda t=targets: self._run_cross_correlation(t))
+
+    def _run_suggestions(self) -> None:
+        """Build suggestion context from cached analytics results and refresh bar."""
+        try:
+            ctx = SuggestionContext(
+                events=self._last_suggestion_events,
+                quality=self._quality_fingerprint,
+                fault=self._last_suggestion_fault,
+                protection=self._last_suggestion_protection,
+                correlation_results=self._last_suggestion_correlation,
+                is_multi_source=self._active_session is not None,
+                rms_active=(self._rms_display_mode != RMSDisplayMode.OFF),
+                phasors_active=(
+                    self._phasor_registry.display_mode != PhasorDisplayMode.OFF
+                ),
+                harmonics_active=(
+                    self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF
+                ),
+                quality_dock_visible=self._quality_dock.isVisible(),
+                fault_dock_visible=self._fault_dock.isVisible(),
+                protection_dock_visible=self._protection_dock.isVisible(),
+                correlation_dock_visible=self._correlation_dock.isVisible(),
+            )
+            suggestions = generate_suggestions(ctx)
+            if suggestions:
+                self._suggestion_widget.load_suggestions(suggestions)
+                self._suggestion_dock.show()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Menu
@@ -1181,6 +1296,7 @@ class PowerwaveMainWindow(QMainWindow):
         view_menu.addAction(self._fault_dock.toggleViewAction())
         view_menu.addAction(self._protection_dock.toggleViewAction())
         view_menu.addAction(self._correlation_dock.toggleViewAction())
+        view_menu.addAction(self._suggestion_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
