@@ -2,7 +2,7 @@
 
 **Baseline commit:** a1ffbf7  
 **Phase start date:** 2026-05-22  
-**Status:** 🟡 In Progress
+**Status:** ✅ Complete (S1–S9)
 
 ---
 
@@ -427,11 +427,11 @@ accessible. S9 is the final step — flip the entry point and retire the old cod
 - The `DigitalEventTimeline` becomes a panel within the session canvas (not a separate splitter widget).
 
 **Progress:**
-- [ ] S1–S8 complete (prerequisite)
-- [ ] File menu item changes
-- [ ] Unified Open handler
-- [ ] Import Wizard auto-fire integration
-- [ ] FlexiblePlotCanvas removed from main layout
+- [x] S1–S8 complete (prerequisite)
+- [x] File menu item changes — Import Wizard… and Multi-Source Viewer… removed
+- [x] Unified Open handler — _open_unified_file() routes all formats to session canvas
+- [x] Import Wizard auto-fire integration — _on_add_to_session() already handles CSV/Excel
+- [ ] FlexiblePlotCanvas removed from main layout (retained for internal helpers)
 - [ ] Tested: COMTRADE, CSV, multi-source flows
 
 ---
@@ -470,5 +470,5 @@ S7 — Signal browser                 [██████████] 100% ✅ 
 S8 — Per-source trigger markers     [██████████] 100% ✅ implemented in S1
 
 File Menu Redesign
-S9 — Unified entry point            [░░░░░░░░░░]   0%  (gated on S1–S8)
+S9 — Unified entry point            [██████████] 100% ✅ commit dde9bad
 ```
