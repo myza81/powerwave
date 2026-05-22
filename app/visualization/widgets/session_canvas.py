@@ -260,6 +260,7 @@ class SessionCanvasWidget(QWidget):
         self._rms_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # S2
         self._rms_raw_hidden: set[tuple[str, str]] = set()             # S2
         self._phasor_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # S3
+        self._harmonic_curves: dict[tuple[str, str], dict[int, pg.PlotDataItem]] = {}  # S4
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
 
         self._build_ui()
@@ -500,6 +501,10 @@ class SessionCanvasWidget(QWidget):
         phasor_stale = [k for k in self._phasor_curves if k[0] == source_id]
         for key in phasor_stale:
             self.remove_phasor_curve(key[0], key[1])
+        # Clean up harmonic overlay curves for this source (S4)
+        harmonic_stale = [k for k in self._harmonic_curves if k[0] == source_id]
+        for key in harmonic_stale:
+            self.remove_harmonic_curves(key[0], key[1])
         self.legend.remove_source_rows(source_id)
         self.remove_zero_line(source_id)
         self.remove_trigger_marker(source_id)
@@ -731,6 +736,88 @@ class SessionCanvasWidget(QWidget):
         self._phasor_curves.clear()
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Harmonic magnitude overlay curves (S4)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def update_harmonic_curves(
+        self,
+        source_id: str,
+        channel_name: str,
+        harmonic_time: np.ndarray,
+        magnitudes_by_order: dict[int, np.ndarray],
+    ) -> None:
+        """Add or update per-order harmonic magnitude overlays for one channel.
+
+        Each harmonic order gets its own solid-line curve drawn via
+        ``harmonic_order_pen(order)`` — colours are order-fixed and consistent
+        across all sources.  The curves share the ViewBox of the raw waveform.
+        """
+        from app.visualization.overlays.overlay_colors import harmonic_order_pen
+        key = (source_id, channel_name)
+        meta = self._metadata.get(key)
+        vb = self._resolve_viewbox(
+            meta.y_axis_side if meta else "left",
+            meta.unit if meta else None,
+            meta.colour if meta else "#AAAAAA",
+        )
+
+        if key not in self._harmonic_curves:
+            self._harmonic_curves[key] = {}
+        order_curves = self._harmonic_curves[key]
+
+        for order, mag_arr in magnitudes_by_order.items():
+            if order not in order_curves:
+                curve = pg.PlotDataItem(
+                    pen=harmonic_order_pen(order),
+                    skipFiniteCheck=True,
+                )
+                curve.setClipToView(True)
+                vb.addItem(curve)
+                order_curves[order] = curve
+
+            h_curve = order_curves[order]
+            if len(harmonic_time) > 0 and len(mag_arr) > 0:
+                h_curve.setData(x=harmonic_time, y=mag_arr)
+            else:
+                h_curve.setData(x=np.array([]), y=np.array([]))
+            h_curve.setVisible(True)
+
+        # Remove curves for orders no longer in magnitudes_by_order
+        for order in list(order_curves):
+            if order not in magnitudes_by_order:
+                stale = order_curves.pop(order)
+                try:
+                    stale_vb = stale.getViewBox()
+                    if stale_vb is not None:
+                        stale_vb.removeItem(stale)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def remove_harmonic_curves(self, source_id: str, channel_name: str) -> None:
+        """Remove all harmonic order curves for one channel."""
+        key = (source_id, channel_name)
+        order_curves = self._harmonic_curves.pop(key, {})
+        for curve in order_curves.values():
+            try:
+                vb = curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(curve)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def clear_harmonic_curves(self) -> None:
+        """Remove all harmonic overlay curves for all channels."""
+        for order_curves in self._harmonic_curves.values():
+            for curve in order_curves.values():
+                try:
+                    vb = curve.getViewBox()
+                    if vb is not None:
+                        vb.removeItem(curve)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._harmonic_curves.clear()
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Panel metadata & housekeeping
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -775,6 +862,16 @@ class SessionCanvasWidget(QWidget):
             except Exception:  # noqa: BLE001
                 pass
         self._phasor_curves.clear()
+        # Harmonic overlays (S4)
+        for order_curves in self._harmonic_curves.values():
+            for curve in order_curves.values():
+                try:
+                    vb = curve.getViewBox()
+                    if vb is not None:
+                        vb.removeItem(curve)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._harmonic_curves.clear()
         for key, curve in list(self._curves.items()):
             meta = self._metadata.get(key)
             vb = self._resolve_viewbox(

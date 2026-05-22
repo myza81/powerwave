@@ -2328,6 +2328,18 @@ class PowerwaveMainWindow(QMainWindow):
         SPECTRUM          — hides magnitude overlays; shows harmonic_spectrum panels.
         OFF               — removes magnitude overlays; hides all harmonic panels.
         """
+        if (
+            self._session_canvas_active
+            and self._session_canvas_controller is not None
+            and self._active_session is not None
+        ):
+            self._session_canvas_controller.set_harmonic_mode(
+                self._harmonic_registry.display_mode,
+                self._active_session,
+                config=self._harmonic_registry.config,
+            )
+            return
+
         mode = self._harmonic_registry.display_mode
 
         # Gather waveform canvases (exclude harmonic analysis panels)

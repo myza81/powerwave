@@ -27,6 +27,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QSplitter, QWidget
 
+from app.analytics.harmonics.harmonic_models import HarmonicConfig, HarmonicDisplayMode
 from app.analytics.phasors.phasor_models import PhasorConfig, PhasorDisplayMode
 from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode
 from app.visualization.widgets.session_canvas import SessionCanvasWidget
@@ -115,6 +116,9 @@ class SessionCanvasController:
         self._rms_config: RMSConfig = RMSConfig()            # S2
         self._phasor_mode: PhasorDisplayMode = PhasorDisplayMode.OFF  # S3
         self._phasor_config: PhasorConfig = PhasorConfig()            # S3
+        self._harmonic_mode: HarmonicDisplayMode = HarmonicDisplayMode.OFF  # S4
+        self._harmonic_config: HarmonicConfig = HarmonicConfig()            # S4
+        self._harmonic_orders: list[int] = [3, 5, 7, 11, 13]               # S4
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
@@ -252,6 +256,8 @@ class SessionCanvasController:
             self._refresh_rms_overlays(session)
         if self._phasor_mode not in (PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS):
             self._refresh_phasor_overlays(session)
+        if self._harmonic_mode == HarmonicDisplayMode.HARMONIC_MAGNITUDE:
+            self._refresh_harmonic_overlays(session)
 
     def on_channel_visibility_changed(
         self,
@@ -516,6 +522,10 @@ class SessionCanvasController:
         if self._phasor_mode not in (PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS):
             self._compute_phasor_for_panel(canvas, panel, session, all_channels, sources_by_id, t_start, t_end)
 
+        # S4: compute harmonic magnitude overlays for this panel
+        if self._harmonic_mode == HarmonicDisplayMode.HARMONIC_MAGNITUDE:
+            self._compute_harmonic_for_panel(canvas, panel, session, all_channels, sources_by_id, t_start, t_end)
+
     def _refresh_zero_lines(self, session) -> None:
         sources_by_id = {s.source_id: s for s in session.list_sources()}
         for canvas in self._canvases.values():
@@ -770,6 +780,104 @@ class SessionCanvasController:
                 canvas.update_phasor_curve(
                     source_id, channel_name, phasor_t, phasor_vals, color, mode
                 )
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Harmonic magnitude overlay (S4)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_harmonic_mode(
+        self,
+        mode: HarmonicDisplayMode,
+        session,
+        *,
+        config: HarmonicConfig | None = None,
+    ) -> None:
+        """Enable or disable harmonic magnitude overlay on all session canvas panels.
+
+        Only HARMONIC_MAGNITUDE produces in-panel curves.  THD, SPECTRUM and OFF
+        all clear any existing harmonic overlays — the session canvas controller
+        does not manage separate THD/spectrum panels.
+        """
+        self._harmonic_mode = mode
+        if config is not None:
+            self._harmonic_config = config
+
+        if mode != HarmonicDisplayMode.HARMONIC_MAGNITUDE:
+            for canvas in self._canvases.values():
+                canvas.clear_harmonic_curves()
+            return
+
+        self._refresh_harmonic_overlays(session)
+
+    def _refresh_harmonic_overlays(self, session) -> None:
+        """Recompute harmonic overlays for all panels using the current mode/config."""
+        if self._harmonic_mode != HarmonicDisplayMode.HARMONIC_MAGNITUDE:
+            return
+        t_start, t_end = _session_window(session)
+        all_channels = self._channel_lookup(session)
+        sources_by_id = {s.source_id: s for s in session.list_sources()}
+        panels = {p.panel_id: p for p in session.list_panels()}
+        for panel_id, canvas in self._canvases.items():
+            panel = panels.get(panel_id)
+            if panel is None:
+                continue
+            self._compute_harmonic_for_panel(
+                canvas, panel, session, all_channels, sources_by_id, t_start, t_end
+            )
+
+    def _compute_harmonic_for_panel(
+        self,
+        canvas: SessionCanvasWidget,
+        panel,
+        session,
+        all_channels: dict,
+        sources_by_id: dict,
+        t_start: float,
+        t_end: float,
+    ) -> None:
+        """Compute H3/H5/H7/H11/H13 magnitude overlays for eligible channels in one panel."""
+        from app.analytics.harmonics.harmonic_extraction import (
+            compute_harmonic_window_samples,
+            extract_harmonics,
+        )
+        from app.analytics.harmonics.harmonic_models import HarmonicChannelRole
+        from app.analytics.harmonics.harmonic_overlay import classify_harmonic_role
+
+        for source_id, channel_name in panel.channel_refs:
+            source = sources_by_id.get(source_id)
+            if source is None or not source.is_active:
+                continue
+            ch = all_channels.get((source_id, channel_name))
+            if ch is not None and not ch.is_visible:
+                continue
+
+            try:
+                sample_rate = self._estimate_sample_rate(source)
+                if sample_rate <= 0:
+                    continue
+                aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
+                role = classify_harmonic_role(channel_name, aligned.unit).role
+                if role == HarmonicChannelRole.UNKNOWN:
+                    continue
+                h_result = extract_harmonics(
+                    aligned.values, sample_rate, self._harmonic_config,
+                    time=aligned.time,
+                )
+                if h_result.n_windows == 0:
+                    continue
+                magnitudes_by_order: dict[int, np.ndarray] = {}
+                for order in self._harmonic_orders:
+                    mag = h_result.get_magnitude(order)
+                    if mag is not None:
+                        magnitudes_by_order[order] = mag
+                if magnitudes_by_order:
+                    canvas.update_harmonic_curves(
+                        source_id, channel_name,
+                        h_result.harmonic_time,
+                        magnitudes_by_order,
+                    )
             except Exception:  # noqa: BLE001
                 pass
 
