@@ -56,6 +56,8 @@ from app.ui.widgets.event_list_panel import EventListPanel
 from app.ui.widgets.cursor_readout_bar import CursorReadoutBar
 from app.ui.widgets.quality_report_panel import QualityReportPanel
 from app.analytics.quality import RecordQuality, compute_quality_fingerprint
+from app.ui.widgets.fault_summary_panel import FaultSummaryPanel
+from app.analytics.fault import classify_fault_from_events
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -394,6 +396,9 @@ class PowerwaveMainWindow(QMainWindow):
         self._quality_fingerprint: RecordQuality | None = None
         self._quality_dock = self._build_quality_dock()
 
+        # Fault characterisation (Phase 5 Enhancement)
+        self._fault_dock = self._build_fault_dock()
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
@@ -405,6 +410,8 @@ class PowerwaveMainWindow(QMainWindow):
         self._cursor_readout_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._quality_dock)
         self._quality_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._fault_dock)
+        self._fault_dock.hide()
         self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
         self._canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
         self._build_menu()
@@ -505,6 +512,7 @@ class PowerwaveMainWindow(QMainWindow):
         self._panel_canvases = {}
         self._grouped_timeline = None
         self._quality_fingerprint = None
+        self._fault_summary_widget.clear_fault()
         self._refresh_signal_browser()
         if self.isVisible() and not self._x_axis_linked:
             QTimer.singleShot(0, self._link_standard_x_axis)
@@ -730,6 +738,9 @@ class PowerwaveMainWindow(QMainWindow):
         if events:
             self._event_dock.show()
 
+        # Fault characterisation (Phase 5) — runs on the same data already in scope
+        self._run_fault_characterisation(record, events, time, data_by_channel, nominal)
+
     def _on_event_selected(self, t_start: float) -> None:
         """Jump the canvas viewport to a detected event."""
         window = 0.1  # ±100 ms around the event start
@@ -809,6 +820,43 @@ class PowerwaveMainWindow(QMainWindow):
                 self._quality_dock.show()
         except Exception:  # noqa: BLE001
             pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Fault characterisation dock (Phase 5 Enhancement)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_fault_dock(self):
+        from PyQt6.QtWidgets import QDockWidget
+        dock = QDockWidget("Fault Characterisation", self)
+        dock.setObjectName("FaultCharacterisationDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self._fault_summary_widget = FaultSummaryPanel()
+        dock.setWidget(self._fault_summary_widget)
+        return dock
+
+    def _run_fault_characterisation(
+        self,
+        record,
+        events: list,
+        time,
+        data_by_channel: dict,
+        nominal_hz: float,
+    ) -> None:
+        """Classify fault type from detected events and show the summary dock."""
+        try:
+            result = classify_fault_from_events(
+                events, time, data_by_channel, record.analog_channels,
+                nominal_hz=nominal_hz,
+            )
+            if result is not None:
+                self._fault_summary_widget.load_fault(result)
+                self._fault_dock.show()
+            else:
+                self._fault_summary_widget.clear_fault()
+        except Exception:  # noqa: BLE001
+            self._fault_summary_widget.clear_fault()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Menu
@@ -933,6 +981,7 @@ class PowerwaveMainWindow(QMainWindow):
         view_menu.addAction(self._event_dock.toggleViewAction())
         view_menu.addAction(self._cursor_readout_dock.toggleViewAction())
         view_menu.addAction(self._quality_dock.toggleViewAction())
+        view_menu.addAction(self._fault_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
