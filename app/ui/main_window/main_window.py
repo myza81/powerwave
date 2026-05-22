@@ -60,6 +60,8 @@ from app.ui.widgets.fault_summary_panel import FaultSummaryPanel
 from app.analytics.fault import classify_fault_from_events
 from app.ui.widgets.protection_timing_panel import ProtectionTimingPanel
 from app.analytics.protection import extract_protection_timing
+from app.ui.widgets.correlation_report_panel import CorrelationReportPanel
+from app.analytics.correlation import correlate_all_pairs
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -404,6 +406,9 @@ class PowerwaveMainWindow(QMainWindow):
         # Protection timing (Phase 6 Enhancement)
         self._protection_dock = self._build_protection_dock()
 
+        # Cross-source correlation (Phase 7 Enhancement)
+        self._correlation_dock = self._build_correlation_dock()
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
@@ -419,6 +424,8 @@ class PowerwaveMainWindow(QMainWindow):
         self._fault_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._protection_dock)
         self._protection_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._correlation_dock)
+        self._correlation_dock.hide()
         self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
         self._canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
         self._build_menu()
@@ -521,6 +528,7 @@ class PowerwaveMainWindow(QMainWindow):
         self._quality_fingerprint = None
         self._fault_summary_widget.clear_fault()
         self._protection_timing_widget.clear_timing()
+        self._correlation_widget.clear_results()
         self._refresh_signal_browser()
         if self.isVisible() and not self._x_axis_linked:
             QTimer.singleShot(0, self._link_standard_x_axis)
@@ -922,6 +930,132 @@ class PowerwaveMainWindow(QMainWindow):
             self._protection_timing_widget.clear_timing()
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Cross-source correlation dock (Phase 7 Enhancement)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_correlation_dock(self):
+        from PyQt6.QtWidgets import QDockWidget
+        dock = QDockWidget("Source Correlation", self)
+        dock.setObjectName("CorrelationReportDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self._correlation_widget = CorrelationReportPanel()
+        dock.setWidget(self._correlation_widget)
+        dock.setMinimumHeight(150)
+        return dock
+
+    def _run_cross_correlation(self, sources: list) -> None:
+        """Compute pairwise cross-correlations for a multi-source set.
+
+        Args:
+            sources: list of SourceRecord or SessionSource objects.
+                     Each must have .source_id and .record attributes.
+        """
+        import numpy as np
+        from app.analytics.events.event_detector import _infer_role  # noqa: PLC0415
+
+        if len(sources) < 2:
+            self._correlation_widget.clear_results()
+            return
+
+        def _best_channel(record) -> tuple[str, np.ndarray, np.ndarray] | None:
+            """Return (source_id, time, data) for the best voltage or current channel."""
+            wf = record.waveform_data
+            if "time" not in wf.columns or wf.empty:
+                return None
+            time = wf["time"].to_numpy(dtype=float)
+
+            # Try voltage first, then current, then highest-RMS analog
+            for preferred_role in ("voltage", "current"):
+                best_rms = -1.0
+                best_name = None
+                best_data = None
+                for ch in record.analog_channels:
+                    role = _infer_role(ch.name, getattr(ch, "unit", "") or "")
+                    if role != preferred_role:
+                        continue
+                    if ch.name not in wf.columns:
+                        continue
+                    data = wf[ch.name].to_numpy(dtype=float)
+                    rms = float(np.sqrt(np.nanmean(data ** 2)))
+                    if rms > best_rms:
+                        best_rms = rms
+                        best_name = ch.name
+                        best_data = data
+                if best_name is not None:
+                    return best_name, time, best_data
+
+            # Fallback: any analog channel with highest RMS
+            best_rms = -1.0
+            best_name = None
+            best_data = None
+            for ch in record.analog_channels:
+                if ch.name not in wf.columns:
+                    continue
+                data = wf[ch.name].to_numpy(dtype=float)
+                rms = float(np.sqrt(np.nanmean(data ** 2)))
+                if rms > best_rms:
+                    best_rms = rms
+                    best_name = ch.name
+                    best_data = data
+            return (best_name, time, best_data) if best_name else None
+
+        try:
+            sources_data: list[tuple[str, np.ndarray, np.ndarray, str]] = []
+            for src in sources:
+                result = _best_channel(src.record)
+                if result is not None:
+                    ch_name, t, d = result
+                    sources_data.append((src.source_id, t, d, ch_name))
+
+            if len(sources_data) < 2:
+                self._correlation_widget.clear_results()
+                return
+
+            results = correlate_all_pairs(sources_data, max_lag_s=10.0)
+            if results:
+                self._correlation_widget.load_results(results)
+                self._correlation_dock.show()
+
+                # Auto-apply high-confidence offsets to EventAnalysisSession
+                if self._active_session is not None:
+                    self._apply_correlation_offsets(results)
+            else:
+                self._correlation_widget.clear_results()
+        except Exception:  # noqa: BLE001
+            self._correlation_widget.clear_results()
+
+    def _apply_correlation_offsets(self, results: list) -> None:
+        """Apply high-confidence correlation offsets to the active session."""
+        if self._active_session is None:
+            return
+        for res in results:
+            if not res.same_event_likely or res.confidence < 0.70:
+                continue
+            try:
+                self._active_session.set_time_offset(
+                    res.source_b_id,
+                    res.suggested_offset_s,
+                    method="correlation",
+                    confidence=res.confidence,
+                )
+                self._active_session.set_alignment_notes(
+                    res.source_b_id,
+                    f"Auto-aligned via cross-correlation against '{res.source_a_id}' "
+                    f"(coeff={res.correlation_coeff:.3f}, lag={res.lag_ms:+.2f} ms)",
+                )
+                self._refresh_session_source_row(res.source_b_id)
+                if self._session_canvas_active and self._session_canvas_controller is not None:
+                    self._session_canvas_controller.on_offset_changed(
+                        res.source_b_id,
+                        res.suggested_offset_s,
+                        self._active_session,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Menu
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1046,6 +1180,7 @@ class PowerwaveMainWindow(QMainWindow):
         view_menu.addAction(self._quality_dock.toggleViewAction())
         view_menu.addAction(self._fault_dock.toggleViewAction())
         view_menu.addAction(self._protection_dock.toggleViewAction())
+        view_menu.addAction(self._correlation_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
@@ -1546,6 +1681,8 @@ class PowerwaveMainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Multi-source session: {n} panel(s) from {session.source_count()} source(s)"
         )
+        # Cross-source correlation (Phase 7)
+        QTimer.singleShot(0, lambda s=session: self._run_cross_correlation(s.sources))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Synthetic mixed display (Phase D2)
@@ -2609,6 +2746,10 @@ class PowerwaveMainWindow(QMainWindow):
 
         n = len(results)
         self.statusBar().showMessage(f"Auto-aligned {n} source(s).")
+
+        # Cross-correlation pass (Phase 7) — runs after trigger-based alignment
+        if source_id == "all" and len(targets) >= 2:
+            QTimer.singleShot(0, lambda t=targets: self._run_cross_correlation(t))
 
     def _refresh_session_source_row(self, source_id: str) -> None:
         """Pull current state from the session and refresh the corresponding panel row."""
