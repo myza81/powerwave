@@ -27,6 +27,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QSplitter, QWidget
 
+from app.analytics.phasors.phasor_models import PhasorConfig, PhasorDisplayMode
 from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode
 from app.visualization.widgets.session_canvas import SessionCanvasWidget
 from app.ui.session.legend_widget import generate_source_variant_colour
@@ -112,6 +113,8 @@ class SessionCanvasController:
         self._legend_visible: bool = True
         self._rms_mode: RMSDisplayMode = RMSDisplayMode.OFF  # S2
         self._rms_config: RMSConfig = RMSConfig()            # S2
+        self._phasor_mode: PhasorDisplayMode = PhasorDisplayMode.OFF  # S3
+        self._phasor_config: PhasorConfig = PhasorConfig()            # S3
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
@@ -247,6 +250,8 @@ class SessionCanvasController:
         self._refresh_trigger_markers(session)
         if self._rms_mode != RMSDisplayMode.OFF:
             self._refresh_rms_overlays(session)
+        if self._phasor_mode not in (PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS):
+            self._refresh_phasor_overlays(session)
 
     def on_channel_visibility_changed(
         self,
@@ -507,6 +512,10 @@ class SessionCanvasController:
         if self._rms_mode != RMSDisplayMode.OFF:
             self._compute_rms_for_panel(canvas, panel, session, all_channels, sources_by_id, t_start, t_end)
 
+        # S3: compute phasor overlays for this panel after all raw curves are updated
+        if self._phasor_mode not in (PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS):
+            self._compute_phasor_for_panel(canvas, panel, session, all_channels, sources_by_id, t_start, t_end)
+
     def _refresh_zero_lines(self, session) -> None:
         sources_by_id = {s.source_id: s for s in session.list_sources()}
         for canvas in self._canvases.values():
@@ -663,6 +672,103 @@ class SessionCanvasController:
                 canvas.update_rms_curve(
                     source_id, channel_name, rms_t, rms_d, color,
                     unit=aligned.unit, rms_only=rms_only,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phasor overlay (S3)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_phasor_mode(
+        self,
+        mode: PhasorDisplayMode,
+        session,
+        *,
+        config: PhasorConfig | None = None,
+    ) -> None:
+        """Enable or disable phasor magnitude/angle overlay on all session canvas panels.
+
+        OFF / SEQUENCE_COMPONENTS — in-panel overlays cleared (sequence panels
+                                    are not managed by the session canvas controller).
+        MAGNITUDE — RMS magnitude envelope drawn as a dotted brighter curve.
+        ANGLE     — Phase angle trace drawn as a dash-dot cyan-shifted curve.
+        """
+        self._phasor_mode = mode
+        if config is not None:
+            self._phasor_config = config
+
+        if mode in (PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS):
+            for canvas in self._canvases.values():
+                canvas.clear_phasor_curves()
+            return
+
+        self._refresh_phasor_overlays(session)
+
+    def _refresh_phasor_overlays(self, session) -> None:
+        """Recompute phasor overlays for all panels using the current mode/config."""
+        if self._phasor_mode in (PhasorDisplayMode.OFF, PhasorDisplayMode.SEQUENCE_COMPONENTS):
+            return
+        t_start, t_end = _session_window(session)
+        all_channels = self._channel_lookup(session)
+        sources_by_id = {s.source_id: s for s in session.list_sources()}
+        panels = {p.panel_id: p for p in session.list_panels()}
+        for panel_id, canvas in self._canvases.items():
+            panel = panels.get(panel_id)
+            if panel is None:
+                continue
+            self._compute_phasor_for_panel(
+                canvas, panel, session, all_channels, sources_by_id, t_start, t_end
+            )
+
+    def _compute_phasor_for_panel(
+        self,
+        canvas: SessionCanvasWidget,
+        panel,
+        session,
+        all_channels: dict,
+        sources_by_id: dict,
+        t_start: float,
+        t_end: float,
+    ) -> None:
+        """Compute phasor magnitude/angle overlay for eligible channels in one panel."""
+        from app.analytics.phasors.phasor_extraction import (
+            compute_phasor_window_samples,  # noqa: F401 — ensures import chain is valid
+            extract_phasor,
+        )
+        from app.analytics.phasors.phasor_models import PhasorChannelRole
+        from app.analytics.phasors.phasor_overlay import classify_phasor_role
+
+        mode = self._phasor_mode
+
+        for source_id, channel_name in panel.channel_refs:
+            source = sources_by_id.get(source_id)
+            if source is None or not source.is_active:
+                continue
+            ch = all_channels.get((source_id, channel_name))
+            if ch is not None and not ch.is_visible:
+                continue
+
+            try:
+                sample_rate = self._estimate_sample_rate(source)
+                if sample_rate <= 0:
+                    continue
+                aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
+                result = classify_phasor_role(channel_name, aligned.unit)
+                if result.role == PhasorChannelRole.UNKNOWN:
+                    continue
+                phasor_t, mag_rms, angle_deg, _ = extract_phasor(
+                    aligned.time, aligned.values, sample_rate, self._phasor_config
+                )
+                phasor_vals = (
+                    mag_rms if mode == PhasorDisplayMode.MAGNITUDE else angle_deg
+                )
+                color = (
+                    (ch.color_hex if (ch and ch.color_hex) else None)
+                    or self._auto_colour(source_id, channel_name)
+                )
+                canvas.update_phasor_curve(
+                    source_id, channel_name, phasor_t, phasor_vals, color, mode
                 )
             except Exception:  # noqa: BLE001
                 pass

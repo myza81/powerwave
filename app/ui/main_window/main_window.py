@@ -2125,6 +2125,18 @@ class PowerwaveMainWindow(QMainWindow):
         OFF                — calls set_phasor_display_mode(OFF) on all waveform
                              canvases and hides sequence panels.
         """
+        if (
+            self._session_canvas_active
+            and self._session_canvas_controller is not None
+            and self._active_session is not None
+        ):
+            self._session_canvas_controller.set_phasor_mode(
+                self._phasor_registry.display_mode,
+                self._active_session,
+                config=self._phasor_registry.config,
+            )
+            return
+
         mode = self._phasor_registry.display_mode
 
         def _is_sequence_key(k: str) -> bool:

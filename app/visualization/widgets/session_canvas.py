@@ -196,6 +196,20 @@ def _rms_pen_color(hex_color: str) -> str:
     return f"#{r2:02X}{g2:02X}{b2:02X}"
 
 
+def _phasor_mag_pen_color(hex_color: str) -> str:
+    """60 % blend toward white — brighter than RMS (40 %) for magnitude overlays."""
+    from app.analytics.phasors.phasor_models import PhasorDisplayMode
+    from app.visualization.overlays.overlay_colors import phasor_color
+    return phasor_color("", PhasorDisplayMode.MAGNITUDE, base_color=hex_color)
+
+
+def _phasor_angle_pen_color(hex_color: str) -> str:
+    """40 % blend toward cyan — distinguishable from raw and magnitude overlays."""
+    from app.analytics.phasors.phasor_models import PhasorDisplayMode
+    from app.visualization.overlays.overlay_colors import phasor_color
+    return phasor_color("", PhasorDisplayMode.ANGLE, base_color=hex_color)
+
+
 @dataclasses.dataclass
 class _CurveMetadata:
     source_id: str
@@ -245,6 +259,7 @@ class SessionCanvasWidget(QWidget):
         self._trigger_markers: dict[str, pg.InfiniteLine] = {}  # S1
         self._rms_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # S2
         self._rms_raw_hidden: set[tuple[str, str]] = set()             # S2
+        self._phasor_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # S3
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
 
         self._build_ui()
@@ -481,6 +496,10 @@ class SessionCanvasWidget(QWidget):
         rms_stale = [k for k in self._rms_curves if k[0] == source_id]
         for key in rms_stale:
             self.remove_rms_curve(key[0], key[1])
+        # Clean up phasor overlay curves for this source (S3)
+        phasor_stale = [k for k in self._phasor_curves if k[0] == source_id]
+        for key in phasor_stale:
+            self.remove_phasor_curve(key[0], key[1])
         self.legend.remove_source_rows(source_id)
         self.remove_zero_line(source_id)
         self.remove_trigger_marker(source_id)
@@ -638,6 +657,80 @@ class SessionCanvasWidget(QWidget):
         self._rms_raw_hidden.clear()
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Phasor overlay curves (S3)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def update_phasor_curve(
+        self,
+        source_id: str,
+        channel_name: str,
+        phasor_time: np.ndarray,
+        phasor_values: np.ndarray,
+        color: str,
+        mode,  # PhasorDisplayMode — imported locally to avoid top-level dep
+    ) -> None:
+        """Add or update a phasor magnitude/angle overlay for one channel.
+
+        Magnitude overlays use a dotted, brighter-white pen.
+        Angle overlays use a dash-dot, cyan-shifted pen.
+        Both are drawn in the same ViewBox as the raw waveform.
+        """
+        from app.analytics.phasors.phasor_models import PhasorDisplayMode
+        key = (source_id, channel_name)
+        if mode == PhasorDisplayMode.MAGNITUDE:
+            pen_color = _phasor_mag_pen_color(color)
+            pen_style = Qt.PenStyle.DotLine
+        else:  # ANGLE
+            pen_color = _phasor_angle_pen_color(color)
+            pen_style = Qt.PenStyle.DashDotLine
+        pen = pg.mkPen(pen_color, width=1.5, style=pen_style)
+
+        meta = self._metadata.get(key)
+        vb = self._resolve_viewbox(
+            meta.y_axis_side if meta else "left",
+            meta.unit if meta else None,
+            color,
+        )
+
+        if key not in self._phasor_curves:
+            curve = pg.PlotDataItem(pen=pen, skipFiniteCheck=True)
+            curve.setClipToView(True)
+            vb.addItem(curve)
+            self._phasor_curves[key] = curve
+        else:
+            self._phasor_curves[key].setPen(pen)
+
+        phasor_curve = self._phasor_curves[key]
+        if len(phasor_time) > 0 and len(phasor_values) > 0:
+            phasor_curve.setData(x=phasor_time, y=phasor_values)
+        else:
+            phasor_curve.setData(x=np.array([]), y=np.array([]))
+        phasor_curve.setVisible(True)
+
+    def remove_phasor_curve(self, source_id: str, channel_name: str) -> None:
+        """Remove the phasor overlay for one channel."""
+        key = (source_id, channel_name)
+        curve = self._phasor_curves.pop(key, None)
+        if curve is not None:
+            try:
+                vb = curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(curve)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def clear_phasor_curves(self) -> None:
+        """Remove all phasor overlay curves."""
+        for curve in list(self._phasor_curves.values()):
+            try:
+                vb = curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(curve)
+            except Exception:  # noqa: BLE001
+                pass
+        self._phasor_curves.clear()
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Panel metadata & housekeeping
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -673,6 +766,15 @@ class SessionCanvasWidget(QWidget):
                 pass
         self._rms_curves.clear()
         self._rms_raw_hidden.clear()
+        # Phasor overlays (S3)
+        for curve in self._phasor_curves.values():
+            try:
+                vb = curve.getViewBox()
+                if vb is not None:
+                    vb.removeItem(curve)
+            except Exception:  # noqa: BLE001
+                pass
+        self._phasor_curves.clear()
         for key, curve in list(self._curves.items()):
             meta = self._metadata.get(key)
             vb = self._resolve_viewbox(
