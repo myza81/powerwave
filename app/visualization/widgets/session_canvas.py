@@ -155,8 +155,12 @@ class _RightAxisManager:
     def clear(self) -> None:
         """Remove all secondary ViewBoxes and axes from the scene / layout."""
         for entry in self._entries.values():
-            if entry.viewbox.scene() is not None:
-                entry.viewbox.scene().removeItem(entry.viewbox)
+            try:
+                scene = entry.viewbox.scene()
+                if scene is not None:
+                    scene.removeItem(entry.viewbox)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 self._glw.removeItem(entry.axis_item)
             except Exception:  # noqa: BLE001
@@ -286,7 +290,8 @@ class SessionCanvasWidget(QWidget):
         # Main plot area: GraphicsLayoutWidget hosts PlotItem at col=0;
         # _RightAxisManager adds secondary AxisItems at col=1, 2, …
         self._datetime_axis = DatetimeAxisItem(orientation="bottom")
-        self._glw = pg.GraphicsLayoutWidget(background="#1E1E1E")
+        self._glw = pg.GraphicsLayoutWidget()
+        self._glw.setBackground("#1E1E1E")
         self._primary_plot: pg.PlotItem = self._glw.addPlot(
             row=0, col=0, axisItems={"bottom": self._datetime_axis}
         )
@@ -496,7 +501,10 @@ class SessionCanvasWidget(QWidget):
                 meta.unit if meta else None,
                 meta.colour if meta else "#AAAAAA",
             )
-            vb.removeItem(curve)
+            try:
+                vb.removeItem(curve)
+            except Exception:  # noqa: BLE001
+                pass
         # Clean up RMS overlay curves for this source
         rms_stale = [k for k in self._rms_curves if k[0] == source_id]
         for key in rms_stale:
@@ -978,11 +986,20 @@ class SessionCanvasWidget(QWidget):
                 meta.unit if meta else None,
                 meta.colour if meta else "#AAAAAA",
             )
-            vb.removeItem(curve)
+            try:
+                vb.removeItem(curve)
+            except Exception:  # noqa: BLE001
+                pass
         for line in self._zero_lines.values():
-            self._primary_plot.removeItem(line)
+            try:
+                self._primary_plot.removeItem(line)
+            except Exception:  # noqa: BLE001
+                pass
         for line in self._trigger_markers.values():
-            self._primary_plot.removeItem(line)
+            try:
+                self._primary_plot.removeItem(line)
+            except Exception:  # noqa: BLE001
+                pass
         self._curves.clear()
         self._zero_lines.clear()
         self._trigger_markers.clear()
