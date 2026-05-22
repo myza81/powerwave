@@ -223,17 +223,20 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-### Phase 5 — Fault Characterisation 🔴
+### Phase 5 — Fault Characterisation ✅ [COMPLETE — commit 848ac55]
 
 **Goal:** When a voltage dip or overcurrent is detected, run symmetrical components analysis and classify fault type.
 
-**Classification:** A-g, B-g, C-g, AB, BC, CA, ABg, BCg, CAg, ABC (3-phase)
+**Classification:** A-g, B-g, C-g, AB, BC, CA, AB-g, BC-g, CA-g, ABC, ABC-g
 
 **Uses existing:** `app/analytics/phasors/symmetrical_components.py`
 
 **Progress:**
-- [ ] Fault classifier
-- [ ] Fault summary panel
+- [x] `FaultType` enum + `FaultCharacterisation` dataclass
+- [x] `identify_voltage_phase_channels()` — heuristic A/B/C name matching
+- [x] `classify_fault_from_events()` — single-cycle DFT phasor at fault midpoint + Fortescue + per-phase depression
+- [x] `FaultSummaryPanel` — compact two-row dock with phase circles, ground symbol, V₁/V₂/V₀ readout
+- [x] Wired inside `_run_event_detection()`; auto-shows on classification
 
 ---
 
@@ -436,8 +439,8 @@ Phase 1 — Two-Cursor Measurement    [██████████] 100% ✅ 
 Phase 2 — Event Detection           [██████████] 100% ✅ commit 39a8f59
 Phase 3 — Live Value Readout        [██████████] 100% ✅ commit 7b38ab8
 Phase 4 — Data Quality Fingerprint  [██████████] 100% ✅ commit df923b9
-Phase 5 — Fault Characterisation    [░░░░░░░░░░]   0%  ← current
-Phase 6 — Protection Timing         [░░░░░░░░░░]   0%
+Phase 5 — Fault Characterisation    [██████████] 100% ✅ commit 848ac55
+Phase 6 — Protection Timing         [░░░░░░░░░░]   0%  ← current
 Phase 7 — Cross-Source Correlation  [░░░░░░░░░░]   0%
 Phase 8 — Contextual Suggestions    [░░░░░░░░░░]   0%
 
