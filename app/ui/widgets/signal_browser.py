@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QDockWidget, QTreeWidget, QTreeWidgetItem
 
 
@@ -17,6 +18,8 @@ class SignalBrowserEntry:
     name: str
     visible: bool
     kind: str = "analog"
+    quality_grade: str | None = None   # "ok" | "warn" | "error" | None
+    quality_tooltip: str = ""
 
 
 class SignalBrowserDock(QDockWidget):
@@ -69,6 +72,14 @@ class SignalBrowserDock(QDockWidget):
                     Qt.CheckState.Checked if entry.visible else Qt.CheckState.Unchecked,
                 )
                 item.setData(0, Qt.ItemDataRole.UserRole, entry.key)
+                if entry.quality_grade == "error":
+                    item.setForeground(0, QColor("#FF5555"))
+                elif entry.quality_grade == "warn":
+                    item.setForeground(0, QColor("#FFAA33"))
+                elif entry.quality_grade == "ok":
+                    item.setForeground(0, QColor("#55CC55"))
+                if entry.quality_tooltip:
+                    item.setToolTip(0, entry.quality_tooltip)
                 group_item.addChild(item)
 
             self._tree.expandAll()

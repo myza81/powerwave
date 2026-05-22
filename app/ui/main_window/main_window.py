@@ -54,6 +54,8 @@ from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
 from app.ui.widgets.measurement_panel import MeasurementPanel
 from app.ui.widgets.event_list_panel import EventListPanel
 from app.ui.widgets.cursor_readout_bar import CursorReadoutBar
+from app.ui.widgets.quality_report_panel import QualityReportPanel
+from app.analytics.quality import RecordQuality, compute_quality_fingerprint
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -388,6 +390,10 @@ class PowerwaveMainWindow(QMainWindow):
         # Cursor readout bar (Phase 3 Enhancement)
         self._cursor_readout_dock = self._build_cursor_readout_dock()
 
+        # Data quality fingerprint (Phase 4 Enhancement)
+        self._quality_fingerprint: RecordQuality | None = None
+        self._quality_dock = self._build_quality_dock()
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
@@ -397,6 +403,8 @@ class PowerwaveMainWindow(QMainWindow):
         self._event_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._cursor_readout_dock)
         self._cursor_readout_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._quality_dock)
+        self._quality_dock.hide()
         self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
         self._canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
         self._build_menu()
@@ -496,6 +504,7 @@ class PowerwaveMainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         self._panel_canvases = {}
         self._grouped_timeline = None
+        self._quality_fingerprint = None
         self._refresh_signal_browser()
         if self.isVisible() and not self._x_axis_linked:
             QTimer.singleShot(0, self._link_standard_x_axis)
@@ -763,6 +772,45 @@ class PowerwaveMainWindow(QMainWindow):
         self._cursor_readout_dock.show()
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Data quality dock (Phase 4 Enhancement)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_quality_dock(self):
+        from PyQt6.QtWidgets import QDockWidget
+        dock = QDockWidget("Data Quality", self)
+        dock.setObjectName("QualityReportDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self._quality_widget = QualityReportPanel()
+        dock.setWidget(self._quality_widget)
+        return dock
+
+    def _run_quality_check(self, record) -> None:
+        """Compute quality fingerprint for a loaded record and refresh the UI."""
+        try:
+            time = record.time
+            data_by_channel: dict[str, object] = {}
+            for ch in record.analog_channels:
+                data_by_channel[ch.name] = ch.samples
+            if not data_by_channel:
+                return
+            import numpy as np
+            time_arr = np.asarray(time, dtype=float)
+            data_arr = {k: np.asarray(v, dtype=float) for k, v in data_by_channel.items()}
+            result = compute_quality_fingerprint(time_arr, data_arr)
+            self._quality_fingerprint = result
+            self._quality_widget.load_quality(result)
+            # Refresh browser to apply grade colours
+            self._refresh_signal_browser()
+            # Auto-show dock if any issues were found
+            from app.analytics.quality import QualityGrade
+            if result.overall_grade != QualityGrade.OK:
+                self._quality_dock.show()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Menu
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -884,6 +932,7 @@ class PowerwaveMainWindow(QMainWindow):
         view_menu.addAction(self._measurement_dock.toggleViewAction())
         view_menu.addAction(self._event_dock.toggleViewAction())
         view_menu.addAction(self._cursor_readout_dock.toggleViewAction())
+        view_menu.addAction(self._quality_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
@@ -1138,6 +1187,7 @@ class PowerwaveMainWindow(QMainWindow):
                 QTimer.singleShot(0, self._link_standard_x_axis)
                 self._refresh_signal_browser()
                 QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
+                QTimer.singleShot(0, lambda r=record: self._run_quality_check(r))
                 self._show_cursor_readout()
                 self.statusBar().showMessage(_format_load_status(record))
                 title = (
@@ -1163,6 +1213,7 @@ class PowerwaveMainWindow(QMainWindow):
             QTimer.singleShot(0, self._link_standard_x_axis)
             self._refresh_signal_browser()
             QTimer.singleShot(0, lambda r=result: self._run_event_detection(r))
+            QTimer.singleShot(0, lambda r=result: self._run_quality_check(r))
             self._show_cursor_readout()
             self.statusBar().showMessage(_format_load_status(result))
             title = result.metadata.station_name or Path(result.metadata.source_file).name
@@ -1314,6 +1365,7 @@ class PowerwaveMainWindow(QMainWindow):
             QTimer.singleShot(0, self._apply_harmonic_display_mode)
 
         QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
+        QTimer.singleShot(0, lambda r=record: self._run_quality_check(r))
         self._show_cursor_readout()
         for canvas in panel_canvases.values():
             self._connect_canvas_readout(canvas)
@@ -2081,6 +2133,12 @@ class PowerwaveMainWindow(QMainWindow):
         ) -> None:
             key = f"signal-{len(targets)}"
             targets[key] = (kind, panel_key, name)
+            quality_grade: str | None = None
+            quality_tooltip: str = ""
+            if self._quality_fingerprint and name in self._quality_fingerprint.channels:
+                ch_q = self._quality_fingerprint.channels[name]
+                quality_grade = ch_q.grade.value
+                quality_tooltip = ch_q.tooltip
             entries.append(SignalBrowserEntry(
                 key=key,
                 source=source,
@@ -2088,6 +2146,8 @@ class PowerwaveMainWindow(QMainWindow):
                 name=name,
                 visible=visible,
                 kind=kind,
+                quality_grade=quality_grade,
+                quality_tooltip=quality_tooltip,
             ))
 
         if self._panel_canvases:
