@@ -222,6 +222,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._cursor_b: pg.InfiniteLine | None = None      # second measurement cursor
         self._measurement_mode: bool = False
         self._trigger_line: pg.InfiniteLine | None = None
+        self._event_markers: list[pg.InfiniteLine] = []   # Phase 2 detection markers
         self._reserved_right_axes: list[pg.AxisItem] = []
 
         # Engineering scaling state (Phase 5B)
@@ -614,6 +615,51 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             float(self._cursor_b.value()),
         )
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Event markers (Phase 2)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def add_event_markers(self, events: list) -> None:
+        """Place InfiniteLine markers on the canvas for each detected event.
+
+        Each event gets one marker at t_start colored by event type. An end
+        marker is also added when duration > 0.5 cycle (20ms) to bracket the
+        event region.
+        """
+        self.clear_event_markers()
+        for ev in events:
+            color = ev.event_type.color
+            label = ev.event_type.label
+            start_line = pg.InfiniteLine(
+                pos=ev.t_start,
+                angle=90,
+                movable=False,
+                pen=pg.mkPen(color, width=1.5, style=Qt.PenStyle.DashDotLine),
+                label=label,
+                labelOpts={"color": color, "position": 0.75},
+            )
+            self._primary_plot.addItem(start_line)
+            self._event_markers.append(start_line)
+
+            if ev.duration_ms > 20.0:
+                end_line = pg.InfiniteLine(
+                    pos=ev.t_end,
+                    angle=90,
+                    movable=False,
+                    pen=pg.mkPen(color, width=1.0, style=Qt.PenStyle.DotLine),
+                )
+                self._primary_plot.addItem(end_line)
+                self._event_markers.append(end_line)
+
+    def clear_event_markers(self) -> None:
+        """Remove all event marker lines from the canvas."""
+        for line in self._event_markers:
+            try:
+                self._primary_plot.removeItem(line)
+            except Exception:
+                pass
+        self._event_markers.clear()
+
     def _clear_canvas(self) -> None:
         """Remove all parameters, cursor, and trigger line. Reset to blank state.
 
@@ -663,6 +709,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._cursor = None
         self._cursor_b = None  # removed by PlotItem.clear() above
         self._trigger_line = None
+        self._event_markers.clear()  # items removed by PlotItem.clear() above
         self._curve_data_signatures.clear()
 
         # RMS overlay — curves removed by PlotItem.clear() / scene removeItem;
@@ -771,6 +818,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._cursor = None
         self._cursor_b = None  # removed by PlotItem.clear() above
         self._trigger_line = None
+        self._event_markers.clear()  # removed by PlotItem.clear() above
 
     def _rebuild_visible_channel_axes(self) -> None:
         """Rebuild visible axes without reloading or mutating waveform data."""

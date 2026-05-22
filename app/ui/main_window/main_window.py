@@ -52,6 +52,7 @@ from app.ui.import_wizard import ImportWizardDialog
 from app.ui.session import SessionCanvasController, SessionPanel
 from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
 from app.ui.widgets.measurement_panel import MeasurementPanel
+from app.ui.widgets.event_list_panel import EventListPanel
 
 _FILE_FILTER = (
     "Supported Files (*.cfg *.comtrade *.csv *.xlsx);;"
@@ -380,11 +381,16 @@ class PowerwaveMainWindow(QMainWindow):
         self._measurement_dock = self._build_measurement_dock()
         self._measurement_mode: bool = False
 
+        # Event list panel (Phase 2 Enhancement)
+        self._event_dock = self._build_event_dock()
+
         self._build_layout()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
         self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._measurement_dock)
         self._measurement_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._event_dock)
+        self._event_dock.hide()
         self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
         self._build_menu()
 
@@ -639,11 +645,87 @@ class PowerwaveMainWindow(QMainWindow):
     def _on_measurement_cursors_moved(self, t_a: float, t_b: float) -> None:
         result = self._canvas.compute_current_measurements()
         if result is None:
-            # Try panel canvases (grouped layout) — use the one that emitted
             sender_canvas = self.sender()
             if hasattr(sender_canvas, "compute_current_measurements"):
                 result = sender_canvas.compute_current_measurements()
         self._measurement_widget.update_measurements(result)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Event detection dock (Phase 2 Enhancement)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_event_dock(self):
+        from PyQt6.QtWidgets import QDockWidget
+        dock = QDockWidget("Detected Events", self)
+        dock.setObjectName("EventListDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self._event_list_widget = EventListPanel()
+        self._event_list_widget.event_selected.connect(self._on_event_selected)
+        dock.setWidget(self._event_list_widget)
+        dock.setMinimumHeight(140)
+        return dock
+
+    def _run_event_detection(self, record: "DisturbanceRecord") -> None:
+        """Classify channels, detect events, apply markers and populate event list."""
+        from app.analytics.events.event_detector import classify_channel_roles, detect_events
+        import numpy as np
+
+        try:
+            time = record.waveform_data["time"].to_numpy(dtype=np.float64)
+            roles = classify_channel_roles(record.analog_channels)
+            if not roles:
+                self._event_list_widget.clear()
+                self._canvas.clear_event_markers()
+                return
+
+            data_by_channel: dict[str, np.ndarray] = {
+                name: record.waveform_data[name].to_numpy(dtype=np.float64)
+                for name in roles
+                if name in record.waveform_data.columns
+            }
+
+            trigger_s = (
+                record.timing_info.trigger_time - record.timing_info.start_time
+            ).total_seconds()
+            nominal = getattr(record.sampling_info, "nominal_frequency", None)
+            try:
+                nominal = float(nominal) if nominal else 50.0
+            except (TypeError, ValueError):
+                nominal = 50.0
+
+            events = detect_events(
+                time, data_by_channel, roles,
+                trigger_time_s=trigger_s,
+                nominal_hz=nominal,
+            )
+        except Exception:
+            return
+
+        # Apply markers to all active canvases
+        self._canvas.add_event_markers(events)
+        for canvas in self._panel_canvases.values():
+            if self._qt_widget_alive(canvas):
+                canvas.add_event_markers(events)
+
+        # Populate list panel and show the dock if events were found
+        self._event_list_widget.load_events(events)
+        if events:
+            self._event_dock.show()
+
+    def _on_event_selected(self, t_start: float) -> None:
+        """Jump the canvas viewport to a detected event."""
+        window = 0.1  # ±100 ms around the event start
+        t_lo = t_start - window
+        t_hi = t_start + window
+        if self._panel_canvases:
+            for canvas in self._panel_canvases.values():
+                if self._qt_widget_alive(canvas):
+                    canvas._primary_plot.setXRange(t_lo, t_hi, padding=0)
+                    break
+        elif self._qt_widget_alive(self._canvas):
+            self._canvas._primary_plot.setXRange(t_lo, t_hi, padding=0)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Menu
@@ -765,6 +847,7 @@ class PowerwaveMainWindow(QMainWindow):
         )
         self._measurement_mode_action.toggled.connect(self._on_toggle_measurement_mode)
         view_menu.addAction(self._measurement_dock.toggleViewAction())
+        view_menu.addAction(self._event_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
         synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
@@ -1018,6 +1101,7 @@ class PowerwaveMainWindow(QMainWindow):
                 self._canvas.set_axis_display_mode(self._axis_display_mode)
                 QTimer.singleShot(0, self._link_standard_x_axis)
                 self._refresh_signal_browser()
+                QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
                 self.statusBar().showMessage(_format_load_status(record))
                 title = (
                     record.metadata.station_name
@@ -1041,6 +1125,7 @@ class PowerwaveMainWindow(QMainWindow):
             self._canvas.set_axis_display_mode(self._axis_display_mode)
             QTimer.singleShot(0, self._link_standard_x_axis)
             self._refresh_signal_browser()
+            QTimer.singleShot(0, lambda r=result: self._run_event_detection(r))
             self.statusBar().showMessage(_format_load_status(result))
             title = result.metadata.station_name or Path(result.metadata.source_file).name
             self.setWindowTitle(f"Powerwave — {title}")
@@ -1190,6 +1275,7 @@ class PowerwaveMainWindow(QMainWindow):
         if self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF:
             QTimer.singleShot(0, self._apply_harmonic_display_mode)
 
+        QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
         self.statusBar().showMessage(_format_load_status(record))
         self.setWindowTitle(f"Powerwave — {source_id}")
 
