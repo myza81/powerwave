@@ -240,23 +240,25 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-### Phase 6 — Protection Timing Extraction 🔴
+### Phase 6 — Protection Timing Extraction ✅ [COMPLETE — commit 17d5f98]
 
 **Goal:** Identify protection relay response timing from digital channels and waveform events.
 
 **Extracted events:**
 - Fault inception (voltage dip start)
-- Relay pickup (digital channel transition)
-- Trip command (digital channel)
-- Circuit breaker open (current drops to zero)
-- Arc extinction / reclosure
+- Relay pickup (digital channel transition — pickup/start/86)
+- Trip command (digital channel — trip/87/51/50/67/21)
+- CB open (digital channel — cb/52/breaker/aux)
+- Arc extinction (current RMS < 5% of prefault for ≥ 0.5 cycles)
+- Reclosure (current recovery > 10% of prefault after clearing)
 
-**Output:** Timing table — pickup time, trip time, fault clearing time, reclosure interval.
+**Output:** Timing table — pickup delay, trip delay, clearing time, reclose interval (all in ms).
 
 **Progress:**
-- [ ] Digital channel mapping to protection events
-- [ ] Timing extraction engine
-- [ ] Timing report panel
+- [x] Digital channel classification by keyword heuristics (PICKUP/TRIP/CB/RECLOSE)
+- [x] `extract_protection_timing()` — transition detection + current extinction + recovery
+- [x] `ProtectionTimingPanel` — summary chips + chronological events table with role colours
+- [x] Wired at tail of `_run_event_detection()`; auto-shows when >1 milestone found
 
 ---
 
@@ -440,7 +442,7 @@ Phase 2 — Event Detection           [██████████] 100% ✅ 
 Phase 3 — Live Value Readout        [██████████] 100% ✅ commit 7b38ab8
 Phase 4 — Data Quality Fingerprint  [██████████] 100% ✅ commit df923b9
 Phase 5 — Fault Characterisation    [██████████] 100% ✅ commit 848ac55
-Phase 6 — Protection Timing         [░░░░░░░░░░]   0%  ← current
+Phase 6 — Protection Timing         [██████████] 100% ✅ commit 17d5f98
 Phase 7 — Cross-Source Correlation  [░░░░░░░░░░]   0%
 Phase 8 — Contextual Suggestions    [░░░░░░░░░░]   0%
 
