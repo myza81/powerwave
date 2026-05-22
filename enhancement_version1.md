@@ -26,7 +26,7 @@ Direct interaction with the waveform: the engineer places markers and the app co
 | Capability | Status |
 |---|---|
 | Two-cursor measurement (Δt, ΔY, frequency, RMS, mean, peak, energy) | ✅ Phase 1 |
-| Single-cursor live value readout per channel | 🔴 Phase 3 |
+| Single-cursor live value readout per channel | ✅ Phase 3 |
 | Smart snapping (zero crossings, peaks, cycle boundaries, trigger) | 🔴 Phase 1 |
 
 ### Tier 2 — Data Intelligence (Quality & Classification)
@@ -190,15 +190,17 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-### Phase 3 — Single-Cursor Live Value Readout 🔴 [CURRENT]
+### Phase 3 — Single-Cursor Live Value Readout ✅ [COMPLETE — commit 7b38ab8]
 
 **Goal:** As the yellow cursor moves, show a floating readout bubble (or status bar) with the interpolated Y value for every visible channel.
 
 **Readout format:** `VA: 11.2 kV  IA: 487 A  freq: 49.98 Hz`
 
 **Progress:**
-- [ ] Cursor value interpolation
-- [ ] Floating readout widget
+- [x] Cursor value interpolation (`_compute_cursor_values` via np.searchsorted + linear interp)
+- [x] `CursorReadoutBar` widget — 36px dock strip, scrollable channel chips in waveform colours
+- [x] `cursor_values_changed` signal on `FlexiblePlotCanvas`
+- [x] Wired into `MainWindow` at all three load paths; View menu toggle (Ctrl+R)
 
 ---
 
@@ -431,8 +433,8 @@ accessible. S9 is the final step — flip the entry point and retire the old cod
 Intelligence Phases
 Phase 1 — Two-Cursor Measurement    [██████████] 100% ✅ commit 1c46a3d
 Phase 2 — Event Detection           [██████████] 100% ✅ commit 39a8f59
-Phase 3 — Live Value Readout        [░░░░░░░░░░]   0%  ← current
-Phase 4 — Data Quality Fingerprint  [░░░░░░░░░░]   0%
+Phase 3 — Live Value Readout        [██████████] 100% ✅ commit 7b38ab8
+Phase 4 — Data Quality Fingerprint  [░░░░░░░░░░]   0%  ← current
 Phase 5 — Fault Characterisation    [░░░░░░░░░░]   0%
 Phase 6 — Protection Timing         [░░░░░░░░░░]   0%
 Phase 7 — Cross-Source Correlation  [░░░░░░░░░░]   0%
