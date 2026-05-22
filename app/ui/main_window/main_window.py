@@ -2046,6 +2046,16 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _apply_scaling_to_all_canvases(self) -> None:
         """Push the current scaling mode and registry to every visible canvas."""
+        if (
+            self._session_canvas_active
+            and self._session_canvas_controller is not None
+            and self._active_session is not None
+        ):
+            self._session_canvas_controller.set_scaling_mode(
+                self._scaling_mode, self._active_session,
+                registry=self._scaling_registry,
+            )
+            return
         canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
         for canvas in canvases:
             if self._qt_widget_alive(canvas):

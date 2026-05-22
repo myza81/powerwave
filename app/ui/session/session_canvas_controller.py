@@ -30,6 +30,8 @@ from PyQt6.QtWidgets import QSplitter, QWidget
 from app.analytics.harmonics.harmonic_models import HarmonicConfig, HarmonicDisplayMode
 from app.analytics.phasors.phasor_models import PhasorConfig, PhasorDisplayMode
 from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode
+from app.analytics.scaling.scaling_models import EngineeringScalingMode
+from app.analytics.scaling.scaling_registry import ScalingRegistry
 from app.visualization.widgets.session_canvas import SessionCanvasWidget
 from app.ui.session.legend_widget import generate_source_variant_colour
 
@@ -119,6 +121,8 @@ class SessionCanvasController:
         self._harmonic_mode: HarmonicDisplayMode = HarmonicDisplayMode.OFF  # S4
         self._harmonic_config: HarmonicConfig = HarmonicConfig()            # S4
         self._harmonic_orders: list[int] = [3, 5, 7, 11, 13]               # S4
+        self._scaling_mode: EngineeringScalingMode = EngineeringScalingMode.RAW  # S5
+        self._scaling_registry: ScalingRegistry = ScalingRegistry()              # S5
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
@@ -237,15 +241,18 @@ class SessionCanvasController:
                     continue
                 try:
                     aligned = session.build_aligned_data(sid, channel_name, t_start, t_end)
+                    scaled_values, display_unit = self._scale_aligned(
+                        channel_name, aligned.values, aligned.unit
+                    )
                     color = (ch.color_hex if (ch and ch.color_hex) else None) or self._auto_colour(sid, channel_name)
                     source = sources_by_id.get(sid)
                     badge = source.display_name if source else sid
                     canvas.update_curve(
-                        sid, channel_name, aligned.time, aligned.values,
+                        sid, channel_name, aligned.time, scaled_values,
                         color=color, visible=True,
                         display_name=ch.display_name if ch else channel_name,
                         source_badge=badge,
-                        unit=aligned.unit,
+                        unit=display_unit,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -499,14 +506,17 @@ class SessionCanvasController:
                 continue
             try:
                 aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
+                scaled_values, display_unit = self._scale_aligned(
+                    channel_name, aligned.values, aligned.unit
+                )
                 source = sources_by_id.get(source_id)
                 badge = source.display_name if source else source_id
                 canvas.update_curve(
-                    source_id, channel_name, aligned.time, aligned.values,
+                    source_id, channel_name, aligned.time, scaled_values,
                     color=color, visible=True,
                     display_name=ch.display_name if ch else channel_name,
                     source_badge=badge,
-                    unit=aligned.unit,
+                    unit=display_unit,
                     line_style=ch.line_style if ch else "solid",
                     line_width=ch.line_width if ch else 1.0,
                     y_axis_side=ch.y_axis_side if ch else "left",
@@ -672,8 +682,11 @@ class SessionCanvasController:
                 if sample_rate <= 0:
                     continue
                 aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
+                scaled_values, _ = self._scale_aligned(
+                    channel_name, aligned.values, aligned.unit
+                )
                 rms_t, rms_d = compute_rms_overlay(
-                    aligned.time, aligned.values, sample_rate, config=self._rms_config
+                    aligned.time, scaled_values, sample_rate, config=self._rms_config
                 )
                 color = (
                     (ch.color_hex if (ch and ch.color_hex) else None)
@@ -767,8 +780,11 @@ class SessionCanvasController:
                 result = classify_phasor_role(channel_name, aligned.unit)
                 if result.role == PhasorChannelRole.UNKNOWN:
                     continue
+                scaled_values, _ = self._scale_aligned(
+                    channel_name, aligned.values, aligned.unit
+                )
                 phasor_t, mag_rms, angle_deg, _ = extract_phasor(
-                    aligned.time, aligned.values, sample_rate, self._phasor_config
+                    aligned.time, scaled_values, sample_rate, self._phasor_config
                 )
                 phasor_vals = (
                     mag_rms if mode == PhasorDisplayMode.MAGNITUDE else angle_deg
@@ -782,6 +798,49 @@ class SessionCanvasController:
                 )
             except Exception:  # noqa: BLE001
                 pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Engineering scaling (S5)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_scaling_mode(
+        self,
+        mode: EngineeringScalingMode,
+        session,
+        *,
+        registry: ScalingRegistry | None = None,
+    ) -> None:
+        """Apply an engineering scaling mode to all session canvas panels.
+
+        Triggers a full repaint so all raw curves, RMS/phasor/harmonic overlays,
+        and axis unit labels reflect the new scaling.  When *registry* is supplied
+        it replaces the current ScalingRegistry (PT/CT ratios, per-unit bases).
+        """
+        if registry is not None:
+            self._scaling_registry = registry
+        self._scaling_mode = mode
+        self.refresh_all(session)
+
+    def _scale_aligned(
+        self,
+        channel_name: str,
+        values: np.ndarray,
+        unit: str | None,
+    ) -> tuple[np.ndarray, str | None]:
+        """Return (scaled_values, display_unit) for the current scaling mode.
+
+        RAW mode and unconfigured channels (e.g. PER_UNIT without a voltage base)
+        are returned unchanged so we never display silently wrong values.
+        """
+        if self._scaling_mode == EngineeringScalingMode.RAW:
+            return values, unit
+        result = self._scaling_registry.compute_scaling_result(
+            channel_name, unit, self._scaling_mode
+        )
+        display_unit: str | None = result.display_unit or unit
+        if result.configured and result.factor != 1.0:
+            return values * result.factor, display_unit
+        return values, display_unit
 
     # ─────────────────────────────────────────────────────────────────────────
     # Harmonic magnitude overlay (S4)
@@ -861,8 +920,11 @@ class SessionCanvasController:
                 role = classify_harmonic_role(channel_name, aligned.unit).role
                 if role == HarmonicChannelRole.UNKNOWN:
                     continue
+                scaled_values, _ = self._scale_aligned(
+                    channel_name, aligned.values, aligned.unit
+                )
                 h_result = extract_harmonics(
-                    aligned.values, sample_rate, self._harmonic_config,
+                    scaled_values, sample_rate, self._harmonic_config,
                     time=aligned.time,
                 )
                 if h_result.n_windows == 0:
