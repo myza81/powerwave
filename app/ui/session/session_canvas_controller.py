@@ -123,6 +123,8 @@ class SessionCanvasController:
         self._harmonic_orders: list[int] = [3, 5, 7, 11, 13]               # S4
         self._scaling_mode: EngineeringScalingMode = EngineeringScalingMode.RAW  # S5
         self._scaling_registry: ScalingRegistry = ScalingRegistry()              # S5
+        self._measurement_mode: bool = False      # S6
+        self._measurement_callback: object = None # S6
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
@@ -162,6 +164,8 @@ class SessionCanvasController:
                 canvas.set_panel_title(panel.title)
             canvas.setMinimumHeight(160)
             canvas.set_legend_visible(self._legend_visible)
+            if self._measurement_mode:  # S6: propagate measurement state to (re-)created canvases
+                canvas.set_measurement_mode(True)
             splitter.addWidget(canvas)
             splitter.setStretchFactor(i, 1)
 
@@ -843,6 +847,102 @@ class SessionCanvasController:
         return values, display_unit
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Two-cursor measurement (S6)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_measurement_callback(self, cb) -> None:
+        """Register a callable(MeasurementResult|None) invoked when cursors move."""
+        self._measurement_callback = cb
+
+    def set_measurement_mode(self, enabled: bool, session) -> None:
+        """Enable or disable two-cursor measurement mode on all session panels.
+
+        Each panel gets its own independent A/B cursor pair. When either cursor
+        moves the registered measurement callback receives a MeasurementResult
+        computed from all visible channels in that panel.
+        """
+        self._measurement_mode = enabled
+        self._session_ref = session
+        for canvas in self._canvases.values():
+            canvas.set_measurement_mode(enabled)
+
+    def compute_current_measurements(
+        self, canvas: SessionCanvasWidget, session
+    ) -> object | None:
+        """Compute cursor measurements for one panel canvas.
+
+        Gathers aligned data for every visible channel in the panel, applies
+        the current scaling, and delegates to the measurement engine.
+        Returns a ``MeasurementResult`` or ``None`` when data is unavailable.
+        """
+        from app.visualization.interaction.measurement_engine import compute_measurements
+        if not self._measurement_mode:
+            return None
+        positions = canvas.cursor_positions()
+        if positions is None:
+            return None
+        t_a, t_b = positions
+
+        panels = {p.panel_id: p for p in session.list_panels()}
+        panel = panels.get(canvas.panel_id)
+        if panel is None:
+            return None
+
+        t_start, t_end = _session_window(session)
+        all_channels = self._channel_lookup(session)
+        sources_by_id = {s.source_id: s for s in session.list_sources()}
+        multi_source = len({ref[0] for ref in panel.channel_refs}) > 1
+
+        data_by_channel: dict[str, tuple] = {}
+        time_arr = None
+
+        for source_id, channel_name in panel.channel_refs:
+            source = sources_by_id.get(source_id)
+            if source is None or not source.is_active:
+                continue
+            ch = all_channels.get((source_id, channel_name))
+            if ch is not None and not ch.is_visible:
+                continue
+            try:
+                aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
+                scaled_values, display_unit = self._scale_aligned(
+                    channel_name, aligned.values, aligned.unit
+                )
+                # Disambiguate channel labels when multiple sources share the panel
+                label = f"{source_id}/{channel_name}" if multi_source else channel_name
+                data_by_channel[label] = (scaled_values, display_unit or "")
+                if time_arr is None:
+                    time_arr = aligned.time
+            except Exception:  # noqa: BLE001
+                pass
+
+        if time_arr is None or len(data_by_channel) == 0:
+            return None
+
+        nominal_hz = None
+        for source in sources_by_id.values():
+            if not source.is_active:
+                continue
+            try:
+                raw = getattr(source.record.metadata, "nominal_frequency", None)
+                nominal_hz = float(raw) if raw else None
+            except Exception:  # noqa: BLE001
+                pass
+            if nominal_hz:
+                break
+
+        return compute_measurements(t_a, t_b, time_arr, data_by_channel, nominal_hz=nominal_hz)
+
+    def _on_canvas_measurement_moved(
+        self, canvas: SessionCanvasWidget, t_a: float, t_b: float
+    ) -> None:
+        """Invoked when any panel canvas emits measurement_cursors_moved."""
+        if self._measurement_callback is None or self._session_ref is None:
+            return
+        result = self.compute_current_measurements(canvas, self._session_ref)
+        self._measurement_callback(result)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Harmonic magnitude overlay (S4)
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1011,6 +1111,10 @@ class SessionCanvasController:
         canvas.merge_with_requested.connect(self._handle_merge_panels)
         canvas.split_by_source_requested.connect(self._handle_split_by_source)
         canvas.split_by_type_requested.connect(self._handle_split_by_type)
+        # S6: route cursor movement through the controller to compute measurements
+        canvas.measurement_cursors_moved.connect(
+            lambda t_a, t_b, _c=canvas: self._on_canvas_measurement_moved(_c, t_a, t_b)
+        )
 
     def _handle_legend_colour(
         self, source_id: str, channel_name: str, color_hex: str

@@ -242,6 +242,7 @@ class SessionCanvasWidget(QWidget):
     merge_with_requested = pyqtSignal(str, str)   # my_panel_id, target_panel_id
     split_by_source_requested = pyqtSignal(str)   # my_panel_id
     split_by_type_requested = pyqtSignal(str)     # my_panel_id
+    measurement_cursors_moved = pyqtSignal(float, float)  # t_a, t_b  (S6)
 
     def __init__(
         self,
@@ -261,6 +262,9 @@ class SessionCanvasWidget(QWidget):
         self._rms_raw_hidden: set[tuple[str, str]] = set()             # S2
         self._phasor_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # S3
         self._harmonic_curves: dict[tuple[str, str], dict[int, pg.PlotDataItem]] = {}  # S4
+        self._cursor_a: pg.InfiniteLine | None = None  # S6
+        self._cursor_b: pg.InfiniteLine | None = None  # S6
+        self._measurement_mode: bool = False           # S6
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
 
         self._build_ui()
@@ -818,6 +822,97 @@ class SessionCanvasWidget(QWidget):
         self._harmonic_curves.clear()
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Two-cursor measurement (S6)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_measurement_mode(self, enabled: bool) -> None:
+        """Enable or disable two-cursor measurement mode.
+
+        When enabled, cursor A (yellow) and cursor B (cyan) both appear as
+        draggable InfiniteLines. Either cursor moving emits
+        ``measurement_cursors_moved(t_a, t_b)``.
+        """
+        if enabled == self._measurement_mode:
+            return
+        self._measurement_mode = enabled
+        if enabled:
+            self._add_cursor_a()
+            self._add_cursor_b()
+        else:
+            self._remove_cursor_b()
+            self._remove_cursor_a()
+
+    def measurement_mode(self) -> bool:
+        return self._measurement_mode
+
+    def cursor_positions(self) -> tuple[float, float] | None:
+        """Return (t_a, t_b) or None if either cursor is missing."""
+        if self._cursor_a is None or self._cursor_b is None:
+            return None
+        return float(self._cursor_a.value()), float(self._cursor_b.value())
+
+    def _add_cursor_a(self) -> None:
+        if self._cursor_a is not None:
+            return
+        self._cursor_a = pg.InfiniteLine(
+            pos=0.0,
+            angle=90,
+            movable=True,
+            pen=pg.mkPen("#FFFF00", width=1.5, style=Qt.PenStyle.DashLine),
+            label="A",
+            labelOpts={"color": "#FFFF00", "position": 0.9},
+        )
+        self._cursor_a.sigPositionChanged.connect(self._on_cursor_a_moved)
+        self._primary_plot.addItem(self._cursor_a)
+
+    def _add_cursor_b(self) -> None:
+        if self._cursor_b is not None:
+            return
+        t_ref = float(self._cursor_a.value()) + 0.02 if self._cursor_a is not None else 0.02
+        self._cursor_b = pg.InfiniteLine(
+            pos=t_ref,
+            angle=90,
+            movable=True,
+            pen=pg.mkPen("#00CCFF", width=1.5, style=Qt.PenStyle.DashLine),
+            label="B",
+            labelOpts={"color": "#00CCFF", "position": 0.85},
+        )
+        self._cursor_b.sigPositionChanged.connect(self._on_cursor_b_moved)
+        self._primary_plot.addItem(self._cursor_b)
+        self._emit_measurement()
+
+    def _remove_cursor_a(self) -> None:
+        if self._cursor_a is not None:
+            try:
+                self._primary_plot.removeItem(self._cursor_a)
+            except Exception:  # noqa: BLE001
+                pass
+            self._cursor_a = None
+
+    def _remove_cursor_b(self) -> None:
+        if self._cursor_b is not None:
+            try:
+                self._primary_plot.removeItem(self._cursor_b)
+            except Exception:  # noqa: BLE001
+                pass
+            self._cursor_b = None
+
+    def _on_cursor_a_moved(self, _line: pg.InfiniteLine) -> None:
+        if self._measurement_mode:
+            self._emit_measurement()
+
+    def _on_cursor_b_moved(self, _line: pg.InfiniteLine) -> None:
+        self._emit_measurement()
+
+    def _emit_measurement(self) -> None:
+        if self._cursor_a is None or self._cursor_b is None:
+            return
+        self.measurement_cursors_moved.emit(
+            float(self._cursor_a.value()),
+            float(self._cursor_b.value()),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Panel metadata & housekeeping
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -843,6 +938,10 @@ class SessionCanvasWidget(QWidget):
         self.legend.setVisible(visible)
 
     def clear_all(self) -> None:
+        # Measurement cursors (S6)
+        self._remove_cursor_b()
+        self._remove_cursor_a()
+        self._measurement_mode = False
         # RMS overlays first (they hold ViewBox refs via getViewBox)
         for rms_curve in self._rms_curves.values():
             try:

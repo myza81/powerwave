@@ -68,13 +68,13 @@ The long-term UX goal is a **single unified canvas** — open a file, get the se
 
 | Feature | FlexiblePlotCanvas | SessionCanvas | Migration Phase |
 |---|---|---|---|
-| N-axis per channel (MultiAxisManager) | ✅ | ❌ | S1 |
+| N-axis per channel (MultiAxisManager) | ✅ | ✅ | S1 |
 | RMS overlay | ✅ | ✅ | S2 |
 | Phasor magnitude/angle overlay | ✅ | ✅ | S3 |
 | Harmonic magnitude overlay | ✅ | ✅ | S4 |
-| Engineering scaling (kV, pu, etc.) | ✅ | ❌ | S5 |
-| Two-cursor measurement | 🔴 Phase 1 | ❌ | S6 (after Phase 1) |
-| Trigger marker line | ✅ | ❌ | S1 |
+| Engineering scaling (kV, pu, etc.) | ✅ | ✅ | S5 |
+| Two-cursor measurement | ✅ | ✅ | S6 |
+| Trigger marker line | ✅ | ✅ | S1 |
 | Absolute timestamp axis | ✅ | ✅ | Done |
 | Signal browser integration | ✅ | ✅ | Done |
 | Colour management in legend | ✅ | ✅ | Done |
@@ -464,9 +464,9 @@ S1 — N-axis + trigger markers       [██████████] 100% ✅ 
 S2 — RMS overlay                    [██████████] 100% ✅ commit db16f65
 S3 — Phasor overlay                 [██████████] 100% ✅ commit 22eaf94
 S4 — Harmonic overlay               [██████████] 100% ✅ commit bcef567
-S5 — Engineering scaling            [░░░░░░░░░░]   0%  ← current
-S6 — Two-cursor measurement port    [░░░░░░░░░░]   0%
-S7 — Signal browser                 [░░░░░░░░░░]   0%
+S5 — Engineering scaling            [██████████] 100% ✅ commit 5864ffa
+S6 — Two-cursor measurement port    [██████████] 100% ✅ commit (pending)
+S7 — Signal browser                 [░░░░░░░░░░]   0%  ← current
 S8 — Per-source trigger markers     [░░░░░░░░░░]   0%
 
 File Menu Redesign

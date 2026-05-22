@@ -684,6 +684,17 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _on_toggle_measurement_mode(self, checked: bool) -> None:
         self._measurement_mode = checked
+        # S6: session canvas short-circuit — route through controller
+        if self._session_canvas_active and self._session_canvas_controller is not None:
+            self._session_canvas_controller.set_measurement_mode(
+                checked, self._active_session
+            )
+            if checked:
+                self._measurement_dock.show()
+            else:
+                self._measurement_dock.hide()
+            self._measurement_widget.update_measurements(None)
+            return
         self._canvas.set_measurement_mode(checked)
         for canvas in self._panel_canvases.values():
             if self._qt_widget_alive(canvas):
@@ -2725,6 +2736,10 @@ class PowerwaveMainWindow(QMainWindow):
 
         self._session_canvas_controller.register_with_sync(
             self._vis_manager.synchronization_manager
+        )
+        # S6: wire measurement results to the measurement panel dock
+        self._session_canvas_controller.set_measurement_callback(
+            self._measurement_widget.update_measurements
         )
         self._session_canvas_controller.refresh_all(self._active_session)
 
