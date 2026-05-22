@@ -76,7 +76,7 @@ The long-term UX goal is a **single unified canvas** — open a file, get the se
 | Two-cursor measurement | ✅ | ✅ | S6 |
 | Trigger marker line | ✅ | ✅ | S1 |
 | Absolute timestamp axis | ✅ | ✅ | Done |
-| Signal browser integration | ✅ | ✅ | Done |
+| Signal browser integration | ✅ | ✅ | S7 |
 | Colour management in legend | ✅ | ✅ | Done |
 | Y-axis side (left/right auto-assign) | ✅ | ✅ | Done |
 
@@ -466,8 +466,8 @@ S3 — Phasor overlay                 [██████████] 100% ✅ 
 S4 — Harmonic overlay               [██████████] 100% ✅ commit bcef567
 S5 — Engineering scaling            [██████████] 100% ✅ commit 5864ffa
 S6 — Two-cursor measurement port    [██████████] 100% ✅ commit 45c6cde
-S7 — Signal browser                 [░░░░░░░░░░]   0%  ← current
-S8 — Per-source trigger markers     [░░░░░░░░░░]   0%
+S7 — Signal browser                 [██████████] 100% ✅ commit 1f6e7ba
+S8 — Per-source trigger markers     [██████████] 100% ✅ implemented in S1
 
 File Menu Redesign
 S9 — Unified entry point            [░░░░░░░░░░]   0%  (gated on S1–S8)
