@@ -34,7 +34,7 @@ What the app knows about the data before the engineer does anything.
 
 | Capability | Status |
 |---|---|
-| Data quality fingerprint on load (sample rate gaps, clipping, noise floor) | 🔴 Phase 4 |
+| Data quality fingerprint on load (sample rate gaps, clipping, noise floor) | ✅ Phase 4 |
 | Recording classification (fault capture, trend, steady-state) | 🔴 Phase 4 |
 | Timestamp integrity report | ✅ Implemented (Import Wizard) |
 
@@ -204,21 +204,22 @@ MeasurementPanel (QDockWidget)
 
 ---
 
-### Phase 4 — Data Quality Fingerprint 🔴
+### Phase 4 — Data Quality Fingerprint ✅ [COMPLETE — commit df923b9]
 
 **Goal:** On file load, silently compute a quality fingerprint and surface a compact status indicator (green/amber/red badge in the signal browser).
 
 **Checks:**
 - Sample rate consistency (gaps > 2×median interval)
 - Clipping detection (>3 consecutive samples at ADC rail)
-- Noise floor vs signal peak (SNR estimate)
-- DC offset magnitude
+- Noise floor vs signal peak (SNR estimate via MAD)
+- DC offset ratio |mean| / peak
 - Missing/NaN sample percentage
 
 **Progress:**
-- [ ] Fingerprint computation
-- [ ] Signal browser badge
-- [ ] Quality report panel (expandable)
+- [x] `compute_quality_fingerprint()` in `app/analytics/quality/quality_fingerprint.py`
+- [x] Signal browser leaf items coloured green/amber/red with issue tooltips
+- [x] `QualityReportPanel` dock — sortable per-channel table, auto-shows on WARN/ERROR
+- [x] Wired at all three load paths; resets on layout switch
 
 ---
 
@@ -434,8 +435,8 @@ Intelligence Phases
 Phase 1 — Two-Cursor Measurement    [██████████] 100% ✅ commit 1c46a3d
 Phase 2 — Event Detection           [██████████] 100% ✅ commit 39a8f59
 Phase 3 — Live Value Readout        [██████████] 100% ✅ commit 7b38ab8
-Phase 4 — Data Quality Fingerprint  [░░░░░░░░░░]   0%  ← current
-Phase 5 — Fault Characterisation    [░░░░░░░░░░]   0%
+Phase 4 — Data Quality Fingerprint  [██████████] 100% ✅ commit df923b9
+Phase 5 — Fault Characterisation    [░░░░░░░░░░]   0%  ← current
 Phase 6 — Protection Timing         [░░░░░░░░░░]   0%
 Phase 7 — Cross-Source Correlation  [░░░░░░░░░░]   0%
 Phase 8 — Contextual Suggestions    [░░░░░░░░░░]   0%
