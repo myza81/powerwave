@@ -457,10 +457,10 @@ Phase 4 — Data Quality Fingerprint  [██████████] 100% ✅ 
 Phase 5 — Fault Characterisation    [██████████] 100% ✅ commit 848ac55
 Phase 6 — Protection Timing         [██████████] 100% ✅ commit 17d5f98
 Phase 7 — Cross-Source Correlation  [██████████] 100% ✅ commit 87dbc27
-Phase 8 — Contextual Suggestions    [░░░░░░░░░░]   0%  ← current
+Phase 8 — Contextual Suggestions    [██████████] 100% ✅ commit d1bf093
 
 Session Canvas Migration (prerequisite for File menu redesign)
-S1 — N-axis + trigger markers       [░░░░░░░░░░]   0%
+S1 — N-axis + trigger markers       [░░░░░░░░░░]   0%  ← current
 S2 — RMS overlay                    [░░░░░░░░░░]   0%
 S3 — Phasor overlay                 [░░░░░░░░░░]   0%
 S4 — Harmonic overlay               [░░░░░░░░░░]   0%
