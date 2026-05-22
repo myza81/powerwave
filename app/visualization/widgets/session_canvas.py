@@ -188,6 +188,22 @@ _STYLE_MAP = {
 }
 
 
+def _migrate_item(item: pg.PlotDataItem, old_vb: pg.ViewBox, new_vb: pg.ViewBox) -> None:
+    """Move a PlotDataItem between ViewBoxes without crashing on autoRangeEnabled.
+
+    pg.ViewBox.addItem calls scene.addItem(item) before item.setParentItem(childGroup).
+    When item already has data, the intermediate state (parentItem=None, in scene) causes
+    itemChange → _updateView → getViewBox to fall back to GraphicsLayoutWidget (the scene
+    view), which lacks autoRangeEnabled.  Temporarily clearing opts['clipToView'] avoids
+    the crash at that exact moment without affecting the final rendered state.
+    """
+    was_clip = item.opts.get('clipToView', False)
+    item.opts['clipToView'] = False
+    old_vb.removeItem(item)
+    new_vb.addItem(item)
+    item.opts['clipToView'] = was_clip
+
+
 def _rms_pen_color(hex_color: str) -> str:
     """Blend *hex_color* 40 % toward white — lighter shade for RMS overlay curves."""
     c = hex_color.lstrip("#")
@@ -406,8 +422,7 @@ class SessionCanvasWidget(QWidget):
                     existing_meta.y_axis_side, existing_meta.unit, existing_meta.colour
                 )
                 if old_vb is not target_vb:
-                    old_vb.removeItem(self._curves[key])
-                    target_vb.addItem(self._curves[key])
+                    _migrate_item(self._curves[key], old_vb, target_vb)
 
         curve = self._curves[key]
         if len(time) > 0 and len(values) > 0:
@@ -471,8 +486,7 @@ class SessionCanvasWidget(QWidget):
         old_vb = self._resolve_viewbox(meta.y_axis_side, meta.unit, meta.colour)
         new_vb = self._resolve_viewbox(side, meta.unit, meta.colour)
         if old_vb is not new_vb:
-            old_vb.removeItem(curve)
-            new_vb.addItem(curve)
+            _migrate_item(curve, old_vb, new_vb)
         meta.y_axis_side = side
 
     def set_curve_visible(
@@ -490,6 +504,26 @@ class SessionCanvasWidget(QWidget):
         if meta is not None:
             meta.visible = visible
         self.legend.update_row_visible(source_id, channel_name, visible)
+
+    def remove_curve(self, source_id: str, channel_name: str) -> None:
+        """Remove one curve and all its overlays; clean up the legend row."""
+        key = (source_id, channel_name)
+        meta = self._metadata.pop(key, None)
+        curve = self._curves.pop(key, None)
+        if curve is not None:
+            vb = self._resolve_viewbox(
+                meta.y_axis_side if meta else "left",
+                meta.unit if meta else None,
+                meta.colour if meta else "#AAAAAA",
+            )
+            try:
+                vb.removeItem(curve)
+            except Exception:  # noqa: BLE001
+                pass
+        self.remove_rms_curve(source_id, channel_name)
+        self.remove_phasor_curve(source_id, channel_name)
+        self.remove_harmonic_curves(source_id, channel_name)
+        self.legend.remove_row(source_id, channel_name)
 
     def remove_source(self, source_id: str) -> None:
         stale = [k for k in self._curves if k[0] == source_id]

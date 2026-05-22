@@ -196,6 +196,11 @@ class SessionCanvasController:
             panel = panels.get(panel_id)
             if panel is None:
                 continue
+            # Remove curves that are no longer assigned to this panel
+            expected = {(sid, cname) for sid, cname in panel.channel_refs}
+            for key in list(canvas._curves.keys()):
+                if key not in expected:
+                    canvas.remove_curve(key[0], key[1])
             self._paint_panel(
                 canvas, panel, session, all_channels, active_sids,
                 sources_by_id, t_start, t_end,
@@ -393,6 +398,16 @@ class SessionCanvasController:
         sync_manager.clear()
         sync_manager.register_many(canvases, master_canvas=canvases[0])
 
+    def normalize_all_to_session_window(self, session) -> None:
+        """Set all canvas X ranges to the global session window.
+
+        Call this after refresh_all() via QTimer.singleShot(0) so pyqtgraph's
+        auto-range events have settled before we force a common viewport.
+        """
+        t_start, t_end = _session_window(session)
+        for canvas in self._canvases.values():
+            canvas.normalize_viewport(t_start, t_end)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Time axis mode (mirrors FlexiblePlotCanvas.set_time_axis_mode)
     # ─────────────────────────────────────────────────────────────────────────
@@ -411,39 +426,6 @@ class SessionCanvasController:
         else:
             for canvas in self._canvases.values():
                 canvas.clear_time_reference()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Y-axis display mode (mirrors FlexiblePlotCanvas.set_axis_display_mode)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def set_axis_display_mode(self, mode, session) -> None:
-        """Apply Shared or Dedicated Y-axis assignment to all session channels.
-
-        SHARED — every channel is placed on the left (primary) axis, resetting
-                 any per-channel overrides.
-        DEDICATED — channels are auto-assigned left/right by signal type:
-                    voltage and frequency → left; current and power → right.
-                    Users can still override individual channels via the legend.
-
-        Mirrors the View → Axis Mode menu that controls FlexiblePlotCanvas.
-        """
-        from app.visualization.axis_management import AxisDisplayMode
-        m = AxisDisplayMode.coerce(mode)
-        all_channels = self._channel_lookup(session)
-
-        for (source_id, channel_name), ch in all_channels.items():
-            if m == AxisDisplayMode.SHARED:
-                side = "left"
-            else:
-                side = _auto_y_axis_side(channel_name, ch)
-
-            try:
-                session.set_channel_y_axis_side(source_id, channel_name, side)
-            except Exception:  # noqa: BLE001
-                pass
-            for canvas in self._canvases.values():
-                canvas.set_curve_y_axis(source_id, channel_name, side)
-                canvas.legend.update_row_y_axis_side(source_id, channel_name, side)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -849,6 +831,19 @@ class SessionCanvasController:
     # ─────────────────────────────────────────────────────────────────────────
     # Two-cursor measurement (S6)
     # ─────────────────────────────────────────────────────────────────────────
+
+    def get_channel_colour(self, source_id: str, channel_name: str) -> str:
+        """Return the effective display colour for a channel.
+
+        Reads from any canvas that already has the curve rendered (post refresh_all),
+        falling back to the auto-colour computation when not yet rendered.
+        """
+        key = (source_id, channel_name)
+        for canvas in self._canvases.values():
+            meta = canvas._metadata.get(key)
+            if meta is not None:
+                return meta.colour
+        return self._auto_colour(source_id, channel_name)
 
     def set_measurement_callback(self, cb) -> None:
         """Register a callable(MeasurementResult|None) invoked when cursors move."""

@@ -42,7 +42,6 @@ from app.intelligence import RuleManager
 from app.models import DisturbanceRecord
 from app.providers import ProviderManager, ComtradeProvider, CsvProvider, ExcelProvider
 from app.visualization.axis.datetime_axis import TimeDisplayMode
-from app.visualization.axis_management import AxisDisplayMode
 from app.visualization.managers.visualization_manager import VisualizationManager
 from app.visualization.overlays.overlay_colors import sequence_curve_label
 from app.visualization.performance import timed_section
@@ -360,8 +359,6 @@ class PowerwaveMainWindow(QMainWindow):
         self._current_signal_metadata: dict = {}
         self._time_display_mode: TimeDisplayMode = TimeDisplayMode.RELATIVE
         self._time_axis_actions: dict[TimeDisplayMode, object] = {}
-        self._axis_display_mode: AxisDisplayMode = AxisDisplayMode.SHARED
-        self._axis_mode_actions: dict[AxisDisplayMode, object] = {}
         # Engineering scaling state (Phase 5B)
         self._scaling_mode: EngineeringScalingMode = EngineeringScalingMode.RAW
         self._scaling_registry: ScalingRegistry = ScalingRegistry()
@@ -1260,27 +1257,6 @@ class PowerwaveMainWindow(QMainWindow):
         time_axis_group.addAction(absolute_time)
         self._time_axis_actions[TimeDisplayMode.ABSOLUTE] = absolute_time
 
-        axis_mode_menu = view_menu.addMenu("&Axis Mode")
-        axis_mode_group = QActionGroup(self)
-        axis_mode_group.setExclusive(True)
-
-        shared_axis = axis_mode_menu.addAction("&Shared Axis")
-        shared_axis.setCheckable(True)
-        shared_axis.setChecked(True)
-        shared_axis.triggered.connect(
-            lambda: self._on_axis_display_mode_changed(AxisDisplayMode.SHARED)
-        )
-        axis_mode_group.addAction(shared_axis)
-        self._axis_mode_actions[AxisDisplayMode.SHARED] = shared_axis
-
-        dedicated_axis = axis_mode_menu.addAction("&Dedicated Axis")
-        dedicated_axis.setCheckable(True)
-        dedicated_axis.triggered.connect(
-            lambda: self._on_axis_display_mode_changed(AxisDisplayMode.DEDICATED)
-        )
-        axis_mode_group.addAction(dedicated_axis)
-        self._axis_mode_actions[AxisDisplayMode.DEDICATED] = dedicated_axis
-
         view_menu.addSeparator()
         self._measurement_mode_action = view_menu.addAction("&Measurement Mode")
         self._measurement_mode_action.setCheckable(True)
@@ -1509,8 +1485,6 @@ class PowerwaveMainWindow(QMainWindow):
         panel_canvases = self._vis_manager.display_grouped_record(
             record, None, axis_mode=axis_mode
         )
-        for canvas in panel_canvases.values():
-            canvas.set_axis_display_mode(self._axis_display_mode)
 
         if panel_canvases:
             seq_panels = self._build_sequence_panels(record, None, FlexiblePlotCanvas)
@@ -1520,7 +1494,6 @@ class PowerwaveMainWindow(QMainWindow):
             self._rebuild_grouped_layout(panel_canvases, record)
         else:
             self._vis_manager.set_record(record, axis_mode=axis_mode)
-            self._canvas.set_axis_display_mode(self._axis_display_mode)
             QTimer.singleShot(0, self._link_standard_x_axis)
 
         self._refresh_signal_browser()
@@ -1559,7 +1532,6 @@ class PowerwaveMainWindow(QMainWindow):
                 self._time_display_mode = TimeDisplayMode.RELATIVE
                 self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
                 self._vis_manager.set_record(record, axis_mode=TimeDisplayMode.RELATIVE.value)
-                self._canvas.set_axis_display_mode(self._axis_display_mode)
                 QTimer.singleShot(0, self._link_standard_x_axis)
                 self._refresh_signal_browser()
                 QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
@@ -1585,7 +1557,6 @@ class PowerwaveMainWindow(QMainWindow):
             self._time_display_mode = TimeDisplayMode.RELATIVE
             self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
             self._vis_manager.set_record(result, axis_mode=TimeDisplayMode.RELATIVE.value)
-            self._canvas.set_axis_display_mode(self._axis_display_mode)
             QTimer.singleShot(0, self._link_standard_x_axis)
             self._refresh_signal_browser()
             QTimer.singleShot(0, lambda r=result: self._run_event_detection(r))
@@ -1702,8 +1673,6 @@ class PowerwaveMainWindow(QMainWindow):
         panel_canvases = self._vis_manager.display_grouped_record(
             record, signal_metadata or None, axis_mode=axis_mode
         )
-        for canvas in panel_canvases.values():
-            canvas.set_axis_display_mode(self._axis_display_mode)
         _log_runtime_route(
             f"display_grouped_record returned panels={list(panel_canvases.keys())}"
         )
@@ -1798,8 +1767,6 @@ class PowerwaveMainWindow(QMainWindow):
             session,
             axis_mode=TimeDisplayMode.ABSOLUTE.value,
         )
-        for canvas in panel_canvases.values():
-            canvas.set_axis_display_mode(self._axis_display_mode)
         first_record = session.sources[0].record
         self._rebuild_grouped_layout(panel_canvases, first_record)
         self._refresh_signal_browser()
@@ -1826,9 +1793,6 @@ class PowerwaveMainWindow(QMainWindow):
         panel_canvases = self._vis_manager.display_grouped_record(
             result.record, result.signal_metadata
         )
-        for canvas in panel_canvases.values():
-            canvas.set_axis_display_mode(self._axis_display_mode)
-
         # Build sequence panels if three-phase groups exist (Phase 6B)
         seq_panels = self._build_sequence_panels(
             result.record, result.signal_metadata, FlexiblePlotCanvas
@@ -1902,40 +1866,6 @@ class PowerwaveMainWindow(QMainWindow):
             self._session_canvas_controller.set_time_axis_mode(
                 self._time_display_mode, self._active_session
             )
-
-    def _set_axis_mode_action_checked(self, mode: AxisDisplayMode) -> None:
-        action = self._axis_mode_actions.get(mode)
-        if action is not None:
-            action.setChecked(True)
-
-    def _on_axis_display_mode_changed(self, mode: AxisDisplayMode) -> None:
-        """Switch visible panels between shared and dedicated Y-axis grouping."""
-        self._axis_display_mode = mode
-        self._apply_axis_display_mode_to_visible()
-        self._set_axis_mode_action_checked(mode)
-        self.statusBar().showMessage(
-            "Axis mode: Shared" if mode == AxisDisplayMode.SHARED else "Axis mode: Dedicated"
-        )
-
-    def _apply_axis_display_mode_to_visible(self) -> None:
-        """Apply current Y-axis grouping without reloading records."""
-        if self._session_canvas_active:
-            if (
-                self._session_canvas_controller is not None
-                and self._active_session is not None
-            ):
-                self._session_canvas_controller.set_axis_display_mode(
-                    self._axis_display_mode, self._active_session
-                )
-            return
-        canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
-        for canvas in canvases:
-            if self._qt_widget_alive(canvas):
-                canvas.set_axis_display_mode(self._axis_display_mode)
-        if self._panel_canvases:
-            QTimer.singleShot(0, self._link_panel_x_axes)
-        else:
-            QTimer.singleShot(0, self._link_standard_x_axis)
 
     def _on_rms_mode_changed(self, mode: RMSDisplayMode) -> None:
         """Apply a new global RMS display mode to all currently active canvases."""
@@ -2744,6 +2674,7 @@ class PowerwaveMainWindow(QMainWindow):
             self._on_session_channel_colour
         )
         panel.channel_panel_changed.connect(self._on_session_channel_panel)
+        panel.new_panel_requested.connect(self._on_session_new_panel_requested)
         panel.session_cleared.connect(self._on_session_cleared)
         panel.source_active_changed.connect(self._on_session_source_active)
         panel.set_as_reference_requested.connect(self._on_session_set_as_reference)
@@ -2783,15 +2714,16 @@ class PowerwaveMainWindow(QMainWindow):
         self._session_canvas_controller.set_measurement_callback(
             self._measurement_widget.update_measurements
         )
-        self._session_canvas_controller.refresh_all(self._active_session)
-
-        # Sync session canvas to the current time-axis and Y-axis modes so it
-        # matches whatever was already set in the single-source viewer.
         self._session_canvas_controller.set_time_axis_mode(
             self._time_display_mode, self._active_session
         )
-        self._session_canvas_controller.set_axis_display_mode(
-            self._axis_display_mode, self._active_session
+        self._session_canvas_controller.refresh_all(self._active_session)
+        self._sync_session_panel_colours()
+        # Normalize all panels to the same X range after auto-range settles
+        _ctrl = self._session_canvas_controller
+        _sess = self._active_session
+        QTimer.singleShot(
+            0, lambda c=_ctrl, s=_sess: c.normalize_all_to_session_window(s)
         )
 
         n = len(self._active_session.list_sources())
@@ -3012,6 +2944,21 @@ class PowerwaveMainWindow(QMainWindow):
                 source_id, channel_name, visible, self._active_session
             )
 
+    def _sync_session_panel_colours(self) -> None:
+        """Push controller-computed waveform colours to the session panel swatches.
+
+        Called after refresh_all() so swatches reflect the actual curve colours
+        rather than the raw (often None) color_hex values in the session model.
+        """
+        if self._active_session is None or self._session_canvas_controller is None:
+            return
+        panel = self._ensure_session_panel()
+        for ch in self._active_session.list_analog_channels(active_only=False):
+            colour = self._session_canvas_controller.get_channel_colour(
+                ch.source_id, ch.channel_name
+            )
+            panel.update_channel_colour(ch.source_id, ch.channel_name, colour)
+
     def _on_session_channel_colour(
         self, source_id: str, channel_name: str
     ) -> None:
@@ -3055,6 +3002,7 @@ class PowerwaveMainWindow(QMainWindow):
         self._active_session.set_channel_colour(source_id, channel_name, new_hex)
         if self._session_canvas_active and self._session_canvas_controller is not None:
             self._session_canvas_controller.on_colour_changed(source_id, channel_name, new_hex)
+        self._ensure_session_panel().update_channel_colour(source_id, channel_name, new_hex)
 
     def _on_toggle_legend(self, checked: bool) -> None:
         if self._session_canvas_controller is not None:
@@ -3066,6 +3014,33 @@ class PowerwaveMainWindow(QMainWindow):
         if self._active_session is None:
             return
         self._active_session.set_channel_panel(source_id, channel_name, panel_id)
+        self._rebuild_session_canvas_after_panel_change()
+
+    def _on_session_new_panel_requested(
+        self, source_id: str, channel_name: str
+    ) -> None:
+        """User chose '＋ New panel…' in the channel tree — prompt for a name and create it."""
+        if self._active_session is None:
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "New Panel", "Panel name:", text="New Panel"
+        )
+        if not ok or not name.strip():
+            return
+        panel_id = self._active_session.add_panel(name.strip())
+        self._active_session.set_channel_panel(source_id, channel_name, panel_id)
+        # Update session panel combos with the new panel list, then select the new panel
+        sp = self._ensure_session_panel()
+        sp.refresh_all_panel_choices(self._active_session.list_panels())
+        sp.update_channel_panel(source_id, channel_name, panel_id)
+        self._rebuild_session_canvas_after_panel_change()
+
+    def _rebuild_session_canvas_after_panel_change(self) -> None:
+        """Rebuild and refresh the session canvas after any panel-assignment change."""
+        if not self._session_canvas_active or self._active_session is None:
+            return
+        self._activate_session_canvas()
 
     def _on_session_cleared(self) -> None:
         from app.sessions import EventAnalysisSession

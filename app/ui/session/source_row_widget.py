@@ -111,6 +111,7 @@ class SourceRowWidget(QWidget):
     channel_visibility_changed = pyqtSignal(str, str, bool)
     channel_colour_change_requested = pyqtSignal(str, str)
     channel_panel_changed = pyqtSignal(str, str, str)
+    new_panel_requested = pyqtSignal(str, str)           # source_id, ch_name
     remove_requested = pyqtSignal(str)                   # source_id
     active_changed = pyqtSignal(str, bool)               # source_id, is_active
 
@@ -147,6 +148,14 @@ class SourceRowWidget(QWidget):
         self._expand_btn.setChecked(expanded)
         self._channel_tree.setVisible(expanded)
         self._expand_btn.setText("Channels ▲" if expanded else "Channels ▼")
+
+    def update_channel_colour(self, channel_name: str, colour_hex: str) -> None:
+        """Push a new colour to the channel swatch without rebuilding the tree."""
+        self._channel_tree.update_channel_colour(channel_name, colour_hex)
+
+    def update_channel_panel(self, channel_name: str, panel_id: str) -> None:
+        """Select a specific panel in a channel's combo."""
+        self._channel_tree.update_channel_panel(channel_name, panel_id)
 
     def refresh(
         self,
@@ -208,6 +217,7 @@ class SourceRowWidget(QWidget):
             self.channel_colour_change_requested
         )
         self._channel_tree.channel_panel_changed.connect(self.channel_panel_changed)
+        self._channel_tree.new_panel_requested.connect(self.new_panel_requested)
         outer.addWidget(self._channel_tree)
 
     def _build_row1(

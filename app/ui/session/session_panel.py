@@ -49,6 +49,7 @@ class SessionPanel(QDockWidget):
     channel_visibility_changed = pyqtSignal(str, str, bool)
     channel_colour_change_requested = pyqtSignal(str, str)
     channel_panel_changed = pyqtSignal(str, str, str)
+    new_panel_requested = pyqtSignal(str, str)           # source_id, ch_name
     session_cleared = pyqtSignal()
 
     # Phase 9C additions
@@ -110,6 +111,27 @@ class SessionPanel(QDockWidget):
         self._sources_layout.removeWidget(row)
         row.setParent(None)
         row.deleteLater()
+
+    def update_channel_colour(
+        self, source_id: str, channel_name: str, colour_hex: str
+    ) -> None:
+        """Update the colour swatch for one channel without rebuilding any row."""
+        row = self._source_rows.get(source_id)
+        if row is not None:
+            row.update_channel_colour(channel_name, colour_hex)
+
+    def update_channel_panel(
+        self, source_id: str, channel_name: str, panel_id: str
+    ) -> None:
+        """Select a specific panel in a channel's combo (e.g. after new panel created)."""
+        row = self._source_rows.get(source_id)
+        if row is not None:
+            row.update_channel_panel(channel_name, panel_id)
+
+    def refresh_all_panel_choices(self, panels) -> None:
+        """Refresh panel dropdowns in every source row after panels change."""
+        for row in self._source_rows.values():
+            row._channel_tree.update_panel_choices(panels)
 
     def refresh_source_row(
         self,
@@ -243,6 +265,7 @@ class SessionPanel(QDockWidget):
             self.channel_colour_change_requested
         )
         row.channel_panel_changed.connect(self.channel_panel_changed)
+        row.new_panel_requested.connect(self.new_panel_requested)
         row.remove_requested.connect(self.source_remove_requested)
         row.active_changed.connect(self.source_active_changed)
         row.set_as_reference_requested.connect(self.set_as_reference_requested)

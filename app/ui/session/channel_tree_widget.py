@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 from app.sessions.session_models import PanelConfig, SessionChannel
 
 _ROLE_CH_NAME = Qt.ItemDataRole.UserRole
+_NEW_PANEL_SENTINEL = "__new__"
 
 
 class ChannelTreeWidget(QTreeWidget):
@@ -32,12 +33,14 @@ class ChannelTreeWidget(QTreeWidget):
     channel_visibility_changed = pyqtSignal(str, str, bool)    # source_id, ch_name, visible
     channel_colour_change_requested = pyqtSignal(str, str)      # source_id, ch_name
     channel_panel_changed = pyqtSignal(str, str, str)           # source_id, ch_name, panel_id
+    new_panel_requested = pyqtSignal(str, str)                  # source_id, ch_name
 
     def __init__(self, source_id: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._source_id = source_id
         self._channel_items: dict[str, QTreeWidgetItem] = {}
         self._panel_combos: dict[str, QComboBox] = {}
+        self._colour_swatches: dict[str, _ColourSwatch] = {}
         self._updating = False
 
         self.setColumnCount(3)
@@ -66,6 +69,7 @@ class ChannelTreeWidget(QTreeWidget):
             self.clear()
             self._channel_items.clear()
             self._panel_combos.clear()
+            self._colour_swatches.clear()
 
             if analog_channels:
                 analog_root = QTreeWidgetItem(self)
@@ -82,6 +86,27 @@ class ChannelTreeWidget(QTreeWidget):
                     self._add_channel_item(digital_root, ch, panels)
         finally:
             self._updating = False
+
+    def update_channel_panel(self, channel_name: str, panel_id: str) -> None:
+        """Select a specific panel in a channel's combo (e.g. after new panel created)."""
+        combo = self._panel_combos.get(channel_name)
+        if combo is None:
+            return
+        self._updating = True
+        try:
+            for i in range(combo.count()):
+                if combo.itemData(i) == panel_id:
+                    combo.setCurrentIndex(i)
+                    combo.setProperty("_last_panel_id", panel_id)
+                    break
+        finally:
+            self._updating = False
+
+    def update_channel_colour(self, channel_name: str, colour_hex: str) -> None:
+        """Update the colour swatch for one channel without rebuilding the tree."""
+        swatch = self._colour_swatches.get(channel_name)
+        if swatch is not None:
+            swatch.set_colour(colour_hex)
 
     def update_channel_visibility(self, channel_name: str, visible: bool) -> None:
         """Update a single checkbox without triggering signal re-emission."""
@@ -103,9 +128,12 @@ class ChannelTreeWidget(QTreeWidget):
         try:
             for channel_name, combo in self._panel_combos.items():
                 current_panel_id = combo.currentData()
+                if current_panel_id == _NEW_PANEL_SENTINEL:
+                    current_panel_id = combo.property("_last_panel_id")
                 combo.clear()
                 for panel in panels:
                     combo.addItem(panel.title, userData=panel.panel_id)
+                combo.addItem("＋ New panel…", userData=_NEW_PANEL_SENTINEL)
                 for i in range(combo.count()):
                     if combo.itemData(i) == current_panel_id:
                         combo.setCurrentIndex(i)
@@ -133,7 +161,6 @@ class ChannelTreeWidget(QTreeWidget):
         )
         self._channel_items[ch.channel_name] = item
 
-        # Colour swatch placeholder (Phase 9E will wire colour picker)
         swatch = _ColourSwatch(ch.color_hex or "#888888")
         swatch.clicked.connect(
             lambda name=ch.channel_name: self.channel_colour_change_requested.emit(
@@ -141,16 +168,19 @@ class ChannelTreeWidget(QTreeWidget):
             )
         )
         self.setItemWidget(item, 1, swatch)
+        self._colour_swatches[ch.channel_name] = swatch
 
         # Panel assignment combo
         combo = QComboBox()
         combo.setMaximumHeight(22)
         for panel in panels:
             combo.addItem(panel.title, userData=panel.panel_id)
+        combo.addItem("＋ New panel…", userData=_NEW_PANEL_SENTINEL)
         for i in range(combo.count()):
             if combo.itemData(i) == ch.panel_id:
                 combo.setCurrentIndex(i)
                 break
+        combo.setProperty("_last_panel_id", ch.panel_id)
         combo.currentIndexChanged.connect(
             lambda _idx, name=ch.channel_name, cb=combo: self._on_panel_combo_changed(
                 name, cb
@@ -172,7 +202,22 @@ class ChannelTreeWidget(QTreeWidget):
         if self._updating:
             return
         panel_id = combo.currentData()
+        if panel_id == _NEW_PANEL_SENTINEL:
+            # Reset combo to the previous valid panel immediately so the UI
+            # doesn't stay on the sentinel item while the dialog is shown.
+            last_id = combo.property("_last_panel_id")
+            self._updating = True
+            try:
+                for i in range(combo.count()):
+                    if combo.itemData(i) == last_id:
+                        combo.setCurrentIndex(i)
+                        break
+            finally:
+                self._updating = False
+            self.new_panel_requested.emit(self._source_id, channel_name)
+            return
         if panel_id is not None:
+            combo.setProperty("_last_panel_id", panel_id)
             self.channel_panel_changed.emit(self._source_id, channel_name, panel_id)
 
 
@@ -189,7 +234,7 @@ class _ColourSwatch(QWidget):
         layout.setContentsMargins(2, 1, 2, 1)
         self._label = QLabel()
         self._label.setFixedSize(14, 14)
-        self._label.setToolTip("Click to change colour (Phase 9E)")
+        self._label.setToolTip("Click to change colour")
         self._apply_colour(colour_hex)
         layout.addWidget(self._label)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
