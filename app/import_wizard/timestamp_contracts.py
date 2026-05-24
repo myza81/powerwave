@@ -13,6 +13,11 @@ RECONSTRUCT_FROM_INTERVAL  No usable timestamp column; rebuild from sampling_int
 COMBINE_DATE_TIME_COLUMNS  Date and time are in separate columns; combine via date_column + time_column.
 EXCEL_SERIAL_CONVERSION    Column contains Excel serial date numbers (days since 1899-12-30).
 TIMEZONE_ALIGNMENT         Timestamps are in a non-UTC timezone; convert to target_timezone.
+RECONSTRUCT_HYBRID         Low-resolution timestamps used as 100 ms anchors; sub-interval
+                           times are interpolated within each anchor window using a fixed dt.
+                           Parameters: sampling_interval_seconds (or override_sample_rate_hz),
+                           override_start_datetime (optional), date_column + time_column
+                           (optional, when date/time are split across two columns).
 """
 from __future__ import annotations
 
@@ -29,6 +34,7 @@ class TimestampRepairStrategy(enum.Enum):
     COMBINE_DATE_TIME_COLUMNS  = "combine_date_time_columns"
     EXCEL_SERIAL_CONVERSION    = "excel_serial_conversion"
     TIMEZONE_ALIGNMENT         = "timezone_alignment"
+    RECONSTRUCT_HYBRID         = "reconstruct_hybrid"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,16 +51,20 @@ class TimestampRepairPlan:
     detected_format: str | None = None
     user_format: str | None = None
 
-    # Used by RECONSTRUCT_FROM_INTERVAL
+    # Used by RECONSTRUCT_FROM_INTERVAL and RECONSTRUCT_HYBRID
     sampling_interval_seconds: float | None = None
 
-    # Used by COMBINE_DATE_TIME_COLUMNS
+    # Used by COMBINE_DATE_TIME_COLUMNS and RECONSTRUCT_HYBRID (split date+time)
     date_column: str | None = None
     time_column: str | None = None
 
     # Used by TIMEZONE_ALIGNMENT
     source_timezone: str | None = None
     target_timezone: str | None = None
+
+    # Used by RECONSTRUCT_HYBRID — user-assisted overrides
+    override_start_datetime: str | None = None     # ISO string; replaces first anchor
+    override_sample_rate_hz: float | None = None   # explicit Fs; overrides inferred
 
     # Set to True once the wizard has validated this plan is internally consistent
     repair_validated: bool = False

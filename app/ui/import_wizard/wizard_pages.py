@@ -6,6 +6,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -133,8 +134,10 @@ class TimestampSelectPage(QWidget):
         self.table.setModel(model)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table, 1)
 
+        # ── Format Override ───────────────────────────────────────────────
         override_group = QGroupBox("Format Override")
         form = QFormLayout(override_group)
         self.selected_column_label = QLabel("None")
@@ -154,9 +157,96 @@ class TimestampSelectPage(QWidget):
         form.addRow("Manual format", override_row)
         layout.addWidget(override_group)
 
+        # ── Timestamp Reconstruction ──────────────────────────────────────
+        self._recon_group = QGroupBox("Timestamp Reconstruction")
+        recon_form = QFormLayout(self._recon_group)
+
+        self.recon_status_label = QLabel("No truncation detected.")
+        self.recon_status_label.setWordWrap(True)
+        recon_form.addRow("Detection", self.recon_status_label)
+
+        self.recon_enable_check = QCheckBox("Enable anchor-based sub-interval reconstruction")
+        self.recon_enable_check.setChecked(False)
+        self.recon_enable_check.setToolTip(
+            "When enabled, duplicate timestamps are treated as 100 ms anchor windows and "
+            "sub-interval times are interpolated using the sample rate below."
+        )
+        recon_form.addRow("", self.recon_enable_check)
+
+        self.recon_start_edit = QLineEdit()
+        self.recon_start_edit.setPlaceholderText("YYYY-MM-DD HH:MM:SS.sss  (leave blank to use file's first timestamp)")
+        self.recon_start_edit.setEnabled(False)
+        recon_form.addRow("Start date/time", self.recon_start_edit)
+
+        self.recon_rate_spin = QDoubleSpinBox()
+        self.recon_rate_spin.setRange(0.001, 100_000.0)
+        self.recon_rate_spin.setDecimals(3)
+        self.recon_rate_spin.setSuffix(" Hz")
+        self.recon_rate_spin.setSpecialValueText("auto")
+        self.recon_rate_spin.setValue(0.001)  # sentinel = auto
+        self.recon_rate_spin.setEnabled(False)
+        recon_form.addRow("Sample rate", self.recon_rate_spin)
+
+        self.recon_dt_label = QLabel("")
+        recon_form.addRow("Interval", self.recon_dt_label)
+
+        self.recon_sample_label = QLabel("")
+        self.recon_sample_label.setWordWrap(True)
+        self.recon_sample_label.setStyleSheet("font-family: monospace; color: #888888;")
+        recon_form.addRow("Preview", self.recon_sample_label)
+
+        self.recon_enable_check.toggled.connect(self._on_recon_toggled)
+        self.recon_rate_spin.valueChanged.connect(self._on_recon_rate_changed)
+
+        layout.addWidget(self._recon_group)
+
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
         layout.addWidget(self.message_label)
+
+    # ── Reconstruction helpers ────────────────────────────────────────────
+
+    def _on_recon_toggled(self, enabled: bool) -> None:
+        self.recon_start_edit.setEnabled(enabled)
+        self.recon_rate_spin.setEnabled(enabled)
+
+    def _on_recon_rate_changed(self, value: float) -> None:
+        _AUTO = 0.001
+        if value <= _AUTO:
+            self.recon_dt_label.setText("auto (inferred from data)")
+        else:
+            dt_ms = 1000.0 / value
+            self.recon_dt_label.setText(f"{dt_ms:.3f} ms per sample")
+
+    def update_truncation_analysis(self, analysis) -> None:
+        """Populate the reconstruction panel from a TruncationAnalysis result."""
+        self.recon_status_label.setText(analysis.notes or "—")
+        if analysis.is_truncated:
+            self.recon_enable_check.setChecked(True)
+            hz = analysis.inferred_sample_rate_hz
+            if hz and hz > 0.001:
+                was = self.recon_rate_spin.blockSignals(True)
+                self.recon_rate_spin.setValue(round(hz, 3))
+                self.recon_rate_spin.blockSignals(was)
+                self._on_recon_rate_changed(hz)
+        else:
+            self.recon_enable_check.setChecked(False)
+
+    @property
+    def reconstruction_enabled(self) -> bool:
+        return self.recon_enable_check.isChecked()
+
+    @property
+    def reconstruction_start_datetime(self) -> str:
+        return self.recon_start_edit.text().strip()
+
+    @property
+    def reconstruction_sample_rate_hz(self) -> float | None:
+        """Return the user-specified Hz, or None when set to auto (≤ 0.001)."""
+        val = self.recon_rate_spin.value()
+        return val if val > 0.001 else None
+
+    # ── Standard page API ─────────────────────────────────────────────────
 
     def refresh(self, session: ImportWizardSession | None) -> None:
         count = len(session.timestamp_candidates) if session else 0

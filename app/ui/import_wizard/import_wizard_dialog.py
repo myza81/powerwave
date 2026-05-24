@@ -57,6 +57,7 @@ from app.import_wizard import (
 )
 from app.import_wizard.import_pipeline import run_import_pipeline_with_plan
 from app.import_wizard.pipeline_plan_builder import PlanBuildResult, build_execution_plan
+from app.import_wizard.truncation_detector import detect_timestamp_truncation
 from app.ui.import_wizard.column_mapping_model import ColumnMappingTableModel
 from app.ui.import_wizard.preview_table_model import PreviewTableModel
 from app.ui.import_wizard.timestamp_candidate_model import TimestampCandidateTableModel
@@ -309,6 +310,9 @@ class ImportWizardDialog(QDialog):
         self.timestamp_page.table.clicked.connect(self._on_timestamp_clicked)
         self.timestamp_page.override_edit.textChanged.connect(self._on_timestamp_override_changed)
         self.timestamp_page.reset_button.clicked.connect(self._reset_timestamp_override)
+        self.timestamp_page.recon_enable_check.toggled.connect(self._on_recon_setting_changed)
+        self.timestamp_page.recon_start_edit.textChanged.connect(self._on_recon_setting_changed)
+        self.timestamp_page.recon_rate_spin.valueChanged.connect(self._on_recon_setting_changed)
         self.column_model.dataChanged.connect(self._on_column_mapping_changed)
         self.back_button.clicked.connect(self.go_back)
         self.next_button.clicked.connect(self.go_next)
@@ -361,6 +365,7 @@ class ImportWizardDialog(QDialog):
         self.timestamp_model.set_candidates([])
         self.column_model.set_mappings([])
         self.timestamp_page.override_edit.clear()
+        self._reset_reconstruction_ui()
         self.complete_page.set_result(None)
         self.review_page.refresh(None, None)
         self._set_step(WizardStep.LOAD_FILE)
@@ -424,6 +429,9 @@ class ImportWizardDialog(QDialog):
         self.preview_model.set_preview(result.raw_preview)
         self.timestamp_model.set_candidates(result.timestamp_candidates)
         self.column_model.set_mappings(result.column_mappings)
+        best = self.timestamp_model.selected_candidate()
+        if best is not None:
+            self._run_truncation_detection(best)
         was_blocked = self.timestamp_page.override_edit.blockSignals(True)
         self.timestamp_page.override_edit.clear()
         self.timestamp_page.override_edit.blockSignals(was_blocked)
@@ -456,8 +464,8 @@ class ImportWizardDialog(QDialog):
         candidate = self.timestamp_model.selected_candidate()
         if self._session is not None and candidate is not None:
             self._session.selected_timestamp_column = candidate.column_name
-            # Invalidate any stale repair plan so the next build derives it fresh.
             self._session.timestamp_repair_plan = None
+            self._run_truncation_detection(candidate)
             self._sync_timestamp_override_plan()
             self._refresh_timestamp_override_feedback()
             self._invalidate_execution_state("Timestamp selection changed.")
@@ -471,6 +479,94 @@ class ImportWizardDialog(QDialog):
 
     def _reset_timestamp_override(self) -> None:
         self.timestamp_page.override_edit.clear()
+
+    def _reset_reconstruction_ui(self) -> None:
+        """Reset reconstruction panel to default state without emitting signals."""
+        for w in (
+            self.timestamp_page.recon_enable_check,
+            self.timestamp_page.recon_rate_spin,
+        ):
+            w.blockSignals(True)
+        self.timestamp_page.recon_start_edit.blockSignals(True)
+        self.timestamp_page.recon_enable_check.setChecked(False)
+        self.timestamp_page.recon_start_edit.clear()
+        self.timestamp_page.recon_rate_spin.setValue(0.001)
+        self.timestamp_page.recon_status_label.setText("No truncation detected.")
+        self.timestamp_page.recon_dt_label.setText("")
+        self.timestamp_page.recon_sample_label.setText("")
+        for w in (
+            self.timestamp_page.recon_enable_check,
+            self.timestamp_page.recon_rate_spin,
+        ):
+            w.blockSignals(False)
+        self.timestamp_page.recon_start_edit.blockSignals(False)
+
+    def _run_truncation_detection(self, candidate) -> None:
+        """Analyse candidate for truncated timestamps and populate the UI panel.
+
+        Signals on the reconstruction widgets are blocked so that auto-population
+        does not trigger _on_recon_setting_changed — the calling site handles any
+        required plan invalidation.
+        """
+        fmt = candidate.detected_format
+        if fmt in (None, "excel_serial"):
+            fmt = None
+        analysis = detect_timestamp_truncation(candidate.example_values, fmt=fmt)
+        for w in (
+            self.timestamp_page.recon_enable_check,
+            self.timestamp_page.recon_rate_spin,
+        ):
+            w.blockSignals(True)
+        self.timestamp_page.update_truncation_analysis(analysis)
+        for w in (
+            self.timestamp_page.recon_enable_check,
+            self.timestamp_page.recon_rate_spin,
+        ):
+            w.blockSignals(False)
+        self.timestamp_page.recon_sample_label.setText(
+            self._generate_reconstruction_sample(candidate)
+        )
+
+    def _on_recon_setting_changed(self) -> None:
+        if self._session is None:
+            return
+        candidate = self.timestamp_model.selected_candidate()
+        if candidate is not None:
+            self.timestamp_page.recon_sample_label.setText(
+                self._generate_reconstruction_sample(candidate)
+            )
+        self._sync_timestamp_override_plan()
+        self._invalidate_execution_state("Timestamp reconstruction setting changed.")
+
+    def _generate_reconstruction_sample(self, candidate) -> str:
+        """Return a short preview string of the first 5 reconstructed timestamps."""
+        if not candidate or not candidate.example_values:
+            return ""
+        hz = self.timestamp_page.reconstruction_sample_rate_hz or 50.0
+        try:
+            import pandas as pd
+            from datetime import timedelta
+            fmt = candidate.detected_format
+            if fmt in (None, "excel_serial"):
+                fmt = None
+            raw = pd.Series(candidate.example_values[:20], dtype=str)
+            parsed = pd.to_datetime(raw, format=fmt if fmt else "mixed", errors="coerce")
+            valid = parsed.dropna()
+            if valid.empty:
+                return ""
+            start_text = self.timestamp_page.reconstruction_start_datetime
+            if start_text:
+                try:
+                    first_ts = pd.Timestamp(start_text)
+                except Exception:
+                    first_ts = valid.iloc[0]
+            else:
+                first_ts = valid.iloc[0]
+            dt_td = timedelta(seconds=1.0 / hz)
+            samples = [first_ts + i * dt_td for i in range(5)]
+            return "  →  ".join(t.strftime("%H:%M:%S.%f")[:12] for t in samples)
+        except Exception:
+            return ""
 
     def _on_column_mapping_changed(self, *_args) -> None:
         if self._session is None:
@@ -740,6 +836,21 @@ class ImportWizardDialog(QDialog):
             return
         candidate = self.timestamp_model.selected_candidate()
         if candidate is None:
+            return
+
+        # Reconstruction takes priority over format-only overrides.
+        if self.timestamp_page.reconstruction_enabled:
+            hz = self.timestamp_page.reconstruction_sample_rate_hz
+            start_dt = self.timestamp_page.reconstruction_start_datetime or None
+            self._session.timestamp_repair_plan = TimestampRepairPlan(
+                strategy=TimestampRepairStrategy.RECONSTRUCT_HYBRID,
+                detected_format=candidate.detected_format,
+                sampling_interval_seconds=(1.0 / hz) if hz else None,
+                override_sample_rate_hz=hz,
+                override_start_datetime=start_dt if start_dt else None,
+                repair_validated=True,
+                repair_notes="Anchor-based sub-interval reconstruction enabled.",
+            )
             return
 
         manual_format = self.timestamp_page.override_edit.text().strip()

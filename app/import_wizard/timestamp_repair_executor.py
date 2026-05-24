@@ -377,6 +377,120 @@ def execute_excel_serial_conversion(
     return normalized, diag, msgs
 
 
+def execute_reconstruct_hybrid(
+    raw_series: pd.Series,
+    plan: TimestampRepairPlan,
+    aux_series: dict[str, pd.Series] | None = None,
+) -> tuple[pd.Series, RepairDiagnostics, list[ValidationMessage]]:
+    """Hybrid anchor + sub-interval reconstruction for low-resolution timestamps.
+
+    Each distinct consecutive anchor value is treated as the floor of a time
+    window.  Within that window, samples are assigned:
+
+        t[i_in_window] = anchor + i_in_window × dt
+
+    where dt = 1 / sample_rate_hz.  When date and time live in separate columns
+    (plan.date_column + plan.time_column) they are combined before parsing.
+
+    The user may override:
+        plan.override_start_datetime  — forces the first anchor to a specific time.
+        plan.override_sample_rate_hz  — uses an explicit Fs instead of the inferred one.
+        plan.sampling_interval_seconds — alternative to override_sample_rate_hz.
+    """
+    msgs: list[ValidationMessage] = []
+    aux = aux_series or {}
+    n = len(raw_series)
+
+    # --- Step 1: Parse anchor timestamps -----------------------------------
+    fmt = plan.detected_format or plan.user_format
+    date_col = plan.date_column
+    time_col = plan.time_column
+
+    if date_col and time_col:
+        date_s = aux.get(date_col, raw_series)
+        time_s = aux.get(time_col)
+        if time_s is None:
+            msgs.append(ValidationMessage(
+                severity=ValidationSeverity.WARNING,
+                code="TS_HYBRID_NO_TIME_COL",
+                message=f"Time column '{time_col}' not in aux_series; using date column only.",
+            ))
+            combined = date_s.astype(str)
+        else:
+            combined = date_s.astype(str).str.strip() + " " + time_s.astype(str).str.strip()
+        anchors = pd.to_datetime(combined, format="mixed", errors="coerce")
+    else:
+        anchors = _coerce_to_datetime(raw_series, fmt=fmt)
+
+    # --- Step 2: Determine dt ----------------------------------------------
+    hz: float | None = plan.override_sample_rate_hz
+    if hz is None and plan.sampling_interval_seconds and plan.sampling_interval_seconds > 0:
+        hz = 1.0 / plan.sampling_interval_seconds
+    if hz is None or hz <= 0:
+        msgs.append(ValidationMessage(
+            severity=ValidationSeverity.WARNING,
+            code="TS_HYBRID_NO_RATE",
+            message="Sample rate not specified and could not be inferred; defaulting to 50 Hz.",
+        ))
+        hz = 50.0
+    dt_s = 1.0 / hz
+
+    # --- Step 3: Override first anchor if user specified start datetime -----
+    override_ts: pd.Timestamp | None = None
+    if plan.override_start_datetime:
+        try:
+            override_ts = pd.Timestamp(plan.override_start_datetime)
+        except Exception:  # noqa: BLE001
+            msgs.append(ValidationMessage(
+                severity=ValidationSeverity.WARNING,
+                code="TS_HYBRID_BAD_START",
+                message=f"Could not parse override start datetime '{plan.override_start_datetime}'; "
+                        "using first anchor from file.",
+            ))
+
+    # --- Step 4: Walk consecutive runs and assign times --------------------
+    result_vals: list[pd.Timestamp | type(pd.NaT)] = [pd.NaT] * n
+    i = 0
+    first_group = True
+    while i < n:
+        anchor_raw = anchors.iloc[i]
+        if pd.isna(anchor_raw):
+            i += 1
+            continue
+        # Collect the full consecutive run with this anchor value
+        j = i + 1
+        while j < n and anchors.iloc[j] == anchor_raw:
+            j += 1
+        # Determine the effective anchor for this group
+        if first_group and override_ts is not None:
+            effective_anchor = override_ts
+            first_group = False
+        else:
+            effective_anchor = anchor_raw
+            first_group = False
+        # Assign sub-interval times: anchor is the floor of the window
+        dt_td = pd.Timedelta(seconds=dt_s)
+        for k in range(j - i):
+            result_vals[i + k] = effective_anchor + k * dt_td
+        i = j
+
+    normalized = pd.Series(result_vals, index=raw_series.index, dtype="datetime64[ns]")
+    repaired = int(normalized.notna().sum())
+
+    msgs.append(ValidationMessage(
+        severity=ValidationSeverity.INFO,
+        code="TS_HYBRID_RECONSTRUCTED",
+        message=(
+            f"Hybrid reconstruction applied: {repaired} timestamps rebuilt "
+            f"at {hz:.2f} Hz ({dt_s * 1000:.3f} ms/sample) from anchor windows."
+        ),
+    ))
+
+    diag = _build_diagnostics(plan.strategy, raw_series, normalized, repaired_rows=repaired)
+    msgs += _messages_from_diagnostics(diag)
+    return normalized, diag, msgs
+
+
 def execute_timezone_alignment(
     raw_series: pd.Series,
     plan: TimestampRepairPlan,
@@ -444,6 +558,7 @@ _EXECUTORS = {
     TimestampRepairStrategy.COMBINE_DATE_TIME_COLUMNS: execute_combine_date_time_columns,
     TimestampRepairStrategy.EXCEL_SERIAL_CONVERSION:   execute_excel_serial_conversion,
     TimestampRepairStrategy.TIMEZONE_ALIGNMENT:        execute_timezone_alignment,
+    TimestampRepairStrategy.RECONSTRUCT_HYBRID:        execute_reconstruct_hybrid,
 }
 
 

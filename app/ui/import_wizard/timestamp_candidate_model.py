@@ -11,7 +11,7 @@ from app.import_wizard.models import TimestampCandidate
 class TimestampCandidateTableModel(QAbstractTableModel):
     """Displays timestamp candidates and tracks one selected candidate."""
 
-    HEADERS = ["Selected", "Column", "Confidence", "Format", "Invalid Samples"]
+    HEADERS = ["Selected", "Column", "Confidence", "Format", "Invalid Samples", "Timestamp Sample"]
 
     def __init__(self, candidates: list[TimestampCandidate] | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -74,6 +74,9 @@ class TimestampCandidateTableModel(QAbstractTableModel):
             return candidate.detected_format or "auto"
         if col == 4:
             return str(candidate.invalid_sample_count)
+        if col == 5:
+            samples = candidate.example_values[:3]
+            return "  ·  ".join(str(v) for v in samples) if samples else "—"
         return None
 
     def setData(  # noqa: N802
