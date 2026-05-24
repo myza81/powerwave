@@ -69,7 +69,6 @@ _FILE_FILTER = (
     "COMTRADE (*.cfg *.comtrade);;CSV (*.csv);;Excel (*.xlsx);;All Files (*)"
 )
 _MANIFEST_FILTER = "Event Manifests (*.yaml *.yml);;All Files (*)"
-_SAMPLE_MANIFEST = Path("samples") / "manifests" / "pulu_20260306.yaml"
 
 _CSV_EXCEL_SUFFIXES = frozenset({".csv", ".xlsx", ".xls"})
 
@@ -1277,12 +1276,6 @@ class PowerwaveMainWindow(QMainWindow):
         view_menu.addAction(self._suggestion_dock.toggleViewAction())
 
         tools_menu = menu_bar.addMenu("&Tools")
-        synthetic_action = tools_menu.addAction("Load &Synthetic Mixed Disturbance")
-        synthetic_action.setShortcut("Ctrl+T")
-        synthetic_action.triggered.connect(self._on_load_synthetic_mixed)
-        pulu_action = tools_menu.addAction("Load Sample &PULU Event")
-        pulu_action.triggered.connect(self._on_load_sample_pulu)
-
         tools_menu.addSeparator()
         rms_menu = tools_menu.addMenu("&RMS Display")
         rms_group = QActionGroup(self)
@@ -1780,44 +1773,6 @@ class PowerwaveMainWindow(QMainWindow):
         QTimer.singleShot(0, lambda s=session: self._run_cross_correlation(s.sources))
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Synthetic mixed display (Phase D2)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _on_load_synthetic_mixed(self) -> None:
-        """Load and display the synthetic mixed-source disturbance (Phase D2 dev action)."""
-        from app.data.synthetic import make_mixed_disturbance_record
-        self.statusBar().showMessage("Generating synthetic mixed disturbance…")
-        result = make_mixed_disturbance_record()
-        self._time_display_mode = TimeDisplayMode.RELATIVE
-        self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
-        panel_canvases = self._vis_manager.display_grouped_record(
-            result.record, result.signal_metadata
-        )
-        # Build sequence panels if three-phase groups exist (Phase 6B)
-        seq_panels = self._build_sequence_panels(
-            result.record, result.signal_metadata, FlexiblePlotCanvas
-        )
-        panel_canvases.update(seq_panels)
-
-        # Build harmonic analysis panels (Phase 8)
-        harmonic_panels = self._build_harmonic_panels(
-            result.record, result.signal_metadata, FlexiblePlotCanvas
-        )
-        panel_canvases.update(harmonic_panels)
-
-        self._rebuild_grouped_layout(panel_canvases, result.record)
-        self._refresh_signal_browser()
-
-        if self._phasor_registry.display_mode != PhasorDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_phasor_display_mode)
-
-        if self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_harmonic_display_mode)
-
-        n = len(panel_canvases)
-        self.setWindowTitle("Powerwave — Synthetic Mixed Disturbance")
-        self.statusBar().showMessage(f"Synthetic mixed disturbance: {n} panel(s)")
-
     # ─────────────────────────────────────────────────────────────────────────
     # Manifest loading (Phase D4)
     # ─────────────────────────────────────────────────────────────────────────
@@ -1829,10 +1784,6 @@ class PowerwaveMainWindow(QMainWindow):
         )
         if path_str:
             self._load_manifest(Path(path_str))
-
-    def _on_load_sample_pulu(self) -> None:
-        """Load the built-in pulu_20260306 sample event manifest."""
-        self._load_manifest(_SAMPLE_MANIFEST)
 
     # ─────────────────────────────────────────────────────────────────────────
     # RMS display mode (Phase 5A)

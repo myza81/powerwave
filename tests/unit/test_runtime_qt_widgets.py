@@ -429,23 +429,6 @@ def test_legacy_plain_csv_record_still_routes_to_grouped_display(qapp: QApplicat
         qapp.processEvents()
 
 
-def test_synthetic_grouped_panels_keep_x_pixel_alignment(qapp: QApplication) -> None:
-    from app.ui.main_window.main_window import PowerwaveMainWindow
-
-    win = PowerwaveMainWindow()
-    try:
-        win.show()
-        qapp.processEvents()
-        win._on_load_synthetic_mixed()
-        _process_events(qapp, count=8)
-
-        # Only check visible canvases — hidden panels (e.g. harmonic THD/spectrum)
-        # have no valid pixel geometry and are excluded from alignment assertions.
-        canvases = [c for c in win._panel_canvases.values() if c.isVisible()]
-        assert len(canvases) >= 3
-        first_range = canvases[0]._primary_plot.getViewBox().viewRange()[0]
-        for canvas in canvases[1:]:
-            assert canvas._primary_plot.getViewBox().viewRange()[0] == pytest.approx(first_range)
 
         x_start, x_end = first_range
         x_mid = (x_start + x_end) / 2.0

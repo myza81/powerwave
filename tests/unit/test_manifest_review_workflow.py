@@ -35,10 +35,6 @@ class TestExistingWorkflowMethodsPresent:
         from app.ui.main_window.main_window import PowerwaveMainWindow
         assert callable(getattr(PowerwaveMainWindow, "_on_multi_source_loaded", None))
 
-    def test_on_load_sample_pulu_exists(self) -> None:
-        from app.ui.main_window.main_window import PowerwaveMainWindow
-        assert callable(getattr(PowerwaveMainWindow, "_on_load_sample_pulu", None))
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # New review workflow — public surface exists
@@ -201,10 +197,6 @@ class TestExistingWorkflowsPreserved:
     def test_on_record_loaded_exists(self) -> None:
         from app.ui.main_window.main_window import PowerwaveMainWindow
         assert callable(getattr(PowerwaveMainWindow, "_on_record_loaded", None))
-
-    def test_on_load_synthetic_mixed_exists(self) -> None:
-        from app.ui.main_window.main_window import PowerwaveMainWindow
-        assert callable(getattr(PowerwaveMainWindow, "_on_load_synthetic_mixed", None))
 
     def test_build_provider_manager_still_works(self) -> None:
         from app.ui.main_window.main_window import _build_provider_manager

@@ -49,9 +49,6 @@ class TestPanelOrderConstant:
 
 
 class TestSyntheticHandlerExists:
-    def test_on_load_synthetic_mixed_exists(self) -> None:
-        assert hasattr(PowerwaveMainWindow, "_on_load_synthetic_mixed")
-
     def test_rebuild_grouped_layout_exists(self) -> None:
         assert hasattr(PowerwaveMainWindow, "_rebuild_grouped_layout")
 
