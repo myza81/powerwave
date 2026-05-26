@@ -263,6 +263,10 @@ class SessionCanvasWidget(QWidget):
     split_by_source_requested = pyqtSignal(str)   # my_panel_id
     split_by_type_requested = pyqtSignal(str)     # my_panel_id
     measurement_cursors_moved = pyqtSignal(float, float)  # t_a, t_b  (S6)
+    cursor_a_moved = pyqtSignal(float)            # t_a — for cross-panel sync
+    cursor_b_moved = pyqtSignal(float)            # t_b — for cross-panel sync
+    measurement_mode_toggle_requested = pyqtSignal(bool)  # from right-click menu
+    cursor_sync_toggle_requested = pyqtSignal(bool)       # from right-click menu
 
     def __init__(
         self,
@@ -285,6 +289,7 @@ class SessionCanvasWidget(QWidget):
         self._cursor_a: pg.InfiniteLine | None = None  # S6
         self._cursor_b: pg.InfiniteLine | None = None  # S6
         self._measurement_mode: bool = False           # S6
+        self._cursor_sync: bool = True                 # mirrors controller state for menu display
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
 
         self._build_ui()
@@ -334,6 +339,20 @@ class SessionCanvasWidget(QWidget):
     def _show_panel_menu(self, pos) -> None:
         menu = QMenu(self)
 
+        # ── Cursor controls ───────────────────────────────────────────────────
+        cursor_act = menu.addAction("Measurement Cursors")
+        cursor_act.setCheckable(True)
+        cursor_act.setChecked(self._measurement_mode)
+        cursor_act.toggled.connect(self.measurement_mode_toggle_requested.emit)
+
+        sync_act = menu.addAction("Sync Cursors Across Panels")
+        sync_act.setCheckable(True)
+        sync_act.setChecked(self._cursor_sync)
+        sync_act.setEnabled(self._measurement_mode)
+        sync_act.toggled.connect(self.cursor_sync_toggle_requested.emit)
+
+        menu.addSeparator()
+        # ── Panel layout ─────────────────────────────────────────────────────
         merge_menu = menu.addMenu("Merge with →")
         if self._mergeable_panels:
             for pid, ptitle in self._mergeable_panels:
@@ -941,10 +960,31 @@ class SessionCanvasWidget(QWidget):
 
     def _on_cursor_a_moved(self, _line: pg.InfiniteLine) -> None:
         if self._measurement_mode:
+            self.cursor_a_moved.emit(float(self._cursor_a.value()))
             self._emit_measurement()
 
     def _on_cursor_b_moved(self, _line: pg.InfiniteLine) -> None:
+        if self._cursor_b is not None:
+            self.cursor_b_moved.emit(float(self._cursor_b.value()))
         self._emit_measurement()
+
+    def set_cursor_a_pos(self, t: float) -> None:
+        """Move cursor A silently (no signal — prevents cross-panel sync loops)."""
+        if self._cursor_a is not None:
+            self._cursor_a.blockSignals(True)
+            self._cursor_a.setValue(t)
+            self._cursor_a.blockSignals(False)
+
+    def set_cursor_b_pos(self, t: float) -> None:
+        """Move cursor B silently (no signal — prevents cross-panel sync loops)."""
+        if self._cursor_b is not None:
+            self._cursor_b.blockSignals(True)
+            self._cursor_b.setValue(t)
+            self._cursor_b.blockSignals(False)
+
+    def set_cursor_sync_state(self, enabled: bool) -> None:
+        """Update local sync flag so the right-click menu shows the correct checkmark."""
+        self._cursor_sync = enabled
 
     def _emit_measurement(self) -> None:
         if self._cursor_a is None or self._cursor_b is None:

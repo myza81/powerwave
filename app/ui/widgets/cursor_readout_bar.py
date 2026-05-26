@@ -11,8 +11,6 @@ width exceeds the panel.
 """
 from __future__ import annotations
 
-import math
-
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QFrame,
@@ -26,40 +24,11 @@ from PyQt6.QtWidgets import (
 
 
 def _fmt_value(value: float | None, unit: str) -> str:
-    """Format a channel value with appropriate precision and SI prefix."""
+    """Format a channel value as xx,xxx,xxx.xxx [unit]."""
     if value is None:
         return "—"
-    unit_l = unit.lower()
-    abs_v = abs(value)
-
-    # Choose precision based on magnitude
-    if abs_v == 0.0:
-        return f"0.000 {unit}" if unit else "0.000"
-
-    if unit_l in ("kv", "ka"):
-        # Already in kilo-units — show 3 sig figs
-        return f"{value:.3f} {unit}"
-    if unit_l in ("v", "a"):
-        if abs_v >= 1_000:
-            return f"{value / 1_000:.3f} k{unit}"
-        return f"{value:.2f} {unit}"
-    if unit_l == "hz":
-        return f"{value:.4f} {unit}"
-    if unit_l in ("mw", "mvar", "mva"):
-        return f"{value:.3f} {unit}"
-    if unit_l == "pu":
-        return f"{value:.4f} pu"
-
-    # Generic: pick decimals from magnitude
-    if abs_v >= 1_000:
-        return f"{value:.1f} {unit}" if unit else f"{value:.1f}"
-    if abs_v >= 1:
-        return f"{value:.3f} {unit}" if unit else f"{value:.3f}"
-    # sub-unit: use scientific
-    exp = int(math.floor(math.log10(abs_v))) if abs_v > 0 else 0
-    if exp < -3:
-        return f"{value:.3e} {unit}" if unit else f"{value:.3e}"
-    return f"{value:.4f} {unit}" if unit else f"{value:.4f}"
+    suffix = f" {unit}" if unit else ""
+    return f"{value:,.3f}{suffix}"
 
 
 class CursorReadoutBar(QWidget):
@@ -151,9 +120,9 @@ class CursorReadoutBar(QWidget):
         """
         # Time label
         if abs(t) < 1.0:
-            self._lbl_time.setText(f"t = {t * 1000:.3f} ms")
+            self._lbl_time.setText(f"t = {t * 1000:,.3f} ms")
         else:
-            self._lbl_time.setText(f"t = {t:.4f} s")
+            self._lbl_time.setText(f"t = {t:,.3f} s")
 
         # Rebuild chips only when channel count changes; otherwise update in-place
         if len(values) != self._last_channel_count:

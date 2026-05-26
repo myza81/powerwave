@@ -705,6 +705,18 @@ class PowerwaveMainWindow(QMainWindow):
             self._measurement_dock.hide()
             self._measurement_widget.update_measurements(None)
 
+    def _on_measurement_mode_changed_from_canvas(self, enabled: bool) -> None:
+        """Sync the View menu action when measurement mode is toggled from a canvas right-click."""
+        self._measurement_mode = enabled
+        was_blocked = self._measurement_mode_action.blockSignals(True)
+        self._measurement_mode_action.setChecked(enabled)
+        self._measurement_mode_action.blockSignals(was_blocked)
+        if enabled:
+            self._measurement_dock.show()
+        else:
+            self._measurement_dock.hide()
+            self._measurement_widget.update_measurements(None)
+
     def _on_measurement_cursors_moved(self, t_a: float, t_b: float) -> None:
         result = self._canvas.compute_current_measurements()
         if result is None:
@@ -2664,6 +2676,9 @@ class PowerwaveMainWindow(QMainWindow):
         # S6: wire measurement results to the measurement panel dock
         self._session_canvas_controller.set_measurement_callback(
             self._measurement_widget.update_measurements
+        )
+        self._session_canvas_controller.set_measurement_mode_changed_callback(
+            self._on_measurement_mode_changed_from_canvas
         )
         self._session_canvas_controller.set_time_axis_mode(
             self._time_display_mode, self._active_session

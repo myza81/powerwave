@@ -20,6 +20,7 @@ Colour strategy (Phase 9E)
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -125,6 +126,8 @@ class SessionCanvasController:
         self._scaling_registry: ScalingRegistry = ScalingRegistry()              # S5
         self._measurement_mode: bool = False      # S6
         self._measurement_callback: object = None # S6
+        self._cursor_sync: bool = True            # sync cursors across all panels
+        self._measurement_mode_changed_cb: Callable[[bool], None] | None = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
@@ -849,6 +852,17 @@ class SessionCanvasController:
         """Register a callable(MeasurementResult|None) invoked when cursors move."""
         self._measurement_callback = cb
 
+    def set_measurement_mode_changed_callback(self, cb) -> None:
+        """Register a callback(enabled: bool) to notify the main window when
+        measurement mode is toggled from the right-click canvas menu."""
+        self._measurement_mode_changed_cb = cb
+
+    def set_cursor_sync(self, enabled: bool) -> None:
+        """Enable or disable cross-panel cursor synchronisation."""
+        self._cursor_sync = enabled
+        for canvas in self._canvases.values():
+            canvas.set_cursor_sync_state(enabled)
+
     def set_measurement_mode(self, enabled: bool, session) -> None:
         """Enable or disable two-cursor measurement mode on all session panels.
 
@@ -860,6 +874,7 @@ class SessionCanvasController:
         self._session_ref = session
         for canvas in self._canvases.values():
             canvas.set_measurement_mode(enabled)
+            canvas.set_cursor_sync_state(self._cursor_sync)
 
     def compute_current_measurements(
         self, canvas: SessionCanvasWidget, session
@@ -1080,6 +1095,32 @@ class SessionCanvasController:
             other_panels = [(p, t) for p, t in panel_list if p != pid]
             canvas.set_mergeable_panels(other_panels)
 
+    def _on_canvas_cursor_a_moved(self, source: SessionCanvasWidget, t: float) -> None:
+        """Propagate cursor A position to all other canvases when sync is on."""
+        if not self._cursor_sync:
+            return
+        for canvas in self._canvases.values():
+            if canvas is not source:
+                canvas.set_cursor_a_pos(t)
+
+    def _on_canvas_cursor_b_moved(self, source: SessionCanvasWidget, t: float) -> None:
+        """Propagate cursor B position to all other canvases when sync is on."""
+        if not self._cursor_sync:
+            return
+        for canvas in self._canvases.values():
+            if canvas is not source:
+                canvas.set_cursor_b_pos(t)
+
+    def _on_measurement_toggle_from_canvas(self, enabled: bool) -> None:
+        """Handle measurement mode toggle originating from a canvas right-click menu."""
+        if self._session_ref is not None:
+            self.set_measurement_mode(enabled, self._session_ref)
+        if self._measurement_mode_changed_cb is not None:
+            self._measurement_mode_changed_cb(enabled)
+
+    def _on_cursor_sync_toggled(self, enabled: bool) -> None:
+        self.set_cursor_sync(enabled)
+
     def _wire_canvas(self, canvas: SessionCanvasWidget, sources_by_id: dict) -> None:
         """Connect legend and panel-header signals for a newly created canvas."""
         legend = canvas.legend
@@ -1110,6 +1151,18 @@ class SessionCanvasController:
         canvas.measurement_cursors_moved.connect(
             lambda t_a, t_b, _c=canvas: self._on_canvas_measurement_moved(_c, t_a, t_b)
         )
+        # Cursor sync: propagate A/B positions to all other canvases
+        canvas.cursor_a_moved.connect(
+            lambda t, _c=canvas: self._on_canvas_cursor_a_moved(_c, t)
+        )
+        canvas.cursor_b_moved.connect(
+            lambda t, _c=canvas: self._on_canvas_cursor_b_moved(_c, t)
+        )
+        # Right-click menu signals
+        canvas.measurement_mode_toggle_requested.connect(
+            self._on_measurement_toggle_from_canvas
+        )
+        canvas.cursor_sync_toggle_requested.connect(self._on_cursor_sync_toggled)
 
     def _handle_legend_colour(
         self, source_id: str, channel_name: str, color_hex: str

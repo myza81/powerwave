@@ -1182,8 +1182,15 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
 
     def _add_cursor(self) -> None:
         """Add a movable yellow master time cursor to the primary plot."""
+        if self._record is not None:
+            initial_pos = (
+                self._record.timing_info.trigger_time
+                - self._record.timing_info.start_time
+            ).total_seconds()
+        else:
+            initial_pos = 0.0
         self._cursor = pg.InfiniteLine(
-            pos=0.0,
+            pos=initial_pos,
             angle=90,
             movable=True,
             pen=pg.mkPen("#FFFF00", width=1.5, style=Qt.PenStyle.DashLine),

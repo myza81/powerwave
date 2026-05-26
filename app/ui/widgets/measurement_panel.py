@@ -33,7 +33,7 @@ def _fmt(value: float | None, decimals: int = 3, unit: str = "") -> str:
     if value is None:
         return "—"
     suffix = f" {unit}" if unit else ""
-    return f"{value:.{decimals}f}{suffix}"
+    return f"{value:,.3f}{suffix}"
 
 
 class MeasurementPanel(QWidget):
@@ -155,9 +155,9 @@ class MeasurementPanel(QWidget):
 
         # Time summary
         if result.delta_t_ms < 1000.0:
-            dt_text = f"{result.delta_t_ms:.3f} ms"
+            dt_text = f"{result.delta_t_ms:,.3f} ms"
         else:
-            dt_text = f"{result.delta_t_s:.4f} s"
+            dt_text = f"{result.delta_t_s:,.3f} s"
         self._lbl_dt.setText(dt_text)
 
         freq_text = _fmt(result.frequency_hz, 3, "Hz")
@@ -171,11 +171,11 @@ class MeasurementPanel(QWidget):
             self._lbl_energy.setVisible(True)
             energy_ws = result.energy_ws
             if abs(energy_ws) >= 1e6:
-                e_text = f"{energy_ws / 1e6:.3f} MJ"
+                e_text = f"{energy_ws / 1e6:,.3f} MJ"
             elif abs(energy_ws) >= 1e3:
-                e_text = f"{energy_ws / 1e3:.3f} kJ"
+                e_text = f"{energy_ws / 1e3:,.3f} kJ"
             else:
-                e_text = f"{energy_ws:.3f} J"
+                e_text = f"{energy_ws:,.3f} J"
             self._lbl_energy.setText(e_text)
         else:
             self._lbl_energy_key.setVisible(False)
@@ -187,15 +187,13 @@ class MeasurementPanel(QWidget):
 
         for row, ch in enumerate(channels):
             unit = ch.unit or ""
-            dec = self._decimals_for_unit(unit)
-
             self._table.setItem(row, self._COL_CHANNEL, _item(ch.name, align=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
             self._table.setItem(row, self._COL_UNIT, _item(unit))
-            self._table.setItem(row, self._COL_DY, _item(_fmt(ch.delta_y, dec)))
-            self._table.setItem(row, self._COL_RMS, _item(_fmt(ch.rms, dec)))
-            self._table.setItem(row, self._COL_MEAN, _item(_fmt(ch.mean, dec)))
-            self._table.setItem(row, self._COL_PEAK, _item(_fmt(ch.peak, dec)))
-            self._table.setItem(row, self._COL_PP, _item(_fmt(ch.peak_to_peak, dec)))
+            self._table.setItem(row, self._COL_DY, _item(_fmt(ch.delta_y)))
+            self._table.setItem(row, self._COL_RMS, _item(_fmt(ch.rms)))
+            self._table.setItem(row, self._COL_MEAN, _item(_fmt(ch.mean)))
+            self._table.setItem(row, self._COL_PEAK, _item(_fmt(ch.peak)))
+            self._table.setItem(row, self._COL_PP, _item(_fmt(ch.peak_to_peak)))
 
         self._table.resizeColumnToContents(self._COL_CHANNEL)
 
@@ -207,11 +205,3 @@ class MeasurementPanel(QWidget):
         self._lbl_energy.setVisible(False)
         self._table.setRowCount(0)
 
-    @staticmethod
-    def _decimals_for_unit(unit: str) -> int:
-        u = unit.lower()
-        if u in ("kv", "ka", "kw", "kvar"):
-            return 3
-        if u in ("v", "a", "w"):
-            return 1
-        return 3
