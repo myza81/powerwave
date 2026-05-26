@@ -53,20 +53,18 @@ class ComtradeMetadata:
 # CFG parser
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TIMESTAMP_FMTS = (
-    "%d/%m/%Y,%H:%M:%S.%f",
-    "%d/%m/%Y,%H:%M:%S",
-)
 _VALID_REV_YRS = {"1991", "1999", "2013"}
 
 
 def _parse_cfg_timestamp(s: str) -> datetime:
-    for fmt in _TIMESTAMP_FMTS:
-        try:
-            return datetime.strptime(s.strip(), fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"Cannot parse COMTRADE timestamp: {s!r}")
+    """Tolerant COMTRADE timestamp parser — see comtrade_provider._parse_timestamp."""
+    from app.providers.comtrade.comtrade_provider import _parse_timestamp
+    from pathlib import Path
+    from app.providers.base.exceptions import ProviderLoadError
+    try:
+        return _parse_timestamp(s.strip(), Path("<inspect>"))
+    except ProviderLoadError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _locate_cfg(path: Path) -> Path:

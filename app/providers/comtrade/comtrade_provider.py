@@ -22,15 +22,13 @@ from app.providers.base.base_provider import BaseProvider
 from app.providers.base.exceptions import ProviderLoadError
 
 _SUPPORTED_SUFFIXES = {".cfg", ".comtrade"}
-_TIMESTAMP_FMT_SUBSEC = "%d/%m/%Y,%H:%M:%S.%f"
-_TIMESTAMP_FMT_WHOLE = "%d/%m/%Y,%H:%M:%S"
 _DEFAULT_REV_YR = "1999"
 _DEFAULT_NOMINAL_FREQ = 50.0
 _DEFAULT_TIMEMULT = 1.0
 _MICROSECONDS_PER_SECOND = 1_000_000.0
 _VALID_REV_YRS = {"1991", "1999", "2013"}
 # Non-standard revision years written by some IEDs — mapped silently to nearest standard.
-_NONSTANDARD_REV_YR_MAP = {"2005": "1999"}
+_NONSTANDARD_REV_YR_MAP = {"2001": "1999", "2005": "1999"}
 _VALID_DAT_FORMATS = {"ASCII", "BINARY", "BINARY32"}
 
 
@@ -233,16 +231,82 @@ def _parse_digital_line(line: str, default_index: int) -> _DigitalDef:
 
 
 def _parse_timestamp(s: str, path: Path) -> datetime:
-    """Parse COMTRADE timestamp: DD/MM/YYYY,HH:MM:SS[.ffffff]"""
-    for fmt in (_TIMESTAMP_FMT_SUBSEC, _TIMESTAMP_FMT_WHOLE):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    raise ProviderLoadError(
-        f"Cannot parse timestamp '{s}' in '{path}': "
-        "expected DD/MM/YYYY,HH:MM:SS[.ffffff]"
-    )
+    """Parse a COMTRADE CFG timestamp into a datetime.
+
+    Tolerates the real-world format variety found in relay recordings:
+
+    Separators
+        Comma (standard) or space between date and time parts.
+
+    Date order
+        DD/MM/YYYY (IEEE C37.111 standard, default).
+        MM/DD/YY or MM/DD/YYYY — auto-detected when the middle component
+        exceeds 12 (cannot be a valid month, so must be the day).
+
+    Year width
+        4-digit years (preferred) or 2-digit years:
+        00–69 → 2000–2069, 70–99 → 1970–1999.
+
+    Subseconds
+        1–6 fractional digits (padded or truncated to microseconds).
+        Missing fractional part → microsecond = 0.
+    """
+    s = s.strip()
+    # Split date and time on comma (standard) or first space
+    if "," in s:
+        date_str, time_str = s.split(",", 1)
+    elif " " in s:
+        date_str, time_str = s.split(" ", 1)
+    else:
+        raise ProviderLoadError(
+            f"Cannot parse timestamp '{s}' in '{path}': "
+            "expected date,time or date time"
+        )
+
+    date_str = date_str.strip()
+    time_str = time_str.strip()
+
+    d_parts = date_str.split("/")
+    if len(d_parts) != 3:
+        raise ProviderLoadError(
+            f"Cannot parse timestamp date '{date_str}' in '{path}'"
+        )
+    try:
+        p1, p2, p3 = int(d_parts[0]), int(d_parts[1]), int(d_parts[2])
+    except ValueError as exc:
+        raise ProviderLoadError(
+            f"Cannot parse timestamp date '{date_str}' in '{path}'"
+        ) from exc
+
+    # If the middle component > 12 it cannot be a month → MM/DD/Y[Y] format
+    if p2 > 12:
+        month, day, year = p1, p2, p3
+    else:
+        day, month, year = p1, p2, p3
+
+    # 2-digit year expansion: 00-69 → 2000s, 70-99 → 1900s
+    if year < 100:
+        year += 2000 if year < 70 else 1900
+
+    t_parts = time_str.split(":")
+    try:
+        hour = int(t_parts[0])
+        minute = int(t_parts[1])
+        sec_str = t_parts[2] if len(t_parts) > 2 else "0"
+        sec_parts = sec_str.split(".")
+        second = int(sec_parts[0])
+        microsecond = int(sec_parts[1].ljust(6, "0")[:6]) if len(sec_parts) > 1 else 0
+    except (IndexError, ValueError) as exc:
+        raise ProviderLoadError(
+            f"Cannot parse timestamp time '{time_str}' in '{path}'"
+        ) from exc
+
+    try:
+        return datetime(year, month, day, hour, minute, second, microsecond)
+    except ValueError as exc:
+        raise ProviderLoadError(
+            f"Cannot parse timestamp '{s}' in '{path}': {exc}"
+        ) from exc
 
 
 def _find_dat_file(cfg_path: Path) -> Path:
@@ -330,10 +394,13 @@ def _parse_cfg(cfg_path: Path) -> _CfgData:
             f"Cannot parse nrates '{nrates_line}' in '{cfg_path}'"
         ) from exc
 
-    # Sampling rate sections
+    # Sampling rate sections.
+    # nrates == 0 means variable rate, but the CFG still contains exactly one
+    # sentinel line "0,<total_samples>" — consume it unconditionally.
     sampling_rates: list[float] = []
     endsamps: list[int] = []
-    for i in range(n_rates):
+    n_sections = max(n_rates, 1)
+    for i in range(n_sections):
         rate_line = _get_cfg_line(lines, idx, f"rate section {i + 1}", cfg_path)
         idx += 1
         rate_parts = [p.strip() for p in rate_line.split(",")]

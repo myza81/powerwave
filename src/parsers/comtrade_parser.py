@@ -180,36 +180,18 @@ def build_time_array(rate_sections: list[dict]) -> np.ndarray:
 def _parse_timestamp(date_str: str, time_str: str) -> datetime:
     """Parse a COMTRADE date + time string pair into a datetime.
 
-    Handles:
-    - Standard COMTRADE date format  DD/MM/YYYY
-    - Non-standard NARI date format  MM/DD/YY   (auto-detected when middle
-      component > 12, since it cannot be a valid month)
-    - Microseconds with 1–6 fractional digits (zero-padded / truncated to 6)
+    Delegates to the canonical implementation in comtrade_provider so both
+    parsers stay in sync.  The combined "date,time" string is reconstructed
+    for compatibility with the shared function signature.
     """
-    d_parts = date_str.strip().split('/')
-    p1, p2, p3 = int(d_parts[0]), int(d_parts[1]), int(d_parts[2])
-
-    # If the middle component exceeds 12 it cannot be a month → MM/DD/YY
-    if p2 > 12:
-        month, day, year = p1, p2, p3
-    else:
-        day, month, year = p1, p2, p3
-
-    # Two-digit year: 00–69 → 2000s, 70–99 → 1900s
-    if year < 100:
-        year += 2000 if year < 70 else 1900
-
-    t_parts = time_str.strip().split(':')
-    hour = int(t_parts[0])
-    minute = int(t_parts[1])
-    sec_frac = t_parts[2].split('.')
-    second = int(sec_frac[0])
-    microsecond = 0
-    if len(sec_frac) > 1:
-        frac = sec_frac[1].ljust(6, '0')[:6]
-        microsecond = int(frac)
-
-    return datetime(year, month, day, hour, minute, second, microsecond)
+    from app.providers.comtrade.comtrade_provider import _parse_timestamp as _pt
+    from pathlib import Path
+    from app.providers.base.exceptions import ProviderLoadError
+    combined = f"{date_str.strip()},{time_str.strip()}"
+    try:
+        return _pt(combined, Path("<legacy_parser>"))
+    except ProviderLoadError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 # ── ComtradeParser ────────────────────────────────────────────────────────────
