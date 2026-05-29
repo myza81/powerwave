@@ -176,18 +176,3 @@ class TestFlexibleCanvasPhasorStability:
             qapp.processEvents()
 
 
-class TestSequencePanelStability:
-    def test_missing_three_phase_groups_returns_no_panels(self, qapp) -> None:
-        from app.ui.main_window.main_window import PowerwaveMainWindow
-
-        win = PowerwaveMainWindow()
-        try:
-            panels = win._build_sequence_panels(
-                _single_channel_record("VA", "V"),
-                signal_metadata=None,
-                canvas_factory=lambda: None,
-            )
-            assert panels == {}
-        finally:
-            win.close()
-            qapp.processEvents()

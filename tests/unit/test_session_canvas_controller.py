@@ -135,15 +135,16 @@ def test_rebuild_layout_reuses_canvases(qapp) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. rebuild_layout returns a QSplitter
+# 3. rebuild_layout returns a QScrollArea wrapping a QSplitter
 # ---------------------------------------------------------------------------
 
 
 def test_rebuild_layout_returns_splitter(qapp) -> None:
+    from PyQt6.QtWidgets import QScrollArea
     session = _build_session(n_sources=1)
     ctrl = SessionCanvasController()
     result = ctrl.rebuild_layout(session)
-    assert isinstance(result, QSplitter)
+    assert isinstance(result, QScrollArea)
 
 
 # ---------------------------------------------------------------------------

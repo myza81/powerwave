@@ -140,6 +140,40 @@ def clip_digital_to_viewport(
     return t_out, d_out
 
 
+def build_hi_lo_segments(
+    t_trans: np.ndarray,
+    d_trans: np.ndarray,
+    y: float,
+    target_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build NaN-separated horizontal line segments for one binary state.
+
+    Each contiguous run of target_state becomes a horizontal segment at y.
+    NaN markers between segments allow a single PlotDataItem to render
+    multiple disconnected horizontal lines.
+
+    Returns (t_arr, y_arr) ready for curve.setData().
+    """
+    if len(t_trans) < 2:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+
+    segs_t: list[float] = []
+    segs_y: list[float] = []
+    for i in range(len(d_trans) - 1):
+        if int(d_trans[i]) == target_state:
+            segs_t += [float(t_trans[i]), float(t_trans[i + 1]), np.nan]
+            segs_y += [y, y, np.nan]
+
+    if not segs_t:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+
+    return (
+        np.array(segs_t[:-1], dtype=np.float64),
+        np.array(segs_y[:-1], dtype=np.float64),
+    )
+
+
+
 def build_step_series(
     t: np.ndarray,
     d: np.ndarray,

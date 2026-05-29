@@ -42,17 +42,13 @@ from app.intelligence import RuleManager
 from app.models import DisturbanceRecord
 from app.providers import ProviderManager, ComtradeProvider, CsvProvider, ExcelProvider
 from app.visualization.axis.datetime_axis import TimeDisplayMode
-from app.visualization.managers.visualization_manager import VisualizationManager
+from app.visualization.managers.synchronization_manager import SynchronizationManager
 from app.visualization.overlays.overlay_colors import sequence_curve_label
 from app.visualization.performance import timed_section
-from app.visualization.widgets.flexible_plot_canvas import FlexiblePlotCanvas
-from app.visualization.widgets.digital_event_timeline import DigitalEventTimeline
 from app.ui.import_wizard import ImportWizardDialog
 from app.ui.session import SessionCanvasController, SessionPanel
-from app.ui.widgets import SignalBrowserDock, SignalBrowserEntry
 from app.ui.widgets.measurement_panel import MeasurementPanel
 from app.ui.widgets.event_list_panel import EventListPanel
-from app.ui.widgets.cursor_readout_bar import CursorReadoutBar
 from app.ui.widgets.quality_report_panel import QualityReportPanel
 from app.analytics.quality import RecordQuality, compute_quality_fingerprint
 from app.ui.widgets.fault_summary_panel import FaultSummaryPanel
@@ -140,14 +136,6 @@ _PANEL_ORDER = [
     "rocof",
     "other",
 ]
-
-_HARMONIC_PANEL_KEYS: frozenset[str] = frozenset({
-    "thd_voltage",
-    "thd_current",
-    "harmonic_spectrum_voltage",
-    "harmonic_spectrum_current",
-})
-
 
 def _log_direct_open_mapping(filename: str, signal_metadata: dict) -> None:
     """Diagnostic log of channel → display group for a direct CSV/Excel open."""
@@ -321,20 +309,7 @@ class _IntelligentLoadWorker(QRunnable):
 
 
 class PowerwaveMainWindow(QMainWindow):
-    """Powerwave viewer — standard and grouped multi-panel display modes.
-
-    Standard layout (Phase 4A):
-      QSplitter(Vertical): FlexiblePlotCanvas (stretch=3) + DigitalEventTimeline (stretch=1)
-      Activated by File → Open or on application start.
-
-    Grouped layout (Phase D2):
-      QSplitter(Vertical): one FlexiblePlotCanvas per non-empty display group.
-      Activated by Tools → Load Synthetic Mixed Disturbance.
-      X-axes linked via QTimer.singleShot(0) after layout is shown.
-
-    VisualizationManager is held as an instance attribute to prevent GC of
-    cursor_moved signal connections (pyqtSignal weak-ref contract).
-    """
+    """Powerwave viewer — session canvas workspace."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -344,12 +319,7 @@ class PowerwaveMainWindow(QMainWindow):
         self._provider_manager = _build_provider_manager()
         self._rule_manager = RuleManager()
         self._intelligence_manager = self._rule_manager.intelligence_manager
-        self._canvas = FlexiblePlotCanvas()
-        self._timeline = DigitalEventTimeline()
-        self._vis_manager = VisualizationManager(self._canvas, self._timeline)
-        self._x_axis_linked: bool = False
-        self._panel_canvases: dict = {}
-        self._grouped_timeline = None
+        self._sync_manager = SynchronizationManager()
 
         # RMS display state (Phase 5A)
         self._rms_display_mode: RMSDisplayMode = RMSDisplayMode.OFF
@@ -375,14 +345,13 @@ class PowerwaveMainWindow(QMainWindow):
         self._harmonic_panel_cache_record_id: int | None = None
         self._performance_timing_enabled = False
         self._performance_timing_sink = None
-        self._signal_browser = SignalBrowserDock(self)
-        self._signal_entry_targets: dict[str, tuple[str, str, str]] = {}
 
         # Session workspace (Phase 9B/9D)
         self._active_session = None                              # EventAnalysisSession | None
         self._session_panel: SessionPanel | None = None
         self._session_canvas_controller: SessionCanvasController | None = None
         self._session_canvas_active: bool = False
+        self._session_navigator = None                           # WaveformNavigatorStrip | None
 
         # Measurement panel (Phase 1 Enhancement)
         self._measurement_dock = self._build_measurement_dock()
@@ -390,9 +359,6 @@ class PowerwaveMainWindow(QMainWindow):
 
         # Event list panel (Phase 2 Enhancement)
         self._event_dock = self._build_event_dock()
-
-        # Cursor readout bar (Phase 3 Enhancement)
-        self._cursor_readout_dock = self._build_cursor_readout_dock()
 
         # Data quality fingerprint (Phase 4 Enhancement)
         self._quality_fingerprint: RecordQuality | None = None
@@ -415,14 +381,10 @@ class PowerwaveMainWindow(QMainWindow):
         self._last_suggestion_correlation: list = []
 
         self._build_layout()
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._signal_browser)
-        self._signal_browser.visibility_changed.connect(self._on_signal_visibility_changed)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._measurement_dock)
         self._measurement_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._event_dock)
         self._event_dock.hide()
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._cursor_readout_dock)
-        self._cursor_readout_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._quality_dock)
         self._quality_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._fault_dock)
@@ -433,22 +395,15 @@ class PowerwaveMainWindow(QMainWindow):
         self._correlation_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self._suggestion_dock)
         self._suggestion_dock.hide()
-        self._canvas.measurement_cursors_moved.connect(self._on_measurement_cursors_moved)
-        self._canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
+
         self._build_menu()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Qt overrides
     # ─────────────────────────────────────────────────────────────────────────
 
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        if not self._x_axis_linked:
-            self._vis_manager.link_x_axis()
-            self._x_axis_linked = True
-
     def closeEvent(self, event) -> None:
-        self._vis_manager.synchronization_manager.clear()
+        self._sync_manager.clear()
         super().closeEvent(event)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -456,211 +411,18 @@ class PowerwaveMainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_layout(self) -> None:
-        self._restore_standard_layout()
+        from PyQt6.QtWidgets import QLabel
+        placeholder = QLabel("Open a file to begin (File → Open…)")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCentralWidget(placeholder)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
 
-    @staticmethod
-    def _qt_widget_alive(widget) -> bool:
-        """Return False when a Python Qt wrapper points at a deleted C++ object."""
-        if widget is None:
-            return False
-        try:
-            return not sip.isdeleted(widget)
-        except RuntimeError:
-            return False
-
-    def _detach_if_alive(self, widget) -> None:
-        if self._qt_widget_alive(widget):
-            widget.setParent(None)
-
     def _clear_sync_before_layout_switch(self) -> None:
         try:
-            self._vis_manager.synchronization_manager.clear()
+            self._sync_manager.clear()
         except RuntimeError:
             pass
-
-    def _ensure_standard_widgets_alive(self) -> None:
-        """Recreate standard widgets if Qt deleted their underlying objects."""
-        canvas_alive = self._qt_widget_alive(self._canvas)
-        timeline_alive = self._qt_widget_alive(self._timeline)
-        if canvas_alive and timeline_alive:
-            return
-
-        self._clear_sync_before_layout_switch()
-        if not canvas_alive:
-            self._canvas = FlexiblePlotCanvas()
-        if not timeline_alive:
-            self._timeline = DigitalEventTimeline()
-        self._vis_manager = VisualizationManager(self._canvas, self._timeline)
-        self._x_axis_linked = False
-
-    def _link_standard_x_axis(self) -> None:
-        if not (
-            self._qt_widget_alive(self._canvas)
-            and self._qt_widget_alive(self._timeline)
-        ):
-            return
-        right_axes = self._canvas.right_axis_count()
-        self._canvas.reserve_grouped_axis_columns(right_axes)
-        self._timeline.reserve_grouped_axis_columns(right_axes)
-        self._timeline.match_viewbox_geometry(self._canvas._primary_plot.getViewBox())
-        self._vis_manager.link_x_axis()
-        t_start, t_end = self._canvas._primary_plot.getViewBox().viewRange()[0]
-        self._timeline.normalize_viewport(t_start, t_end)
-        self._x_axis_linked = True
-        QTimer.singleShot(0, self._match_standard_timeline_geometry)
-
-    def _match_standard_timeline_geometry(self) -> None:
-        if not (
-            self._qt_widget_alive(self._canvas)
-            and self._qt_widget_alive(self._timeline)
-        ):
-            return
-        self._timeline.match_viewbox_geometry(self._canvas._primary_plot.getViewBox())
-
-    def _restore_standard_layout(self) -> None:
-        """Restore the two-pane standard layout (canvas + timeline)."""
-        self._clear_sync_before_layout_switch()
-        self._ensure_standard_widgets_alive()
-        self._timeline.show()
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self._canvas)
-        splitter.addWidget(self._timeline)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        self.setCentralWidget(splitter)
-        self._panel_canvases = {}
-        self._grouped_timeline = None
-        self._quality_fingerprint = None
-        self._fault_summary_widget.clear_fault()
-        self._protection_timing_widget.clear_timing()
-        self._correlation_widget.clear_results()
-        self._suggestion_widget.clear_suggestions()
-        self._last_suggestion_events = []
-        self._last_suggestion_fault = None
-        self._last_suggestion_protection = None
-        self._last_suggestion_correlation = []
-        self._refresh_signal_browser()
-        if self.isVisible() and not self._x_axis_linked:
-            QTimer.singleShot(0, self._link_standard_x_axis)
-
-    def _rebuild_grouped_layout(
-        self,
-        panel_canvases: dict,
-        record: DisturbanceRecord,
-    ) -> None:
-        """Replace central widget with grouped stacked display.
-
-        Panels are inserted in _PANEL_ORDER; any unrecognised groups follow.
-        Synchronization registration is deferred via QTimer.singleShot(0) so
-        PyQtGraph scenes are fully initialised before signal wiring is attached.
-
-        Each panel canvas is given a minimum height (180 px) so the QSplitter
-        cannot collapse any panel to zero.  Initial splitter sizes are set
-        explicitly so all panels share space equally on first show — without
-        this the splitter may give the top panel all available space.
-        """
-        self._clear_sync_before_layout_switch()
-        self._ensure_standard_widgets_alive()
-        self._detach_if_alive(self._canvas)
-        if not record.digital_channels:
-            self._detach_if_alive(self._timeline)
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-
-        ordered_keys = [k for k in _PANEL_ORDER if k in panel_canvases]
-        known = set(ordered_keys)
-        for k in panel_canvases:
-            if k not in known:
-                ordered_keys.append(k)
-
-        self._panel_canvases = {}
-        for i, key in enumerate(ordered_keys):
-            canvas = panel_canvases[key]
-            canvas.setMinimumHeight(180)
-            splitter.addWidget(canvas)
-            splitter.setStretchFactor(i, 1)
-            self._panel_canvases[key] = canvas
-
-        self._grouped_timeline = None
-        if record.digital_channels:
-            self._timeline.show()
-            self._timeline.setMinimumHeight(80)
-            splitter.addWidget(self._timeline)
-            splitter.setStretchFactor(len(ordered_keys), 1)
-            self._grouped_timeline = self._timeline
-        else:
-            self._timeline.clear()
-            self._timeline.hide()
-
-        # Seed equal initial sizes so the splitter distributes space evenly
-        # before any window resize.  Each panel gets 300 px; Qt will scale
-        # proportionally to the real window height on the first paint event.
-        n_panels = len(ordered_keys) + (1 if record.digital_channels else 0)
-        splitter.setSizes([300] * n_panels)
-
-        self.setCentralWidget(splitter)
-        self._refresh_signal_browser()
-        QTimer.singleShot(0, self._link_panel_x_axes)
-
-    def _link_panel_x_axes(self) -> None:
-        """Register grouped panels for synchronized X interaction.
-
-        Called via QTimer.singleShot(0) from _rebuild_grouped_layout to ensure
-        PyQtGraph items are parented into a visible scene before signal wiring.
-
-        Before synchronization, all canvases reserve the same left/right axis
-        columns so identical X values map to identical horizontal pixels even
-        when one panel has more Y axes than another.
-        """
-        if not self._panel_canvases:
-            return
-        canvases = [
-            canvas
-            for canvas in self._panel_canvases.values()
-            if self._qt_widget_alive(canvas)
-        ]
-        if not canvases:
-            self._panel_canvases = {}
-            return
-        master = canvases[0]
-
-        max_right_axes = max((canvas.right_axis_count() for canvas in canvases), default=0)
-        for canvas in canvases:
-            canvas.reserve_grouped_axis_columns(max_right_axes)
-        timeline = (
-            self._grouped_timeline
-            if self._qt_widget_alive(self._grouped_timeline)
-            else None
-        )
-        if timeline is not None:
-            timeline.reserve_grouped_axis_columns(max_right_axes)
-            timeline.match_viewbox_geometry(master._primary_plot.getViewBox())
-
-        self._vis_manager.register_synchronized_panels(
-            canvases,
-            timeline=timeline,
-        )
-
-        t_start, t_end = master._primary_plot.getViewBox().viewRange()[0]
-        for canvas in canvases[1:]:
-            canvas.normalize_viewport(t_start, t_end)
-        if timeline is not None:
-            timeline.normalize_viewport(t_start, t_end)
-            QTimer.singleShot(
-                0,
-                lambda: (
-                    timeline.match_viewbox_geometry(master._primary_plot.getViewBox())
-                    if self._qt_widget_alive(timeline) and self._qt_widget_alive(master)
-                    else None
-                ),
-            )
-        # Re-pin Y ranges on ALL canvases after synchronization registration;
-        # range propagation can trigger auto-range on sparse panels.
-        for canvas in canvases:
-            if canvas._sparse_mode:
-                canvas._force_y_ranges()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Measurement dock (Phase 1 Enhancement)
@@ -680,30 +442,15 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _on_toggle_measurement_mode(self, checked: bool) -> None:
         self._measurement_mode = checked
-        # S6: session canvas short-circuit — route through controller
         if self._session_canvas_active and self._session_canvas_controller is not None:
             self._session_canvas_controller.set_measurement_mode(
                 checked, self._active_session
             )
-            if checked:
-                self._measurement_dock.show()
-            else:
-                self._measurement_dock.hide()
-            self._measurement_widget.update_measurements(None)
-            return
-        self._canvas.set_measurement_mode(checked)
-        for canvas in self._panel_canvases.values():
-            if self._qt_widget_alive(canvas):
-                canvas.set_measurement_mode(checked)
-                canvas.measurement_cursors_moved.connect(
-                    self._on_measurement_cursors_moved
-                )
         if checked:
             self._measurement_dock.show()
-            self._measurement_widget.update_measurements(None)
         else:
             self._measurement_dock.hide()
-            self._measurement_widget.update_measurements(None)
+        self._measurement_widget.update_measurements(None)
 
     def _on_measurement_mode_changed_from_canvas(self, enabled: bool) -> None:
         """Sync the View menu action when measurement mode is toggled from a canvas right-click."""
@@ -717,12 +464,8 @@ class PowerwaveMainWindow(QMainWindow):
             self._measurement_dock.hide()
             self._measurement_widget.update_measurements(None)
 
-    def _on_measurement_cursors_moved(self, t_a: float, t_b: float) -> None:
-        result = self._canvas.compute_current_measurements()
-        if result is None:
-            sender_canvas = self.sender()
-            if hasattr(sender_canvas, "compute_current_measurements"):
-                result = sender_canvas.compute_current_measurements()
+    def _on_session_measurement_result(self, result) -> None:
+        """Forward session measurement result to the measurement panel."""
         self._measurement_widget.update_measurements(result)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -752,7 +495,6 @@ class PowerwaveMainWindow(QMainWindow):
             roles = classify_channel_roles(record.analog_channels)
             if not roles:
                 self._event_list_widget.clear()
-                self._canvas.clear_event_markers()
                 return
 
             data_by_channel: dict[str, np.ndarray] = {
@@ -778,12 +520,6 @@ class PowerwaveMainWindow(QMainWindow):
         except Exception:
             return
 
-        # Apply markers to all active canvases
-        self._canvas.add_event_markers(events)
-        for canvas in self._panel_canvases.values():
-            if self._qt_widget_alive(canvas):
-                canvas.add_event_markers(events)
-
         # Populate list panel and show the dock if events were found
         self._event_list_widget.load_events(events)
         if events:
@@ -799,45 +535,23 @@ class PowerwaveMainWindow(QMainWindow):
         self._run_protection_timing(record, events, time, data_by_channel, nominal)
 
     def _on_event_selected(self, t_start: float) -> None:
-        """Jump the canvas viewport to a detected event."""
-        window = 0.1  # ±100 ms around the event start
-        t_lo = t_start - window
-        t_hi = t_start + window
-        if self._panel_canvases:
-            for canvas in self._panel_canvases.values():
-                if self._qt_widget_alive(canvas):
-                    canvas._primary_plot.setXRange(t_lo, t_hi, padding=0)
-                    break
-        elif self._qt_widget_alive(self._canvas):
-            self._canvas._primary_plot.setXRange(t_lo, t_hi, padding=0)
+        """Jump the session canvas viewport to a detected event."""
+        if not (self._session_canvas_active and self._session_canvas_controller is not None):
+            return
+        window = 0.1
+        t_lo, t_hi = t_start - window, t_start + window
+        for canvas in self._session_canvas_controller.active_canvases():
+            canvas.normalize_viewport(t_lo, t_hi)
+            break
 
     # ─────────────────────────────────────────────────────────────────────────
     # Cursor readout dock (Phase 3 Enhancement)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _build_cursor_readout_dock(self):
-        from PyQt6.QtWidgets import QDockWidget
-        dock = QDockWidget("Cursor Readout", self)
-        dock.setObjectName("CursorReadoutDock")
-        dock.setAllowedAreas(
-            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea
-        )
-        self._cursor_readout_widget = CursorReadoutBar()
-        dock.setWidget(self._cursor_readout_widget)
-        dock.setMaximumHeight(60)
-        return dock
-
-    def _on_cursor_values_changed(self, t: float, values: list) -> None:
-        self._cursor_readout_widget.update_values(t, values)
-
-    def _connect_canvas_readout(self, canvas) -> None:
-        """Connect cursor_values_changed from a grouped-layout panel canvas."""
-        if hasattr(canvas, "cursor_values_changed"):
-            canvas.cursor_values_changed.connect(self._on_cursor_values_changed)
-
-    def _show_cursor_readout(self) -> None:
-        """Make the cursor readout dock visible (called after a record loads)."""
-        self._cursor_readout_dock.show()
+    def _on_session_crosshair_moved(self, t: float, values: list) -> None:
+        """Forward hover crosshair position + interpolated values to the session panel."""
+        if self._session_panel is not None:
+            self._session_panel.update_crosshair_readouts(t, values)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Data quality dock (Phase 4 Enhancement)
@@ -869,8 +583,6 @@ class PowerwaveMainWindow(QMainWindow):
             result = compute_quality_fingerprint(time_arr, data_arr)
             self._quality_fingerprint = result
             self._quality_widget.load_quality(result)
-            # Refresh browser to apply grade colours
-            self._refresh_signal_browser()
             # Auto-show dock if any issues were found
             from app.analytics.quality import QualityGrade
             if result.overall_grade != QualityGrade.OK:
@@ -1220,7 +932,6 @@ class PowerwaveMainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
 
         view_menu = menu_bar.addMenu("&View")
-        view_menu.addAction(self._signal_browser.toggleViewAction())
         # Session Panel toggle (Phase 9B) — created lazily on first use
         self._session_panel_action = view_menu.addAction("Session &Panel")
         self._session_panel_action.setCheckable(True)
@@ -1280,7 +991,6 @@ class PowerwaveMainWindow(QMainWindow):
         self._measurement_mode_action.toggled.connect(self._on_toggle_measurement_mode)
         view_menu.addAction(self._measurement_dock.toggleViewAction())
         view_menu.addAction(self._event_dock.toggleViewAction())
-        view_menu.addAction(self._cursor_readout_dock.toggleViewAction())
         view_menu.addAction(self._quality_dock.toggleViewAction())
         view_menu.addAction(self._fault_dock.toggleViewAction())
         view_menu.addAction(self._protection_dock.toggleViewAction())
@@ -1451,338 +1161,44 @@ class PowerwaveMainWindow(QMainWindow):
         self._on_new_session()
         self._on_add_to_session()
 
-    def _open_file_dialog(self) -> None:
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, "Open Disturbance File", "", _FILE_FILTER
-        )
-        if path_str:
-            self._load_file(Path(path_str))
-
-    def _open_import_wizard(self) -> None:
-        dlg = ImportWizardDialog(self)
-        dlg.import_completed.connect(self._on_import_wizard_record_ready)
-        dlg.exec()
-
-    def _on_import_wizard_record_ready(self, record: object) -> None:
-        if not isinstance(record, DisturbanceRecord):
-            QMessageBox.warning(
-                self,
-                "Import Wizard",
-                "Import did not return a waveform record.",
-            )
-            return
-        self._display_imported_record(record)
-
-    def _display_imported_record(self, record: DisturbanceRecord) -> None:
-        """Render an Import Wizard record through existing visualization paths."""
-        source_path = _record_source_path(record)
-        provider_type = str(getattr(record.metadata, "provider_type", "") or "import")
-        source_id = source_path.stem or record.metadata.station_name or "imported_record"
-
-        if self._panel_canvases:
-            self._restore_standard_layout()
-
-        self._time_display_mode = TimeDisplayMode.ABSOLUTE
-        self._set_time_axis_action_checked(TimeDisplayMode.ABSOLUTE)
-        axis_mode = TimeDisplayMode.ABSOLUTE.value
-        self._current_signal_metadata = {}
-
-        panel_canvases = self._vis_manager.display_grouped_record(
-            record, None, axis_mode=axis_mode
-        )
-
-        if panel_canvases:
-            seq_panels = self._build_sequence_panels(record, None, FlexiblePlotCanvas)
-            panel_canvases.update(seq_panels)
-            harmonic_panels = self._build_harmonic_panels(record, None, FlexiblePlotCanvas)
-            panel_canvases.update(harmonic_panels)
-            self._rebuild_grouped_layout(panel_canvases, record)
-        else:
-            self._vis_manager.set_record(record, axis_mode=axis_mode)
-            QTimer.singleShot(0, self._link_standard_x_axis)
-
-        self._refresh_signal_browser()
-        if self._rms_display_mode != RMSDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_rms_mode_to_all_canvases)
-        if self._phasor_registry.display_mode != PhasorDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_phasor_display_mode)
-        if self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_harmonic_display_mode)
-        self.statusBar().showMessage(_format_load_status(record))
-        self.setWindowTitle(f"Powerwave - {source_id} ({provider_type})")
-
-    def _load_file(self, path: Path) -> None:
-        self.statusBar().showMessage(f"Loading: {path.name} …")
-        worker = _IntelligentLoadWorker(
-            self._provider_manager, path, self._intelligence_manager
-        )
-        worker.signals.finished.connect(self._on_record_loaded)
-        worker.signals.error.connect(self._on_load_error)
-        QThreadPool.globalInstance().start(worker)
-
-    def _on_record_loaded(self, result: object) -> None:
-        if isinstance(result, _DirectOpenResult):
-            _log_runtime_route(
-                f"_on_record_loaded rich result provider={result.provider_type} "
-                f"path={result.path}"
-            )
-            if result.provider_type in ("csv", "excel"):
-                self._handle_direct_csv_excel(result)
-            else:
-                # COMTRADE — preserve existing set_record() behavior
-                record = result.record
-                _log_runtime_route("COMTRADE direct open -> standard set_record")
-                if self._panel_canvases:
-                    self._restore_standard_layout()
-                self._time_display_mode = TimeDisplayMode.RELATIVE
-                self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
-                self._vis_manager.set_record(record, axis_mode=TimeDisplayMode.RELATIVE.value)
-                QTimer.singleShot(0, self._link_standard_x_axis)
-                self._refresh_signal_browser()
-                QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
-                QTimer.singleShot(0, lambda r=record: self._run_quality_check(r))
-                self._show_cursor_readout()
-                self.statusBar().showMessage(_format_load_status(record))
-                title = (
-                    record.metadata.station_name
-                    or Path(record.metadata.source_file).name
-                )
-                self.setWindowTitle(f"Powerwave — {title}")
-        elif isinstance(result, DisturbanceRecord):
-            # Fallback for any legacy path that still emits a plain record
-            if _is_csv_excel_record(result):
-                _log_runtime_route(
-                    "legacy DisturbanceRecord CSV/Excel result -> grouped route"
-                )
-                self._handle_legacy_csv_excel_record(result)
-                return
-            _log_runtime_route("legacy DisturbanceRecord non-CSV result -> standard set_record")
-            if self._panel_canvases:
-                self._restore_standard_layout()
-            self._time_display_mode = TimeDisplayMode.RELATIVE
-            self._set_time_axis_action_checked(TimeDisplayMode.RELATIVE)
-            self._vis_manager.set_record(result, axis_mode=TimeDisplayMode.RELATIVE.value)
-            QTimer.singleShot(0, self._link_standard_x_axis)
-            self._refresh_signal_browser()
-            QTimer.singleShot(0, lambda r=result: self._run_event_detection(r))
-            QTimer.singleShot(0, lambda r=result: self._run_quality_check(r))
-            self._show_cursor_readout()
-            self.statusBar().showMessage(_format_load_status(result))
-            title = result.metadata.station_name or Path(result.metadata.source_file).name
-            self.setWindowTitle(f"Powerwave — {title}")
-
-    def _handle_legacy_csv_excel_record(self, record: DisturbanceRecord) -> None:
-        """Route plain CSV/Excel records through the D4.4 grouped policy."""
-        from app.data.direct_load_intelligence import (
-            build_signal_metadata,
-            detect_timestamp_ambiguity,
-        )
-
-        path = _record_source_path(record)
-        provider_type = _provider_type_from_path(path)
-        if provider_type not in {"csv", "excel"}:
-            provider_type = str(record.metadata.provider_type or "csv").lower()
-        source_id = path.stem or "csv_source"
-        signal_metadata = build_signal_metadata(
-            record, self._intelligence_manager, source_id, provider_type
-        )
-        ts_ambiguous, ts_matrices = detect_timestamp_ambiguity(path, record)
-        self._handle_direct_csv_excel(_DirectOpenResult(
-            record=record,
-            path=path,
-            provider_type=provider_type,
-            signal_metadata=signal_metadata,
-            ts_ambiguous=ts_ambiguous,
-            ts_matrices=ts_matrices,
-        ))
-
-    def _handle_direct_csv_excel(self, result: _DirectOpenResult) -> None:
-        """Display a directly-opened CSV/Excel file with intelligence-driven grouping.
-
-        Shows DataReviewDialog when the timestamp interpretation is ambiguous or
-        any column requires operator confirmation. Auto-applies for clean data.
-        Applies the operator-selected timestamp format to rebase start_time before
-        visualization, and renders with absolute datetime axis labels.
-        """
-        from PyQt6.QtWidgets import QDialog
-        from app.data.direct_load_intelligence import (
-            apply_selected_timestamp_format,
-            build_direct_open_diagnostics,
-            log_direct_open_diagnostics,
-        )
-        from app.data.multi_source_session import MultiSourceSession, SourceRecord
-        from app.data.review_summary import build_event_review_summary
-        from app.ui.dialogs.data_review_dialog import DataReviewDialog
-
-        record = result.record
-        source_id = result.path.stem or "csv_source"
-        signal_metadata: dict = result.signal_metadata
-        selected_formats: dict[str, str] = {}
-        _log_runtime_route(
-            f"_handle_direct_csv_excel executing provider={result.provider_type} "
-            f"path={result.path}"
-        )
-
-        needs_review = result.ts_ambiguous or any(
-            m.requires_user_confirmation for m in signal_metadata.values()
-        )
-
-        if needs_review:
-            source = SourceRecord(
-                source_id=source_id,
-                provider_type=result.provider_type,
-                record=record,
-                signal_metadata=signal_metadata,
-                original_start_time=record.timing_info.start_time,
-                sampling_rates=list(record.sampling_info.sampling_rates),
-            )
-            session = MultiSourceSession()
-            session.add_source(source)
-            summary = build_event_review_summary(session)
-            ts_matrices = {source_id: result.ts_matrices} if result.ts_matrices else {}
-            dlg = DataReviewDialog(summary, ts_matrices=ts_matrices, parent=self)
-            if dlg.exec() != QDialog.DialogCode.Accepted:
-                self.statusBar().showMessage("Load cancelled.")
-                return
-            self._rule_manager.save_confirmed_rows(
-                dlg.confirmed_column_rows.get(source_id, []),
-                source_id=source_id,
-            )
-            selected_formats = dlg.selected_timestamp_formats.get(source_id, {})
-
-        # Apply operator-selected timestamp format (rebases start_time only)
-        if selected_formats:
-            record = apply_selected_timestamp_format(
-                record, result.ts_matrices, selected_formats
-            )
-
-        self._time_display_mode = TimeDisplayMode.ABSOLUTE
-        self._set_time_axis_action_checked(TimeDisplayMode.ABSOLUTE)
-        axis_mode = TimeDisplayMode.ABSOLUTE.value
-
-        diag = build_direct_open_diagnostics(
-            source_path=str(result.path),
-            provider_type=result.provider_type,
-            signal_metadata=signal_metadata,
-            ts_matrices=result.ts_matrices,
-            selected_formats=selected_formats,
-            axis_mode=axis_mode,
-        )
-        log_direct_open_diagnostics(diag)
-
-        if self._panel_canvases:
-            self._restore_standard_layout()
-
-        self._current_signal_metadata = signal_metadata or {}
-
-        panel_canvases = self._vis_manager.display_grouped_record(
-            record, signal_metadata or None, axis_mode=axis_mode
-        )
-        _log_runtime_route(
-            f"display_grouped_record returned panels={list(panel_canvases.keys())}"
-        )
-        if not panel_canvases:
-            raise RuntimeError(
-                "CSV/Excel direct open produced no grouped panels; refusing "
-                "to fall back to the standard analog/digital splitter."
-            )
-
-        # Build sequence component panels if three-phase groups exist (Phase 6B)
-        seq_panels = self._build_sequence_panels(
-            record, signal_metadata or None, FlexiblePlotCanvas
-        )
-        panel_canvases.update(seq_panels)
-
-        # Build harmonic analysis panels (Phase 8)
-        harmonic_panels = self._build_harmonic_panels(
-            record, signal_metadata or None, FlexiblePlotCanvas
-        )
-        panel_canvases.update(harmonic_panels)
-
-        self._rebuild_grouped_layout(panel_canvases, record)
-        self._refresh_signal_browser()
-
-        # Re-apply RMS mode to the newly created panels if mode is active
-        if self._rms_display_mode != RMSDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_rms_mode_to_all_canvases)
-
-        # Re-apply phasor mode to the newly created panels if mode is active
-        if self._phasor_registry.display_mode != PhasorDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_phasor_display_mode)
-
-        # Re-apply harmonic mode to the newly created panels if mode is active
-        if self._harmonic_registry.display_mode != HarmonicDisplayMode.OFF:
-            QTimer.singleShot(0, self._apply_harmonic_display_mode)
-
-        QTimer.singleShot(0, lambda r=record: self._run_event_detection(r))
-        QTimer.singleShot(0, lambda r=record: self._run_quality_check(r))
-        self._show_cursor_readout()
-        for canvas in panel_canvases.values():
-            self._connect_canvas_readout(canvas)
-        self.statusBar().showMessage(_format_load_status(record))
-        self.setWindowTitle(f"Powerwave — {source_id}")
 
     def _on_load_error(self, message: str) -> None:
         self.statusBar().showMessage(f"Error: {message}")
         QMessageBox.critical(self, "Load Error", message)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Multi-source loading (Phase D3)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _open_multi_source_dialog(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open Multi-Source Session", "", _FILE_FILTER
-        )
-        if not paths:
-            return
-        if len(paths) == 1:
-            self._load_file(Path(paths[0]))
-            return
-        self._load_multi_source([Path(p) for p in paths])
-
-    def _load_multi_source(self, paths: list[Path]) -> None:
-        from app.data.multi_source_session import MultiSourceSession
-
-        self.statusBar().showMessage(f"Loading {len(paths)} sources…")
-        session = MultiSourceSession()
-        errors: list[str] = []
-        for path in paths:
-            try:
-                record = self._provider_manager.load(path)
-                source = _make_source_record(
-                    path.stem, record, provider_type=path.suffix.lstrip(".")
-                )
-                session.add_source(source)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{path.name}: {exc}")
-        if errors:
-            QMessageBox.warning(self, "Load Warnings", "\n".join(errors))
-        if session.is_empty():
-            self.statusBar().showMessage("No sources loaded.")
-            return
-        self._on_multi_source_loaded(session)
-
     def _on_multi_source_loaded(self, session) -> None:
-        if self._panel_canvases:
-            self._restore_standard_layout()
+        """Route a multi-source load (manifest) through the EventAnalysisSession canvas."""
+        from app.sessions.event_session import EventAnalysisSession
+
+        event_session = EventAnalysisSession()
+        for src in session.sources:
+            origin = str(getattr(src, "origin_path", None) or "")
+            event_session.add_source(
+                src.record,
+                src.source_id,
+                getattr(src, "provider_type", "unknown"),
+                origin or None,
+            )
+        event_session.default_layout()
+
+        self._active_session = event_session
         self._time_display_mode = TimeDisplayMode.ABSOLUTE
         self._set_time_axis_action_checked(TimeDisplayMode.ABSOLUTE)
-        panel_canvases = self._vis_manager.display_multi_source_session(
-            session,
-            axis_mode=TimeDisplayMode.ABSOLUTE.value,
-        )
-        first_record = session.sources[0].record
-        self._rebuild_grouped_layout(panel_canvases, first_record)
-        self._refresh_signal_browser()
-        n = len(panel_canvases)
+        self._current_signal_metadata = {}
+        self._session_canvas_action.setEnabled(True)
+        self._save_manifest_action.setEnabled(True)
+        panel = self._ensure_session_panel()
+        panel.refresh_all(event_session)
+        self._activate_session_canvas()
+
         ids = ", ".join(s.source_id for s in session.sources)
         self.setWindowTitle(f"Powerwave — Multi-Source: {ids}")
         self.statusBar().showMessage(
-            f"Multi-source session: {n} panel(s) from {session.source_count()} source(s)"
+            f"Session: {session.source_count()} source(s) loaded."
         )
-        # Cross-source correlation (Phase 7)
-        QTimer.singleShot(0, lambda s=session: self._run_cross_correlation(s.sources))
+        QTimer.singleShot(
+            0, lambda s=event_session: self._run_cross_correlation(s.list_sources())
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # ─────────────────────────────────────────────────────────────────────────
@@ -1820,7 +1236,6 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _apply_time_axis_mode_to_visible(self) -> None:
         """Apply current time-axis display policy without changing X data."""
-        self._vis_manager.set_time_axis_mode(self._time_display_mode)
         if (
             self._session_canvas_active
             and self._session_canvas_controller is not None
@@ -1889,21 +1304,9 @@ class PowerwaveMainWindow(QMainWindow):
             self._session_canvas_controller.set_rms_mode(
                 self._rms_display_mode, self._active_session, config=self._rms_config
             )
-            return
-
-        canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
-        for canvas in canvases:
-            if not self._qt_widget_alive(canvas):
-                continue
-            canvas.set_rms_display_mode(RMSDisplayMode.OFF)
-            canvas.set_rms_display_mode(
-                self._rms_display_mode,
-                config=self._rms_config,
-                signal_metadata=self._current_signal_metadata or None,
-            )
 
     def _apply_rms_mode_to_all_canvases(self) -> None:
-        """Push the current RMS mode to every visible canvas."""
+        """Push the current RMS mode to the session canvas controller."""
         if (
             self._session_canvas_active
             and self._session_canvas_controller is not None
@@ -1911,23 +1314,6 @@ class PowerwaveMainWindow(QMainWindow):
         ):
             self._session_canvas_controller.set_rms_mode(
                 self._rms_display_mode, self._active_session, config=self._rms_config
-            )
-            return
-
-        canvases = []
-        if self._panel_canvases:
-            canvases.extend(self._panel_canvases.values())
-        else:
-            canvases.append(self._canvas)
-
-        sig_meta = self._current_signal_metadata or None
-        for canvas in canvases:
-            if not self._qt_widget_alive(canvas):
-                continue
-            canvas.set_rms_display_mode(
-                self._rms_display_mode,
-                config=self._rms_config,
-                signal_metadata=sig_meta,
             )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1950,7 +1336,7 @@ class PowerwaveMainWindow(QMainWindow):
         self.statusBar().showMessage(labels.get(mode, "Scaling changed"))
 
     def _apply_scaling_to_all_canvases(self) -> None:
-        """Push the current scaling mode and registry to every visible canvas."""
+        """Push the current scaling mode and registry to the session canvas controller."""
         if (
             self._session_canvas_active
             and self._session_canvas_controller is not None
@@ -1960,11 +1346,6 @@ class PowerwaveMainWindow(QMainWindow):
                 self._scaling_mode, self._active_session,
                 registry=self._scaling_registry,
             )
-            return
-        canvases = list(self._panel_canvases.values()) if self._panel_canvases else [self._canvas]
-        for canvas in canvases:
-            if self._qt_widget_alive(canvas):
-                canvas.set_scaling_mode(self._scaling_mode, registry=self._scaling_registry)
 
     def _on_scaling_config(self) -> None:
         """Open the Scaling Configuration dialog and apply any changes."""
@@ -1995,18 +1376,7 @@ class PowerwaveMainWindow(QMainWindow):
         self.statusBar().showMessage(labels.get(mode, "Frequency display changed"))
 
     def _apply_frequency_display_mode(self) -> None:
-        """Show or hide frequency/ROCOF panel canvases based on current mode."""
-        if not self._panel_canvases:
-            return
-        mode = self._frequency_registry.display_mode
-        freq_keys = self._frequency_registry.frequency_panel_keys(
-            list(self._panel_canvases.keys())
-        )
-        visible = mode != FrequencyDisplayMode.OFF
-        for key in freq_keys:
-            canvas = self._panel_canvases.get(key)
-            if canvas is not None and self._qt_widget_alive(canvas):
-                canvas.setVisible(visible)
+        pass  # frequency channels are native session channels — no synthetic panels needed
 
     def _on_phasor_display_mode_changed(self, mode: PhasorDisplayMode) -> None:
         """Apply a new phasor/sequence component display mode."""
@@ -2045,168 +1415,14 @@ class PowerwaveMainWindow(QMainWindow):
             and self._session_canvas_controller is not None
             and self._active_session is not None
         ):
+            mode = self._phasor_registry.display_mode
+            seq_visible = (mode == PhasorDisplayMode.SEQUENCE_COMPONENTS)
+            self._toggle_synthetic_panels("synthetic:sequence", seq_visible)
             self._session_canvas_controller.set_phasor_mode(
-                self._phasor_registry.display_mode,
-                self._active_session,
-                config=self._phasor_registry.config,
+                mode, self._active_session, config=self._phasor_registry.config,
             )
             return
 
-        mode = self._phasor_registry.display_mode
-
-        def _is_sequence_key(k: str) -> bool:
-            return (
-                k in ("sequence_voltage", "sequence_current")
-                or k.endswith("/sequence_voltage")
-                or k.endswith("/sequence_current")
-            )
-
-        # Gather waveform canvases (not sequence panels)
-        if self._panel_canvases:
-            waveform_canvases = [
-                c for k, c in self._panel_canvases.items()
-                if not _is_sequence_key(k) and self._qt_widget_alive(c)
-            ]
-        elif self._qt_widget_alive(self._canvas):
-            waveform_canvases = [self._canvas]
-        else:
-            waveform_canvases = []
-
-        # Apply phasor overlay mode to waveform canvases
-        sig_meta = self._current_signal_metadata or None
-        for canvas in waveform_canvases:
-            if hasattr(canvas, "set_performance_timing"):
-                canvas.set_performance_timing(
-                    self._performance_timing_enabled,
-                    self._performance_timing_sink,
-                )
-            canvas.set_phasor_display_mode(
-                mode, signal_metadata=sig_meta
-            )
-
-        # Show or hide sequence component panels
-        seq_visible = (mode == PhasorDisplayMode.SEQUENCE_COMPONENTS)
-        for key, canvas in (self._panel_canvases or {}).items():
-            if _is_sequence_key(key) and self._qt_widget_alive(canvas):
-                canvas.setVisible(seq_visible)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Sequence panel construction (Phase 6B)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _build_sequence_panels(
-        self,
-        record: DisturbanceRecord,
-        signal_metadata: dict | None,
-        canvas_factory,
-    ) -> dict:
-        """Build sequence component canvas panels for a single-record grouped layout.
-
-        Detects three-phase groups, computes V1/V2/V0 and I1/I2/I0 magnitudes,
-        and returns panel canvases keyed by "sequence_voltage" / "sequence_current".
-        Panels start hidden; _apply_phasor_display_mode() controls visibility.
-
-        Returns {} when no complete three-phase groups are found or on any error.
-        Multi-source sessions are not handled here (document as Phase 6B limitation).
-        """
-        import numpy as np
-        from app.analytics.phasors.phasor_extraction import (
-            compute_phasor_window_samples,
-            extract_phasor,
-        )
-        from app.analytics.phasors.symmetrical_components import (
-            compute_sequence_from_phasor_arrays,
-        )
-
-        if record is None:
-            return {}
-
-        channel_names = [ch.name for ch in record.analog_channels]
-        channel_phases = {
-            ch.name: ch.phase
-            for ch in record.analog_channels
-            if ch.phase
-        }
-
-        groups = self._phasor_registry.detect_three_phase_groups(
-            channel_names,
-            signal_metadata or None,
-            channel_phases or None,
-        )
-        if not groups:
-            return {}
-
-        # Estimate sample rate
-        try:
-            time_col = record.waveform_data["time"].to_numpy(dtype=np.float64)
-        except (KeyError, Exception):  # noqa: BLE001
-            return {}
-
-        rates = [r for r in record.sampling_info.sampling_rates if r > 0]
-        if rates:
-            sample_rate_hz = float(rates[0])
-        elif len(time_col) >= 2:
-            diffs = np.diff(time_col[: min(100, len(time_col))])
-            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
-            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
-        else:
-            sample_rate_hz = 0.0
-
-        if sample_rate_hz <= 0:
-            return {}
-
-        config = self._phasor_registry.config
-        seq_voltage_data: dict[str, np.ndarray] = {}
-        seq_current_data: dict[str, np.ndarray] = {}
-        seq_time: np.ndarray | None = None
-
-        with timed_section(
-            "sequence_rendering",
-            enabled=self._performance_timing_enabled,
-            sink=self._performance_timing_sink,
-        ):
-            for group in groups:
-                if not group.complete:
-                    continue
-                try:
-                    ch_a = record.waveform_data[group.phase_a].to_numpy(dtype=np.float64)  # type: ignore[index]
-                    ch_b = record.waveform_data[group.phase_b].to_numpy(dtype=np.float64)  # type: ignore[index]
-                    ch_c = record.waveform_data[group.phase_c].to_numpy(dtype=np.float64)  # type: ignore[index]
-                    pa = extract_phasor(time_col, ch_a, sample_rate_hz, config)
-                    pb = extract_phasor(time_col, ch_b, sample_rate_hz, config)
-                    pc = extract_phasor(time_col, ch_c, sample_rate_hz, config)
-                    seq = compute_sequence_from_phasor_arrays(pa, pb, pc)
-                except Exception:  # noqa: BLE001
-                    continue
-
-                seq_time = seq["time"]
-                if group.signal_type == "voltage":
-                    seq_voltage_data[sequence_curve_label("V", "positive")] = seq["mag_v1"]
-                    seq_voltage_data[sequence_curve_label("V", "negative")] = seq["mag_v2"]
-                    seq_voltage_data[sequence_curve_label("V", "zero")] = seq["mag_v0"]
-                else:
-                    seq_current_data[sequence_curve_label("I", "positive")] = seq["mag_v1"]
-                    seq_current_data[sequence_curve_label("I", "negative")] = seq["mag_v2"]
-                    seq_current_data[sequence_curve_label("I", "zero")] = seq["mag_v0"]
-
-        if seq_time is None:
-            return {}
-
-        result: dict = {}
-        for panel_key, data_dict, unit, title in [
-            ("sequence_voltage", seq_voltage_data, "V", "Sequence Voltage"),
-            ("sequence_current", seq_current_data, "A", "Sequence Current"),
-        ]:
-            if not data_dict:
-                continue
-            syn_record = _make_sequence_record(record, seq_time, data_dict, unit)
-            canvas = canvas_factory()
-            canvas.set_record(syn_record)
-            canvas.set_panel_title(title)
-            canvas.setVisible(False)
-            result[panel_key] = canvas
-
-        return result
 
     # ─────────────────────────────────────────────────────────────────────────
     # Harmonic display mode (Phase 8)
@@ -2248,375 +1464,27 @@ class PowerwaveMainWindow(QMainWindow):
             and self._session_canvas_controller is not None
             and self._active_session is not None
         ):
+            mode = self._harmonic_registry.display_mode
+            thd_visible = (mode == HarmonicDisplayMode.THD)
+            spec_visible = (mode == HarmonicDisplayMode.SPECTRUM)
+            self._toggle_synthetic_panels("synthetic:thd", thd_visible)
+            self._toggle_synthetic_panels("synthetic:harmonic_spectrum", spec_visible)
             self._session_canvas_controller.set_harmonic_mode(
-                self._harmonic_registry.display_mode,
-                self._active_session,
-                config=self._harmonic_registry.config,
+                mode, self._active_session, config=self._harmonic_registry.config,
             )
             return
 
-        mode = self._harmonic_registry.display_mode
-
-        # Gather waveform canvases (exclude harmonic analysis panels)
-        if self._panel_canvases:
-            waveform_canvases = [
-                c for k, c in self._panel_canvases.items()
-                if k not in _HARMONIC_PANEL_KEYS and self._qt_widget_alive(c)
-            ]
-        elif self._qt_widget_alive(self._canvas):
-            waveform_canvases = [self._canvas]
-        else:
-            waveform_canvases = []
-
-        # Push harmonic overlay mode to waveform canvases
-        sig_meta = self._current_signal_metadata or None
-        for canvas in waveform_canvases:
-            if hasattr(canvas, "set_performance_timing"):
-                canvas.set_performance_timing(
-                    self._performance_timing_enabled,
-                    self._performance_timing_sink,
-                )
-            canvas.set_harmonic_display_mode(mode, signal_metadata=sig_meta)
-
-        # Show/hide THD panels
-        thd_visible = (mode == HarmonicDisplayMode.THD)
-        for key in ("thd_voltage", "thd_current"):
-            canvas = (self._panel_canvases or {}).get(key)
-            if canvas is not None and self._qt_widget_alive(canvas):
-                canvas.setVisible(thd_visible)
-
-        # Show/hide spectrum panels
-        spectrum_visible = (mode == HarmonicDisplayMode.SPECTRUM)
-        for key in ("harmonic_spectrum_voltage", "harmonic_spectrum_current"):
-            canvas = (self._panel_canvases or {}).get(key)
-            if canvas is not None and self._qt_widget_alive(canvas):
-                canvas.setVisible(spectrum_visible)
-
-    def _build_harmonic_panels(
-        self,
-        record: DisturbanceRecord,
-        signal_metadata: dict | None,
-        canvas_factory,
-    ) -> dict:
-        """Build THD trend and harmonic spectrum panels for a grouped layout.
-
-        Computes harmonic extraction for all eligible channels, then constructs:
-          - thd_voltage / thd_current  — time-varying THD% trend panels
-          - harmonic_spectrum_voltage / harmonic_spectrum_current
-                                       — H3..H13 magnitude trend panels
-
-        Panels start hidden; _apply_harmonic_display_mode() controls visibility.
-        Returns {} when no eligible channels are found or on any error.
-        """
-        import numpy as np
-        from app.analytics.harmonics.harmonic_cache import HarmonicCache
-        from app.analytics.harmonics.harmonic_extraction import (
-            compute_harmonic_window_samples,
-            extract_harmonics,
-        )
-        from app.analytics.harmonics.harmonic_metrics import compute_thd_array
-        from app.analytics.harmonics.harmonic_models import HarmonicChannelRole
-        from app.analytics.harmonics.harmonic_overlay import classify_harmonic_role
-
-        if record is None:
-            return {}
-
-        config = self._harmonic_registry.config
-
-        try:
-            time_col = record.waveform_data["time"].to_numpy(dtype=np.float64)
-        except Exception:  # noqa: BLE001
-            return {}
-
-        rates = [r for r in record.sampling_info.sampling_rates if r > 0]
-        if rates:
-            sample_rate_hz = float(rates[0])
-        elif len(time_col) >= 2:
-            diffs = np.diff(time_col[: min(100, len(time_col))])
-            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
-            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
-        else:
-            sample_rate_hz = 0.0
-
-        if sample_rate_hz <= 0:
-            return {}
-
-        window = compute_harmonic_window_samples(sample_rate_hz, config)
-        overlap_clamped = max(0.0, min(config.overlap, 0.999))
-        hop = max(1, int(round(window * (1.0 - overlap_clamped))))
-
-        if (
-            self._harmonic_panel_cache is None
-            or self._harmonic_panel_cache_record_id != id(record)
-        ):
-            self._harmonic_panel_cache = HarmonicCache()
-            self._harmonic_panel_cache_record_id = id(record)
-        cache = self._harmonic_panel_cache
-        thd_voltage: dict[str, np.ndarray] = {}
-        thd_current: dict[str, np.ndarray] = {}
-        # Spectrum: H3..H13 for the first eligible voltage/current channel only.
-        spec_voltage: dict[str, np.ndarray] = {}
-        spec_current: dict[str, np.ndarray] = {}
-        harmonic_time: np.ndarray | None = None
-        _SPECTRUM_ORDERS = [3, 5, 7, 11, 13]
-
-        with timed_section(
-            "harmonic_panel_build",
-            enabled=self._performance_timing_enabled,
-            sink=self._performance_timing_sink,
-        ):
-            for ch in record.analog_channels:
-                name = ch.name
-                meta = (signal_metadata or {}).get(name)
-                role = classify_harmonic_role(name, ch.unit, meta).role
-                if role == HarmonicChannelRole.UNKNOWN:
-                    continue
-
-                try:
-                    raw_data = record.waveform_data[name].to_numpy(dtype=np.float64)
-                except Exception:  # noqa: BLE001
-                    continue
-
-                cached = cache.get(
-                    name, window, hop, config.nominal_hz, config.max_order
-                )
-                if cached is not None:
-                    h_result = cached
-                else:
-                    try:
-                        h_result = extract_harmonics(
-                            raw_data, sample_rate_hz, config, time=time_col
-                        )
-                    except Exception:  # noqa: BLE001
-                        continue
-                    cache.put(
-                        name, window, hop, config.nominal_hz, config.max_order, h_result
-                    )
-
-                if h_result.n_windows == 0:
-                    continue
-
-                harmonic_time = h_result.harmonic_time
-                thd_arr = compute_thd_array(h_result.magnitudes) * 100.0  # → percent
-
-                if role == HarmonicChannelRole.VOLTAGE_HARMONIC:
-                    thd_voltage[name] = thd_arr
-                    if not spec_voltage:
-                        for order in _SPECTRUM_ORDERS:
-                            mag = h_result.get_magnitude(order)
-                            if mag is not None:
-                                spec_voltage[f"H{order}"] = mag
-                else:
-                    thd_current[name] = thd_arr
-                    if not spec_current:
-                        for order in _SPECTRUM_ORDERS:
-                            mag = h_result.get_magnitude(order)
-                            if mag is not None:
-                                spec_current[f"H{order}"] = mag
-
-        if harmonic_time is None:
-            return {}
-
-        result: dict = {}
-        for panel_key, data_dict, unit, title in [
-            ("thd_voltage",              thd_voltage,   "%",     "THD — Voltage (%)"),
-            ("thd_current",              thd_current,   "%",     "THD — Current (%)"),
-            ("harmonic_spectrum_voltage", spec_voltage, "V RMS", "Harmonic Spectrum — Voltage"),
-            ("harmonic_spectrum_current", spec_current, "A RMS", "Harmonic Spectrum — Current"),
-        ]:
-            if not data_dict:
-                continue
-            syn_record = _make_harmonic_record(record, harmonic_time, data_dict, unit)
-            canvas = canvas_factory()
-            canvas.set_record(syn_record)
-            canvas.set_panel_title(title)
-            canvas.setVisible(False)
-            result[panel_key] = canvas
-
-        return result
-
-    def _refresh_signal_browser(self) -> None:
-        """Rebuild the dock tree from the current visualization runtime state."""
-        entries: list[SignalBrowserEntry] = []
-        targets: dict[str, tuple[str, str, str]] = {}
-
-        # S7: session canvas — build entries directly from the session model
-        if self._session_canvas_active and self._active_session is not None:
-            session = self._active_session
-            sources_by_id = {s.source_id: s for s in session.list_sources()}
-            panels_by_id = {p.panel_id: p for p in session.list_panels()}
-            for ch in session.list_analog_channels(active_only=False):
-                source = sources_by_id.get(ch.source_id)
-                if source is None or not source.is_active:
-                    continue
-                panel = panels_by_id.get(ch.panel_id)
-                group_label = panel.title if panel is not None else "Analog"
-                key = f"signal-{len(targets)}"
-                # panel_key is repurposed to carry source_id; name carries channel_name
-                targets[key] = ("session", ch.source_id, ch.channel_name)
-                entries.append(SignalBrowserEntry(
-                    key=key,
-                    source=source.display_name,
-                    group=group_label,
-                    name=ch.display_name or ch.channel_name,
-                    visible=ch.is_visible,
-                    kind="analog",
-                ))
-            self._signal_entry_targets = targets
-            self._signal_browser.set_entries(entries)
-            return
-
-        def source_label(record: DisturbanceRecord | None, fallback: str) -> str:
-            if record is None:
-                return fallback
-            provider = str(getattr(record.metadata, "provider_type", "") or "").upper()
-            source_file = Path(str(getattr(record.metadata, "source_file", "") or "")).name
-            return provider or source_file or fallback
-
-        def add_entry(
-            *,
-            kind: str,
-            panel_key: str,
-            source: str,
-            group: str,
-            name: str,
-            visible: bool,
-        ) -> None:
-            key = f"signal-{len(targets)}"
-            targets[key] = (kind, panel_key, name)
-            quality_grade: str | None = None
-            quality_tooltip: str = ""
-            if self._quality_fingerprint and name in self._quality_fingerprint.channels:
-                ch_q = self._quality_fingerprint.channels[name]
-                quality_grade = ch_q.grade.value
-                quality_tooltip = ch_q.tooltip
-            entries.append(SignalBrowserEntry(
-                key=key,
-                source=source,
-                group=group,
-                name=name,
-                visible=visible,
-                kind=kind,
-                quality_grade=quality_grade,
-                quality_tooltip=quality_tooltip,
-            ))
-
-        if self._panel_canvases:
-            for panel_key, canvas in self._panel_canvases.items():
-                if not self._qt_widget_alive(canvas):
-                    continue
-                record = getattr(canvas, "_record", None)
-                if "/" in panel_key:
-                    src, group_key = panel_key.split("/", 1)
-                    src_label = src
-                else:
-                    group_key = panel_key
-                    src_label = source_label(record, "Record")
-                group_label = getattr(canvas, "_panel_base_title", "") or group_key
-                visible = set(canvas.visible_channel_names())
-                for name in canvas.all_channel_names():
-                    add_entry(
-                        kind="analog",
-                        panel_key=panel_key,
-                        source=src_label,
-                        group=group_label,
-                        name=name,
-                        visible=name in visible,
-                    )
-        elif self._qt_widget_alive(self._canvas):
-            record = getattr(self._canvas, "_record", None)
-            visible = set(self._canvas.visible_channel_names())
-            for name in self._canvas.all_channel_names():
-                add_entry(
-                    kind="analog",
-                    panel_key="standard",
-                    source=source_label(record, "Record"),
-                    group="Analog",
-                    name=name,
-                    visible=name in visible,
-                )
-
-        timeline = self._grouped_timeline if self._grouped_timeline is not None else self._timeline
-        if self._qt_widget_alive(timeline):
-            record = getattr(timeline, "_record", None)
-            visible = set(timeline.visible_channel_names())
-            for name in timeline.all_channel_names():
-                add_entry(
-                    kind="digital",
-                    panel_key="digital",
-                    source=source_label(record, "Record"),
-                    group="Digital",
-                    name=name,
-                    visible=name in visible,
-                )
-
-        self._signal_entry_targets = targets
-        self._signal_browser.set_entries(entries)
-
-    def _on_signal_visibility_changed(self, entry_key: str, visible: bool) -> None:
-        """Apply a Signal Browser checkbox change to live plot widgets."""
-        target = self._signal_entry_targets.get(entry_key)
-        if target is None:
-            return
-        kind, panel_key, name = target
-        # S7: session canvas — route through session model + controller
-        if kind == "session":
-            source_id = panel_key  # repurposed field carries source_id
-            channel_name = name    # canonical channel_name (not display name)
-            if self._active_session is not None:
-                self._active_session.set_channel_visibility(source_id, channel_name, visible)
-            if self._session_canvas_controller is not None:
-                self._session_canvas_controller.on_channel_visibility_changed(
-                    source_id, channel_name, visible
-                )
-            self._refresh_signal_browser()
-            self.statusBar().showMessage(
-                f"{channel_name}: {'visible' if visible else 'hidden'}"
-            )
-            return
-        if kind == "analog":
-            canvas = self._canvas if panel_key == "standard" else self._panel_canvases.get(panel_key)
-            if not self._qt_widget_alive(canvas):
-                return
-            names = set(canvas.visible_channel_names())
-            if visible:
-                names.add(name)
-            else:
-                names.discard(name)
-            ordered = [ch_name for ch_name in canvas.all_channel_names() if ch_name in names]
-            canvas.set_visible_channels(ordered)
-        elif kind == "digital":
-            timeline = self._grouped_timeline if self._grouped_timeline is not None else self._timeline
-            if not self._qt_widget_alive(timeline):
-                return
-            names = set(timeline.visible_channel_names())
-            if visible:
-                names.add(name)
-            else:
-                names.discard(name)
-            ordered = [ch_name for ch_name in timeline.all_channel_names() if ch_name in names]
-            timeline.set_visible_channels(ordered)
-        else:
-            return
-
-        if self._panel_canvases:
-            QTimer.singleShot(0, self._link_panel_x_axes)
-        elif self._qt_widget_alive(self._canvas):
-            QTimer.singleShot(0, self._link_standard_x_axis)
-
-        self._refresh_signal_browser()
-        self.statusBar().showMessage(f"{name}: {'visible' if visible else 'hidden'}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Session workspace (Phase 9B)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _ensure_session_panel(self) -> SessionPanel:
-        """Create the session panel on first use and dock it."""
+        """Create the session panel on first use and dock it on the left."""
         if self._session_panel is None:
             self._session_panel = SessionPanel(self)
             self.addDockWidget(
-                Qt.DockWidgetArea.RightDockWidgetArea, self._session_panel
+                Qt.DockWidgetArea.LeftDockWidgetArea, self._session_panel
             )
             self._wire_session_panel(self._session_panel)
             self._session_panel.visibilityChanged.connect(
@@ -2657,28 +1525,46 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _activate_session_canvas(self) -> None:
         """Build/rebuild the session canvas and make it the central widget."""
+        from PyQt6.QtWidgets import QVBoxLayout, QWidget
+        from app.visualization.widgets.waveform_navigator import WaveformNavigatorStrip
         if self._active_session is None:
             return
         if self._session_canvas_controller is None:
             self._session_canvas_controller = SessionCanvasController()
 
         self._clear_sync_before_layout_switch()
-        splitter = self._session_canvas_controller.rebuild_layout(self._active_session)
-        self.setCentralWidget(splitter)
-        self._panel_canvases = {}
-        self._grouped_timeline = None
+        scroll_area = self._session_canvas_controller.rebuild_layout(self._active_session)
+
+        # Compound central widget: navigator strip (top) + scrollable panels (bottom)
+        self._session_navigator = WaveformNavigatorStrip()
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._session_navigator)
+        central_layout.addWidget(scroll_area, stretch=1)
+        self.setCentralWidget(central)
         self._session_canvas_active = True
         self._session_canvas_action.setChecked(True)
 
-        self._session_canvas_controller.register_with_sync(
-            self._vis_manager.synchronization_manager
-        )
-        # S6: wire measurement results to the measurement panel dock
+        self._session_canvas_controller.register_with_sync(self._sync_manager)
+        # Wire navigator viewport ↔ session canvas X range
+        self._session_canvas_controller.set_navigator(self._session_navigator)
+
+        # S6: wire measurement results to the measurement panel dock + delta readout bar
         self._session_canvas_controller.set_measurement_callback(
-            self._measurement_widget.update_measurements
+            self._on_session_measurement_result
         )
         self._session_canvas_controller.set_measurement_mode_changed_callback(
             self._on_measurement_mode_changed_from_canvas
+        )
+        # Hover crosshair → live cursor readout bar (show+update on mouse move)
+        self._session_canvas_controller.set_crosshair_readout_callback(
+            self._on_session_crosshair_moved
+        )
+        # Drag-drop channel moves → same rebuild path as "Move to panel" legend action
+        self._session_canvas_controller.set_channel_panel_changed_callback(
+            self._on_session_channel_panel
         )
         self._session_canvas_controller.set_time_axis_mode(
             self._time_display_mode, self._active_session
@@ -2694,13 +1580,16 @@ class PowerwaveMainWindow(QMainWindow):
 
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(f"Session canvas: {n} source(s) loaded.")
-        self._refresh_signal_browser()  # S7: populate signal browser with session channels
 
     def _deactivate_session_canvas(self) -> None:
-        """Restore standard layout and exit session canvas mode."""
+        """Exit session canvas mode and show placeholder."""
+        from PyQt6.QtWidgets import QLabel
+        self._clear_sync_before_layout_switch()
         self._session_canvas_active = False
         self._session_canvas_action.setChecked(False)
-        self._restore_standard_layout()
+        placeholder = QLabel("Open a file to begin (File → Open…)")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCentralWidget(placeholder)
 
     def _on_open_session(self) -> None:
         """Start a fresh session workspace. User adds sources via the Session Panel."""
@@ -2750,6 +1639,262 @@ class PowerwaveMainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 self._on_load_error(str(exc))
 
+    # -------------------------------------------------------------------------
+    # Single-record → session loader (replaces FlexiblePlotCanvas paths)
+    # -------------------------------------------------------------------------
+
+    def _load_record_into_session(
+        self,
+        record: DisturbanceRecord,
+        signal_metadata: dict | None = None,
+        *,
+        time_mode: TimeDisplayMode = TimeDisplayMode.RELATIVE,
+    ) -> None:
+        """Create a fresh EventAnalysisSession from one record and activate the session canvas."""
+        from app.sessions.event_session import EventAnalysisSession
+
+        session = EventAnalysisSession()
+        source_path = _record_source_path(record)
+        display_name = source_path.stem or record.metadata.station_name or "source"
+        provider_type = str(getattr(record.metadata, "provider_type", "") or "unknown")
+        origin_path = str(source_path) if source_path.name else None
+
+        session.add_source(record, display_name, provider_type, origin_path)
+        session.default_layout()
+
+        # Inject synthetic computed panels (hidden until mode toggled on)
+        self._add_sequence_panels_to_session(session, record, signal_metadata)
+        self._add_harmonic_panels_to_session(session, record, signal_metadata)
+
+        self._active_session = session
+        self._time_display_mode = time_mode
+        self._set_time_axis_action_checked(time_mode)
+        self._current_signal_metadata = signal_metadata or {}
+
+        self._session_canvas_action.setEnabled(True)
+        self._save_manifest_action.setEnabled(True)
+        panel = self._ensure_session_panel()
+        panel.refresh_all(session)
+        self._activate_session_canvas()
+
+    def _add_sequence_panels_to_session(
+        self,
+        session,
+        record: DisturbanceRecord,
+        signal_metadata: dict | None,
+    ) -> None:
+        """Compute sequence components and inject as hidden synthetic panels in the session."""
+        import numpy as np
+        from app.analytics.phasors.phasor_extraction import extract_phasor
+        from app.analytics.phasors.symmetrical_components import (
+            compute_sequence_from_phasor_arrays,
+        )
+
+        if record is None:
+            return
+        channel_names = [ch.name for ch in record.analog_channels]
+        channel_phases = {ch.name: ch.phase for ch in record.analog_channels if ch.phase}
+        groups = self._phasor_registry.detect_three_phase_groups(
+            channel_names, signal_metadata or None, channel_phases or None,
+        )
+        if not groups:
+            return
+        try:
+            time_col = record.waveform_data["time"].to_numpy(dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            return
+        rates = [r for r in record.sampling_info.sampling_rates if r > 0]
+        if rates:
+            sample_rate_hz = float(rates[0])
+        elif len(time_col) >= 2:
+            diffs = np.diff(time_col[: min(100, len(time_col))])
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
+        else:
+            sample_rate_hz = 0.0
+        if sample_rate_hz <= 0:
+            return
+
+        config = self._phasor_registry.config
+        seq_voltage_data: dict[str, np.ndarray] = {}
+        seq_current_data: dict[str, np.ndarray] = {}
+        seq_time: np.ndarray | None = None
+
+        for group in groups:
+            if not group.complete:
+                continue
+            try:
+                ch_a = record.waveform_data[group.phase_a].to_numpy(dtype=np.float64)
+                ch_b = record.waveform_data[group.phase_b].to_numpy(dtype=np.float64)
+                ch_c = record.waveform_data[group.phase_c].to_numpy(dtype=np.float64)
+                pa = extract_phasor(time_col, ch_a, sample_rate_hz, config)
+                pb = extract_phasor(time_col, ch_b, sample_rate_hz, config)
+                pc = extract_phasor(time_col, ch_c, sample_rate_hz, config)
+                seq = compute_sequence_from_phasor_arrays(pa, pb, pc)
+            except Exception:  # noqa: BLE001
+                continue
+            seq_time = seq["time"]
+            if group.signal_type == "voltage":
+                seq_voltage_data[sequence_curve_label("V", "positive")] = seq["mag_v1"]
+                seq_voltage_data[sequence_curve_label("V", "negative")] = seq["mag_v2"]
+                seq_voltage_data[sequence_curve_label("V", "zero")] = seq["mag_v0"]
+            else:
+                seq_current_data[sequence_curve_label("I", "positive")] = seq["mag_v1"]
+                seq_current_data[sequence_curve_label("I", "negative")] = seq["mag_v2"]
+                seq_current_data[sequence_curve_label("I", "zero")] = seq["mag_v0"]
+
+        if seq_time is None:
+            return
+        for data_dict, unit, title, ptype in [
+            (seq_voltage_data, "V",  "Sequence Voltage",  "synthetic:sequence_voltage"),
+            (seq_current_data, "A",  "Sequence Current",  "synthetic:sequence_current"),
+        ]:
+            if not data_dict:
+                continue
+            syn_record = _make_sequence_record(record, seq_time, data_dict, unit)
+            source_id = session.add_source(syn_record, title, ptype)
+            panel_id = session.add_panel(title)
+            session.set_panel_visible(panel_id, False)
+            for ch_name in data_dict:
+                session.set_channel_panel(source_id, ch_name, panel_id)
+
+    def _add_harmonic_panels_to_session(
+        self,
+        session,
+        record: DisturbanceRecord,
+        signal_metadata: dict | None,
+    ) -> None:
+        """Compute harmonic trends and inject as hidden synthetic panels in the session."""
+        import numpy as np
+        from app.analytics.harmonics.harmonic_cache import HarmonicCache
+        from app.analytics.harmonics.harmonic_extraction import (
+            compute_harmonic_window_samples,
+            extract_harmonics,
+        )
+        from app.analytics.harmonics.harmonic_metrics import compute_thd_array
+        from app.analytics.harmonics.harmonic_models import HarmonicChannelRole
+        from app.analytics.harmonics.harmonic_overlay import classify_harmonic_role
+
+        if record is None:
+            return
+        config = self._harmonic_registry.config
+        try:
+            time_col = record.waveform_data["time"].to_numpy(dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            return
+        rates = [r for r in record.sampling_info.sampling_rates if r > 0]
+        if rates:
+            sample_rate_hz = float(rates[0])
+        elif len(time_col) >= 2:
+            diffs = np.diff(time_col[: min(100, len(time_col))])
+            valid = diffs[np.isfinite(diffs) & (diffs > 0)]
+            sample_rate_hz = 1.0 / float(np.median(valid)) if len(valid) > 0 else 0.0
+        else:
+            sample_rate_hz = 0.0
+        if sample_rate_hz <= 0:
+            return
+
+        window = compute_harmonic_window_samples(sample_rate_hz, config)
+        overlap_clamped = max(0.0, min(config.overlap, 0.999))
+        hop = max(1, int(round(window * (1.0 - overlap_clamped))))
+        if (
+            self._harmonic_panel_cache is None
+            or self._harmonic_panel_cache_record_id != id(record)
+        ):
+            self._harmonic_panel_cache = HarmonicCache()
+            self._harmonic_panel_cache_record_id = id(record)
+        cache = self._harmonic_panel_cache
+        thd_voltage: dict[str, np.ndarray] = {}
+        thd_current: dict[str, np.ndarray] = {}
+        spec_voltage: dict[str, np.ndarray] = {}
+        spec_current: dict[str, np.ndarray] = {}
+        harmonic_time: np.ndarray | None = None
+        _SPECTRUM_ORDERS = [3, 5, 7, 11, 13]
+
+        for ch in record.analog_channels:
+            meta = (signal_metadata or {}).get(ch.name)
+            role = classify_harmonic_role(ch.name, ch.unit, meta).role
+            if role == HarmonicChannelRole.UNKNOWN:
+                continue
+            try:
+                raw_data = record.waveform_data[ch.name].to_numpy(dtype=np.float64)
+            except Exception:  # noqa: BLE001
+                continue
+            cached = cache.get(ch.name, window, hop, config.nominal_hz, config.max_order)
+            h_result = cached
+            if h_result is None:
+                try:
+                    h_result = extract_harmonics(raw_data, sample_rate_hz, config, time=time_col)
+                except Exception:  # noqa: BLE001
+                    continue
+                cache.put(ch.name, window, hop, config.nominal_hz, config.max_order, h_result)
+            if h_result.n_windows == 0:
+                continue
+            harmonic_time = h_result.harmonic_time
+            thd_arr = compute_thd_array(h_result.magnitudes) * 100.0
+            if role == HarmonicChannelRole.VOLTAGE_HARMONIC:
+                thd_voltage[ch.name] = thd_arr
+                if not spec_voltage:
+                    for order in _SPECTRUM_ORDERS:
+                        mag = h_result.get_magnitude(order)
+                        if mag is not None:
+                            spec_voltage[f"H{order}"] = mag
+            else:
+                thd_current[ch.name] = thd_arr
+                if not spec_current:
+                    for order in _SPECTRUM_ORDERS:
+                        mag = h_result.get_magnitude(order)
+                        if mag is not None:
+                            spec_current[f"H{order}"] = mag
+
+        if harmonic_time is None:
+            return
+        for data_dict, unit, title, ptype in [
+            (thd_voltage,  "%",     "THD — Voltage (%)",           "synthetic:thd_voltage"),
+            (thd_current,  "%",     "THD — Current (%)",           "synthetic:thd_current"),
+            (spec_voltage, "V RMS", "Harmonic Spectrum — Voltage", "synthetic:harmonic_spectrum_voltage"),
+            (spec_current, "A RMS", "Harmonic Spectrum — Current", "synthetic:harmonic_spectrum_current"),
+        ]:
+            if not data_dict:
+                continue
+            syn_record = _make_harmonic_record(record, harmonic_time, data_dict, unit)
+            source_id = session.add_source(syn_record, title, ptype)
+            panel_id = session.add_panel(title)
+            session.set_panel_visible(panel_id, False)
+            for ch_name in data_dict:
+                session.set_channel_panel(source_id, ch_name, panel_id)
+
+    def _toggle_synthetic_panels(self, provider_prefix: str, visible: bool) -> None:
+        """Show/hide session panels whose source provider_type starts with provider_prefix."""
+        if self._active_session is None or self._session_canvas_controller is None:
+            return
+        matching_ids = {
+            s.source_id
+            for s in self._active_session.list_sources()
+            if s.provider_type.startswith(provider_prefix)
+        }
+        if not matching_ids:
+            return
+        changed = False
+        for panel in self._active_session.list_panels():
+            if any(ref[0] in matching_ids for ref in panel.channel_refs):
+                if panel.is_visible != visible:
+                    self._active_session.set_panel_visible(panel.panel_id, visible)
+                    changed = True
+        if not changed:
+            return
+        scroll = self._session_canvas_controller.rebuild_layout(self._active_session)
+        central = self.centralWidget()
+        if central is not None:
+            layout = central.layout()
+            if layout is not None and layout.count() >= 2:
+                old_item = layout.takeAt(1)
+                if old_item and old_item.widget():
+                    old_item.widget().setParent(None)
+                layout.addWidget(scroll, stretch=1)
+        self._session_canvas_controller.refresh_all(self._active_session)
+        self._session_canvas_controller.register_with_sync(self._sync_manager)
+
     def _on_session_import_record_ready(self, record: object) -> None:
         from app.models import DisturbanceRecord
 
@@ -2791,7 +1936,6 @@ class PowerwaveMainWindow(QMainWindow):
             self._session_canvas_controller.on_source_removed(source_id)
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(f"Source removed. Session: {n} source(s).")
-        self._refresh_signal_browser()  # S7: reflect source removal in signal browser
 
     def _on_session_offset_changed(self, source_id: str, offset_s: float) -> None:
         if self._active_session is None:

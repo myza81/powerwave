@@ -609,7 +609,7 @@ def test_channel_tree_update_panel_choices_no_signal(qapp) -> None:
     ]
     tree.update_panel_choices(new_panels)
     combo = tree._panel_combos["VA0"]
-    assert combo.count() == 2
+    assert combo.count() == 3  # 2 panels + "＋ New panel…" sentinel
     assert len(emitted) == 0   # no signal storm
 
 

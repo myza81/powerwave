@@ -20,9 +20,21 @@ Performance guards:
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
+
+
+def _fmt_readout(value: float, unit: str) -> str:
+    """Format a numeric readout value with SI magnitude prefix (K / M)."""
+    abs_v = abs(value)
+    suffix = f" {unit}" if unit else ""
+    if abs_v >= 1_000_000:
+        return f"{value / 1_000_000:.3f} M{unit}"
+    if abs_v >= 1_000:
+        return f"{value / 1_000:.3f} K{unit}"
+    return f"{value:.3f}{suffix}"
 from PyQt6.QtWidgets import (
     QDockWidget,
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -128,6 +140,33 @@ class SessionPanel(QDockWidget):
         if row is not None:
             row.update_channel_panel(channel_name, panel_id)
 
+    def update_crosshair_readouts(self, t: float, values: list) -> None:
+        """Update the Readout column from a crosshair hover event.
+
+        *values* is a list of (source_id, channel_name, label, value, unit, color) tuples
+        emitted by SessionCanvasWidget.crosshair_values_changed.
+        """
+        if abs(t) < 1.0:
+            self._time_lbl.setText(f"t = {t * 1000:,.3f} ms")
+        else:
+            self._time_lbl.setText(f"t = {t:,.3f} s")
+        for source_id, channel_name, _label, value, unit, _color in values:
+            row = self._source_rows.get(source_id)
+            if row is None:
+                continue
+            if value is None:
+                row.set_channel_readout(channel_name, "—")
+            elif isinstance(value, str):
+                row.set_channel_readout(channel_name, value)
+            else:
+                row.set_channel_readout(channel_name, _fmt_readout(value, unit))
+
+    def clear_crosshair_readouts(self) -> None:
+        """Clear all Readout column values across every source row."""
+        self._time_lbl.setText("t = —")
+        for row in self._source_rows.values():
+            row.clear_readouts()
+
     def refresh_all_panel_choices(self, panels) -> None:
         """Refresh panel dropdowns in every source row after panels change."""
         for row in self._source_rows.values():
@@ -231,6 +270,14 @@ class SessionPanel(QDockWidget):
         toolbar.addWidget(self._align_all_btn)
 
         toolbar.addStretch()
+
+        self._time_lbl = QLabel("t = —")
+        self._time_lbl.setStyleSheet(
+            "color: #888888; font-family: monospace; font-size: 11px;"
+        )
+        self._time_lbl.setToolTip("Current crosshair time")
+        toolbar.addWidget(self._time_lbl)
+
         outer.addLayout(toolbar)
 
         # ── Scroll area containing source rows ──

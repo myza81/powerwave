@@ -19,25 +19,29 @@ from app.visualization.axis_management import (
     reserved_right_axis_width,
 )
 from app.visualization.rendering.digital_transforms import (
-    build_step_series,
+    build_hi_lo_segments,
     clip_digital_to_viewport,
     digital_role_color,
     extract_transitions,
 )
 from app.visualization.signal_visibility import default_visible_digital_names
 
-_TRACK_SPACING = 1.5   # vertical distance between track baselines (data coords)
-_TRACK_HEIGHT  = 1.0   # height of the HIGH-state fill within each track
+_TRACK_SPACING = 1.0   # row pitch (Y units between channel baselines)
+_LINE_WIDTH_HI = 3     # pen width when signal is HIGH
+_LINE_WIDTH_LO = 1     # pen width when signal is LOW
 
 
 @dataclasses.dataclass
 class _TrackEntry:
-    name:     str
-    curve:    pg.PlotDataItem
-    color:    str
-    y_offset: float        # baseline Y in data coordinates
-    t_trans:  np.ndarray   # pre-extracted transition times (float64)
-    d_trans:  np.ndarray   # pre-extracted transition states (float64)
+    name:      str
+    curve_hi:  pg.PlotDataItem   # thick line — HIGH periods
+    curve_lo:  pg.PlotDataItem   # thin line  — LOW periods
+    label:     pg.TextItem
+    bg_band:   pg.LinearRegionItem
+    color:     str
+    y_offset:  float             # Y position of the line in data coordinates
+    t_trans:   np.ndarray        # pre-extracted transition times (float64)
+    d_trans:   np.ndarray        # pre-extracted transition states (float64)
 
 
 class DigitalEventTimeline(pg.PlotWidget):
@@ -111,6 +115,7 @@ class DigitalEventTimeline(pg.PlotWidget):
         self._add_trigger_line()
         self._add_cursor()
         self._update_viewport()
+        self._update_track_labels()
 
     def link_x_to(self, view_or_plot: pg.ViewBox | pg.PlotItem) -> None:
         """Link X-axis to an external ViewBox or PlotItem.
@@ -226,17 +231,44 @@ class DigitalEventTimeline(pg.PlotWidget):
         raw = self._record.waveform_data[ch.name].to_numpy(dtype=np.float64)  # type: ignore[union-attr]
         t_trans, d_trans = extract_transitions(self._time_cache, raw)
 
-        curve = pg.PlotDataItem(
-            pen=pg.mkPen(color, width=1.5),
-            fillLevel=y_offset,
-            brush=pg.mkBrush(color + "55"),
-            skipFiniteCheck=True,
+        # Alternating row background
+        bg_alpha = 18 if track_idx % 2 == 0 else 0
+        bg_band = pg.LinearRegionItem(
+            values=[y_offset - 0.45, y_offset + 0.45],
+            orientation="horizontal",
+            movable=False,
+            brush=pg.mkBrush(255, 255, 255, bg_alpha),
+            pen=pg.mkPen((0, 0, 0, 0)),
         )
-        self.addItem(curve)
+        bg_band.setZValue(-10)
+        self.addItem(bg_band)
+
+        # Thick line for HIGH periods, thin dim line for LOW periods
+        curve_hi = pg.PlotDataItem(
+            pen=pg.mkPen(color, width=_LINE_WIDTH_HI),
+            connect="finite",
+        )
+        curve_lo = pg.PlotDataItem(
+            pen=pg.mkPen(color + "44", width=_LINE_WIDTH_LO),
+            connect="finite",
+        )
+        self.addItem(curve_lo)   # draw LOW first (below HIGH)
+        self.addItem(curve_hi)
+
+        label = pg.TextItem(
+            html=self._render_label_html(ch.name, color, 0),
+            anchor=(0.0, 0.5),
+            fill=pg.mkBrush("#1E1E1ECC"),
+        )
+        label.setZValue(20)
+        self.addItem(label)
 
         self._tracks[ch.name] = _TrackEntry(
             name=ch.name,
-            curve=curve,
+            curve_hi=curve_hi,
+            curve_lo=curve_lo,
+            label=label,
+            bg_band=bg_band,
             color=color,
             y_offset=y_offset,
             t_trans=t_trans,
@@ -277,21 +309,20 @@ class DigitalEventTimeline(pg.PlotWidget):
         self.set_cursor_pos(cursor_pos)
         self.getPlotItem().setXRange(float(x_range[0]), float(x_range[1]), padding=0)
         self._update_viewport()
+        self._update_track_labels()
 
     def _update_y_axis(self) -> None:
         n = len(self._tracks)
         if n == 0:
             return
-        y_max = (n - 1) * _TRACK_SPACING + _TRACK_HEIGHT + 0.25
         plot = self.getPlotItem()
-        plot.setYRange(-0.25, y_max, padding=0)
-
-        ticks = [
-            (entry.y_offset + _TRACK_HEIGHT / 2, entry.name)
-            for entry in self._tracks.values()
-        ]
-        plot.getAxis("left").setTicks([ticks])
+        plot.setYRange(-0.5, (n - 1) * _TRACK_SPACING + 0.5, padding=0)
+        # Hide all Y-axis tick marks and values
+        left = plot.getAxis("left")
+        left.setTicks([[]])
+        left.setStyle(showValues=False, tickLength=0)
         self._apply_axis_geometry_reservation()
+        self._position_track_labels()
 
     def _add_trigger_line(self) -> None:
         if self._record is None:
@@ -328,7 +359,34 @@ class DigitalEventTimeline(pg.PlotWidget):
         self.addItem(self._cursor)
 
     def _on_cursor_moved(self, line: pg.InfiniteLine) -> None:
-        self.cursor_moved.emit(line.value())
+        t = float(line.value())
+        self._update_track_labels(t)
+        self.cursor_moved.emit(t)
+
+    def _render_label_html(self, name: str, color: str, state: int) -> str:
+        """HTML for the track label: colored indicator square + state digit + name."""
+        sq_color = color if state else "#3A3A3A"
+        state_color = "#FFFFFF" if state else "#555555"
+        return (
+            f'<span style="color:{sq_color};">&#9632;</span>'
+            f'&nbsp;<span style="color:{state_color};font-weight:bold;">{state}</span>'
+            f'&nbsp;&nbsp;<span style="color:#CCCCCC;">{name}</span>'
+        )
+
+    def _get_state_at(self, entry: _TrackEntry, t: float) -> int:
+        """Return the binary state (0 or 1) for this track at time t."""
+        if len(entry.t_trans) == 0:
+            return 0
+        idx = int(np.searchsorted(entry.t_trans, t, side="right")) - 1
+        return int(entry.d_trans[idx]) if idx >= 0 else 0
+
+    def _update_track_labels(self, t: float | None = None) -> None:
+        """Refresh all track label HTML to reflect state at cursor time t."""
+        if t is None:
+            t = float(self._cursor.value()) if self._cursor is not None else 0.0
+        for entry in self._tracks.values():
+            state = self._get_state_at(entry, t)
+            entry.label.setHtml(self._render_label_html(entry.name, entry.color, state))
 
     def _on_x_range_changed(
         self,
@@ -359,19 +417,35 @@ class DigitalEventTimeline(pg.PlotWidget):
                 entry.t_trans, entry.d_trans, t_start, t_end
             )
             if len(t_cl) < 2:
-                entry.curve.setData(_empty, _empty)
+                entry.curve_hi.setData(_empty, _empty)
+                entry.curve_lo.setData(_empty, _empty)
                 continue
-            t_step, y_step = build_step_series(
-                t_cl, d_cl, entry.y_offset, _TRACK_HEIGHT
-            )
-            entry.curve.setData(t_step, y_step)
+            t_hi, y_hi = build_hi_lo_segments(t_cl, d_cl, entry.y_offset, 1)
+            t_lo, y_lo = build_hi_lo_segments(t_cl, d_cl, entry.y_offset, 0)
+            entry.curve_hi.setData(t_hi if len(t_hi) else _empty,
+                                   y_hi if len(y_hi) else _empty)
+            entry.curve_lo.setData(t_lo if len(t_lo) else _empty,
+                                   y_lo if len(y_lo) else _empty)
+        self._position_track_labels()
+
+    def _position_track_labels(self) -> None:
+        """Keep channel labels pinned near the left edge of the digital lanes."""
+        if not self._tracks:
+            return
+        plot = self.getPlotItem()
+        viewbox = plot.getViewBox()
+        x_min, x_max = viewbox.viewRange()[0]
+        width_px = max(1.0, float(viewbox.width()))
+        x_label = float(x_min) + (float(x_max) - float(x_min)) * 8.0 / width_px
+        for entry in self._tracks.values():
+            entry.label.setPos(x_label, entry.y_offset)
 
     def _restore_plot_config(self) -> None:
         plot = self.getPlotItem()
         plot.showGrid(x=True, y=False, alpha=0.2)
         plot.setLabel("bottom", "Time", units="s")
         plot.showAxis("left")
-        plot.getAxis("left").setTicks(None)
+        plot.getAxis("left").setTicks([[]])
         self._apply_axis_geometry_reservation()
         plot.setMouseEnabled(x=True, y=False)
 
@@ -382,7 +456,10 @@ class DigitalEventTimeline(pg.PlotWidget):
         left.setStyle(
             autoExpandTextSpace=False,
             tickTextWidth=max(1, GROUPED_LEFT_AXIS_WIDTH_PX - 8),
+            showValues=False,
         )
+        left.setPen(pg.mkPen((0, 0, 0, 0)))
+        left.setTextPen(pg.mkPen((0, 0, 0, 0)))
 
         right = plot.getAxis("right")
         plot.showAxis("right")

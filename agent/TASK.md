@@ -1790,3 +1790,48 @@ Next phase: final Import Wizard acceptance pass, or Phase 8.55P for CI/developer
 - No CI cloud infrastructure or packaging workflow was added in this phase.
 
 Next phase: Phase 9 planning or CI wiring around the documented validation slices. Avoid new Import Wizard feature work until the acceptance workflow is reviewed by a human operator.
+
+---
+
+## Phase Audit - Full Codebase Read-Only Audit - COMPLETED 2026-05-29
+
+### Status: COMPLETED
+
+### Deliverables
+- docs/CODEBASE_AUDIT_REPORT.md - structured audit report covering architecture,
+  UI/UX workflow, visualization, data handling, dead code candidates,
+  performance risks, test gaps, and remediation roadmap.
+- agent/HANDOFF.md - appended audit handoff.
+- agent/TASK.md - appended audit task record.
+- agent/REPOSITORY_STATE.md - appended repository audit snapshot.
+
+### Outcome
+- No application source code was modified.
+- The audit identifies validation recovery as the immediate next task because
+  pytest collection is blocked by `tests/unit/test_runtime_qt_widgets.py:446`.
+- The main architectural concern is the split between canonical `app/` code and
+  legacy/package-selected `src/` code.
+- The main workflow concern is that CSV/Excel have both wizard and direct
+  provider paths, while COMTRADE bypasses the richer review/repair workflow.
+- The main performance concern is full-file COMTRADE binary loading and heavy
+  DataFrame copies in large import/export paths.
+
+### Validation
+- `pytest -q` -> could not run because `pytest` was not on PATH.
+- `.venv\Scripts\python.exe -m pytest -q` -> collection failed at
+  `tests/unit/test_runtime_qt_widgets.py:446`.
+- `.venv\Scripts\python.exe -m pytest --collect-only -q --ignore=tests/unit/test_runtime_qt_widgets.py`
+  -> 4029 tests collected.
+- `.venv\Scripts\python.exe -m pytest -q --ignore=tests/unit/test_runtime_qt_widgets.py`
+  -> timed out after about 180 seconds with no final counts.
+
+### Recommended Next Tasks
+- Phase 0: repair the broken runtime test file and reconcile tests that reference
+  removed signal-browser widgets.
+- Phase 1: decide canonical package root (`app` versus `src`) and align
+  `pyproject.toml`, tests, docs, and entrypoints.
+- Phase 2: unify CSV/Excel ingestion through the Import Wizard for interactive
+  workflows and define a COMTRADE metadata/channel review path.
+- Phase 3: harden large-file handling, especially COMTRADE binary/BINARY32 and
+  DataFrame copy pressure.
+- Phase 4: clean up legacy modules only after tests and packaging are green.

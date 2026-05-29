@@ -1447,3 +1447,43 @@ Phase 9A Event Session Data Model: COMPLETE 2026-05-19
         values; populated by build_aligned_data in Phase 9B after resampling is wired.
       Auto-trigger alignment only (Phase 9B adds cross-correlation and manual UI offset).
       No session persistence (load/save) — Phase 9C scope.
+
+---
+
+## 2026-05-29 - Repository State After Read-Only Audit
+
+### Audit Artifact
+- Added `docs/CODEBASE_AUDIT_REPORT.md`.
+- Updated agent tracking docs only.
+- No runtime application source code was changed.
+
+### Current Validation State
+- Full pytest collection is blocked by a syntax error in
+  `tests/unit/test_runtime_qt_widgets.py:446`.
+- Ignoring that file, pytest collect-only reports 4029 tests.
+- Ignoring that file, a full pytest run timed out after about 180 seconds before
+  final pass/fail/skip counts.
+- Plain `pytest -q` is not available on PATH; use `.venv\Scripts\python.exe -m pytest`.
+
+### Highest Repository Risks
+- `pyproject.toml` package discovery points at `src`, while the active documented
+  application architecture is under `app`.
+- Two `DisturbanceRecord` classes exist: `app/models/disturbance_record.py` and
+  `src/models/disturbance_record.py`.
+- Legacy `src/` parsers/UI/engine code coexists with the provider/session stack
+  under `app/`.
+- CSV/Excel direct providers remain available alongside the Import Wizard and
+  can bypass the preview, timestamp repair, mapping, export, and waveform flow.
+- COMTRADE binary loading reads the DAT file fully into memory; BINARY32 is
+  listed as a valid format but raises an unsupported-format error during load.
+- Visualization ownership is split between `VisualizationManager` and the newer
+  session canvas/controller path.
+- Signal-browser tests still exist while the widget appears removed in the
+  current working tree.
+
+### Recommended State Before Feature Work
+- Restore test collection.
+- Establish full test results.
+- Resolve package-root ownership.
+- Decide canonical visualization orchestration path.
+- Define interactive ingestion contracts for CSV, Excel, and COMTRADE.

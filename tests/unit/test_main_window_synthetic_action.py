@@ -48,17 +48,6 @@ class TestPanelOrderConstant:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestSyntheticHandlerExists:
-    def test_rebuild_grouped_layout_exists(self) -> None:
-        assert hasattr(PowerwaveMainWindow, "_rebuild_grouped_layout")
-
-    def test_restore_standard_layout_exists(self) -> None:
-        assert hasattr(PowerwaveMainWindow, "_restore_standard_layout")
-
-    def test_link_panel_x_axes_exists(self) -> None:
-        assert hasattr(PowerwaveMainWindow, "_link_panel_x_axes")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # TestSyntheticRecordIntegration
 # ─────────────────────────────────────────────────────────────────────────────

@@ -157,6 +157,14 @@ class SourceRowWidget(QWidget):
         """Select a specific panel in a channel's combo."""
         self._channel_tree.update_channel_panel(channel_name, panel_id)
 
+    def set_channel_readout(self, channel_name: str, value_str: str) -> None:
+        """Update the live readout value for one channel."""
+        self._channel_tree.set_channel_readout(channel_name, value_str)
+
+    def clear_readouts(self) -> None:
+        """Clear all readout values."""
+        self._channel_tree.clear_readouts()
+
     def refresh(
         self,
         source: SessionSource,

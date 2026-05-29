@@ -198,7 +198,12 @@ def _select_initial_multi_source_viewport(
 
 
 class VisualizationManager:
-    """Coordinates FlexiblePlotCanvas (analog) and DigitalEventTimeline (digital).
+    """DEPRECATED — retained for legacy tests only.
+
+    The active display path is now EventAnalysisSession + SessionCanvasController.
+    This class is no longer wired into PowerwaveMainWindow.
+
+    Coordinates FlexiblePlotCanvas (analog) and DigitalEventTimeline (digital).
 
     Responsibilities:
       - Coordinated set_record() / clear() / zoom_to_trigger() / reset_viewport()

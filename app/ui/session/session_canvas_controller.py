@@ -26,7 +26,8 @@ from datetime import datetime, timedelta
 import numpy as np
 from PyQt6 import sip
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QSplitter, QWidget
+from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import QScrollArea, QSplitter, QWidget
 
 from app.analytics.harmonics.harmonic_models import HarmonicConfig, HarmonicDisplayMode
 from app.analytics.phasors.phasor_models import PhasorConfig, PhasorDisplayMode
@@ -128,13 +129,19 @@ class SessionCanvasController:
         self._measurement_callback: object = None # S6
         self._cursor_sync: bool = True            # sync cursors across all panels
         self._measurement_mode_changed_cb: Callable[[bool], None] | None = None
+        self._digital_panel_rows: dict[str, int] = {}   # panel_id → number of digital rows
+        self._needs_digital_resize: bool = False         # trigger one resize after rebuild
+        self._scroll_area: QScrollArea | None = None
+        self._crosshair_readout_cb: object = None        # callable(t, values) for live readout
+        self._navigator = None                           # WaveformNavigatorStrip | None
+        self._channel_panel_changed_cb: object = None   # callable(source_id, ch_name, panel_id)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
     # ─────────────────────────────────────────────────────────────────────────
 
     def rebuild_layout(self, session) -> QWidget:
-        """Return a QSplitter containing one SessionCanvasWidget per panel."""
+        """Return a QScrollArea containing a QSplitter with one SessionCanvasWidget per panel."""
         self._session_ref = session
         visible_panels = [p for p in session.list_panels() if p.is_visible]
         new_ids = [p.panel_id for p in visible_panels]
@@ -165,7 +172,7 @@ class SessionCanvasController:
             else:
                 canvas = self._canvases[panel.panel_id]
                 canvas.set_panel_title(panel.title)
-            canvas.setMinimumHeight(160)
+            canvas.setMinimumHeight(200)
             canvas.set_legend_visible(self._legend_visible)
             if self._measurement_mode:  # S6: propagate measurement state to (re-)created canvases
                 canvas.set_measurement_mode(True)
@@ -174,11 +181,20 @@ class SessionCanvasController:
 
         self._current_panel_ids = new_ids
         self._splitter = splitter
+        self._digital_panel_rows.clear()
+        self._needs_digital_resize = True
         self._update_mergeable_panels()
         self._apply_time_reference(session)
         self._refresh_zero_lines(session)
         self._refresh_trigger_markers(session)
-        return splitter
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(splitter)
+        self._scroll_area = scroll
+        return scroll
 
     def active_canvases(self) -> list[SessionCanvasWidget]:
         return [self._canvases[pid] for pid in self._current_panel_ids if pid in self._canvases]
@@ -212,6 +228,12 @@ class SessionCanvasController:
         self._apply_time_reference(session)
         self._refresh_zero_lines(session)
         self._refresh_trigger_markers(session)
+        self._populate_navigator(session)
+
+        if self._needs_digital_resize:
+            self._needs_digital_resize = False
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._resize_digital_panels)
 
     def refresh_panel(self, panel_id: str, session) -> None:
         self._session_ref = session
@@ -283,10 +305,38 @@ class SessionCanvasController:
         source_id: str,
         channel_name: str,
         visible: bool,
-        session=None,  # noqa: ARG002
+        session=None,
     ) -> None:
         for canvas in self._canvases.values():
             canvas.set_curve_visible(source_id, channel_name, visible)
+        sess = session or self._session_ref
+        if sess is not None:
+            self._repack_digital_panel_for_channel(source_id, channel_name, sess)
+
+    def _repack_digital_panel_for_channel(
+        self, source_id: str, channel_name: str, session
+    ) -> None:
+        """If the toggled channel is digital, repaint its panel to repack Y offsets."""
+        digital_keys = {
+            (ch.source_id, ch.channel_name)
+            for ch in session.list_digital_channels(active_only=False)
+        }
+        if (source_id, channel_name) not in digital_keys:
+            return
+        all_channels = self._channel_lookup(session)
+        active_sids = {s.source_id for s in session.list_sources() if s.is_active}
+        sources_by_id = {s.source_id: s for s in session.list_sources()}
+        t_start, t_end = _session_window(session)
+        for panel in session.list_panels():
+            if (source_id, channel_name) in panel.channel_refs:
+                canvas = self._canvases.get(panel.panel_id)
+                if canvas is not None:
+                    self._digital_panel_rows.pop(panel.panel_id, None)
+                    self._paint_panel(
+                        canvas, panel, session,
+                        all_channels, active_sids, sources_by_id,
+                        t_start, t_end,
+                    )
 
     def on_source_removed(self, source_id: str) -> None:
         for canvas in self._canvases.values():
@@ -314,6 +364,24 @@ class SessionCanvasController:
     # ─────────────────────────────────────────────────────────────────────────
     # Panel merge / split  (Phase 9E — wired via canvas header context menu)
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _handle_channel_drop(
+        self, source_id: str, channel_name: str, from_panel_id: str, to_panel_id: str
+    ) -> None:
+        """Move a channel from one panel to another via drag-and-drop."""
+        if from_panel_id == to_panel_id or self._session_ref is None:
+            return
+        try:
+            self._session_ref.set_channel_panel(source_id, channel_name, to_panel_id)
+        except Exception:  # noqa: BLE001
+            return
+        # Notify main window to do a full rebuild (same path as "Move to panel" in legend)
+        if self._channel_panel_changed_cb is not None:
+            self._channel_panel_changed_cb(source_id, channel_name, to_panel_id)
+
+    def _handle_panel_rename(self, panel_id: str, new_title: str) -> None:
+        if self._session_ref is not None:
+            self._session_ref.rename_panel(panel_id, new_title)
 
     def _handle_merge_panels(self, panel_id_a: str, panel_id_b: str) -> None:
         if self._session_ref is None:
@@ -483,11 +551,19 @@ class SessionCanvasController:
         t_start: float,
         t_end: float,
     ) -> None:
+        digital_keys = {
+            (ch.source_id, ch.channel_name)
+            for ch in session.list_digital_channels(active_only=False)
+        }
+        digital_row = 0
+        digital_tick_labels: list[tuple[float, str]] = []
+
         for source_id, channel_name in panel.channel_refs:
             if source_id not in active_sids:
                 canvas.set_curve_visible(source_id, channel_name, False)
                 continue
             ch = all_channels.get((source_id, channel_name))
+            is_digital = (source_id, channel_name) in digital_keys
             visible = ch.is_visible if ch is not None else True
             color = (ch.color_hex if (ch and ch.color_hex) else None) or self._auto_colour(source_id, channel_name)
             if not visible:
@@ -495,23 +571,59 @@ class SessionCanvasController:
                 continue
             try:
                 aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
-                scaled_values, display_unit = self._scale_aligned(
-                    channel_name, aligned.values, aligned.unit
-                )
                 source = sources_by_id.get(source_id)
                 badge = source.display_name if source else source_id
-                canvas.update_curve(
-                    source_id, channel_name, aligned.time, scaled_values,
-                    color=color, visible=True,
-                    display_name=ch.display_name if ch else channel_name,
-                    source_badge=badge,
-                    unit=display_unit,
-                    line_style=ch.line_style if ch else "solid",
-                    line_width=ch.line_width if ch else 1.0,
-                    y_axis_side=ch.y_axis_side if ch else "left",
-                )
+                if is_digital:
+                    label = (ch.display_name if ch and ch.display_name else channel_name)
+                    canvas.update_digital_curve(
+                        source_id, channel_name,
+                        aligned.time, aligned.values,
+                        color=color, visible=True,
+                        y_offset=float(digital_row),
+                        display_name=label,
+                        source_badge=badge,
+                        unit=ch.unit if ch else None,
+                    )
+                    digital_tick_labels.append((float(digital_row), label))
+                    digital_row += 1
+                else:
+                    scaled_values, display_unit = self._scale_aligned(
+                        channel_name, aligned.values, aligned.unit
+                    )
+                    canvas.update_curve(
+                        source_id, channel_name, aligned.time, scaled_values,
+                        color=color, visible=True,
+                        display_name=ch.display_name if ch else channel_name,
+                        source_badge=badge,
+                        unit=display_unit,
+                        line_style=ch.line_style if ch else "solid",
+                        line_width=ch.line_width if ch else 1.0,
+                        y_axis_side=ch.y_axis_side if ch else "left",
+                    )
             except Exception:  # noqa: BLE001
                 pass
+
+        # For digital-only panels: show channel names as Y-axis tick labels
+        is_digital_only = digital_row > 0 and not any(
+            (sid, cname) not in digital_keys
+            for sid, cname in panel.channel_refs
+        )
+        if is_digital_only:
+            plot = canvas._primary_plot
+            vb = plot.getViewBox()
+            left = plot.getAxis("left")
+            left.setTicks([digital_tick_labels])
+            tick_font = QFont()
+            tick_font.setPointSize(8)
+            left.setStyle(showValues=True, tickLength=0, autoExpandTextSpace=False, tickFont=tick_font)
+            left.setWidth(160)
+            plot.setMouseEnabled(x=True, y=True)
+            vb.enableAutoRange(axis="y", enable=False)
+            # Only reset Y range when row count changes (preserves scroll position)
+            if self._digital_panel_rows.get(panel.panel_id, -1) != digital_row:
+                plot.setYRange(-0.5, float(digital_row) - 0.5, padding=0)
+                self._digital_panel_rows[panel.panel_id] = digital_row
+            canvas.setup_digital_scroll(digital_row)
 
         # S2: compute RMS overlays for this panel after all raw curves are updated
         if self._rms_mode != RMSDisplayMode.OFF:
@@ -524,6 +636,41 @@ class SessionCanvasController:
         # S4: compute harmonic magnitude overlays for this panel
         if self._harmonic_mode == HarmonicDisplayMode.HARMONIC_MAGNITUDE:
             self._compute_harmonic_for_panel(canvas, panel, session, all_channels, sources_by_id, t_start, t_end)
+
+    def _resize_digital_panels(self) -> None:
+        """Size panels after rebuild: digital panels get a capped height, analog panels ~250px.
+
+        The splitter's minimum height is set to the sum of all panel heights so the
+        outer QScrollArea scrollbar activates when total content exceeds the viewport.
+        The user can still drag splitter handles freely after this initial sizing.
+        """
+        _ROW_PX = 30       # pixels per digital channel row
+        _MARGIN_PX = 65    # header strip + legend widget + padding
+        _MAX_DIGITAL_PX = 220  # cap — beyond this the per-panel Y scrollbar takes over
+        _ANALOG_PX = 250   # default height for analog panels
+
+        if self._splitter is None or sip.isdeleted(self._splitter):
+            return
+
+        n_panels = len(self._current_panel_ids)
+        if n_panels == 0:
+            return
+
+        current = list(self._splitter.sizes())
+        if len(current) != n_panels:
+            return
+
+        new_sizes: list[int] = []
+        for pid in self._current_panel_ids:
+            n_rows = self._digital_panel_rows.get(pid, 0)
+            if n_rows > 0:
+                natural = n_rows * _ROW_PX + _MARGIN_PX
+                new_sizes.append(min(natural, _MAX_DIGITAL_PX))
+            else:
+                new_sizes.append(_ANALOG_PX)
+
+        self._splitter.setMinimumHeight(sum(new_sizes))
+        self._splitter.setSizes(new_sizes)
 
     def _refresh_zero_lines(self, session) -> None:
         sources_by_id = {s.source_id: s for s in session.list_sources()}
@@ -1121,6 +1268,86 @@ class SessionCanvasController:
     def _on_cursor_sync_toggled(self, enabled: bool) -> None:
         self.set_cursor_sync(enabled)
 
+    def set_crosshair_readout_callback(self, cb) -> None:
+        """Register callable(t, values) called when the hover crosshair moves over any panel."""
+        self._crosshair_readout_cb = cb
+
+    def set_channel_panel_changed_callback(self, cb) -> None:
+        """Register callable(source_id, ch_name, panel_id) — fired when a channel is drag-dropped."""
+        self._channel_panel_changed_cb = cb
+
+    def set_navigator(self, navigator) -> None:
+        """Wire the WaveformNavigatorStrip to the session: populate it and sync viewport."""
+        self._navigator = navigator
+        # User dragging the navigator region → pan all canvases
+        navigator.viewport_changed.connect(self._on_navigator_viewport_changed)
+        # Wire master canvas X range changes → update navigator region
+        if self._current_panel_ids and self._canvases:
+            master_pid = self._current_panel_ids[0]
+            master_canvas = self._canvases.get(master_pid)
+            if master_canvas is not None:
+                master_canvas.getViewBox().sigXRangeChanged.connect(
+                    self._on_canvas_x_range_changed_for_nav
+                )
+
+    def _on_navigator_viewport_changed(self, t_start: float, t_end: float) -> None:
+        """Navigator region dragged → set X range on all panels."""
+        for canvas in self._canvases.values():
+            canvas.normalize_viewport(t_start, t_end)
+
+    def _on_canvas_x_range_changed_for_nav(self, _vb, x_range) -> None:
+        """Master canvas X range changed → update navigator region."""
+        if self._navigator is not None:
+            t_start, t_end = float(x_range[0]), float(x_range[1])
+            self._navigator.set_viewport(t_start, t_end)
+
+    def _populate_navigator(self, session) -> None:
+        """Fill the navigator strip with downsampled channel data."""
+        if self._navigator is None:
+            return
+        self._navigator.clear_channels()
+        t_start, t_end = _session_window(session)
+        self._navigator.set_time_range(t_start, t_end)
+        all_channels = self._channel_lookup(session)
+        sources_by_id = {s.source_id: s for s in session.list_sources()}
+        digital_keys = {
+            (ch.source_id, ch.channel_name)
+            for ch in session.list_digital_channels(active_only=False)
+        }
+
+        for panel_id, canvas in self._canvases.items():
+            panels = {p.panel_id: p for p in session.list_panels()}
+            panel = panels.get(panel_id)
+            if panel is None:
+                continue
+            for source_id, channel_name in panel.channel_refs:
+                if (source_id, channel_name) in digital_keys:
+                    continue  # skip digital channels in navigator
+                source = sources_by_id.get(source_id)
+                if source is None or not source.is_active:
+                    continue
+                ch = all_channels.get((source_id, channel_name))
+                if ch is not None and not ch.is_visible:
+                    continue
+                try:
+                    aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
+                    color = (ch.color_hex if (ch and ch.color_hex) else None) or self._auto_colour(source_id, channel_name)
+                    nav_key = f"{source_id}:{channel_name}"
+                    self._navigator.update_channel(nav_key, aligned.time, aligned.values, color)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _on_crosshair_moved(self, source_canvas: SessionCanvasWidget, t: float) -> None:
+        """Propagate crosshair position to all other panels without feedback loops."""
+        for canvas in self._canvases.values():
+            if canvas is not source_canvas:
+                canvas.set_crosshair_pos(t)
+
+    def _on_crosshair_values_changed(self, t: float, values: list) -> None:
+        """Forward interpolated channel values at the crosshair to the readout bar."""
+        if self._crosshair_readout_cb is not None:
+            self._crosshair_readout_cb(t, values)
+
     def _wire_canvas(self, canvas: SessionCanvasWidget, sources_by_id: dict) -> None:
         """Connect legend and panel-header signals for a newly created canvas."""
         legend = canvas.legend
@@ -1133,6 +1360,9 @@ class SessionCanvasController:
         )
         legend.visibility_changed.connect(
             lambda sid, cname, vis: self._handle_legend_visibility(sid, cname, vis)
+        )
+        legend.batch_visibility_changed.connect(
+            lambda keys, vis: self._handle_legend_batch_visibility(keys, vis)
         )
         legend.line_style_changed.connect(
             lambda sid, cname, style: self._handle_legend_line_style(sid, cname, style)
@@ -1147,6 +1377,8 @@ class SessionCanvasController:
         canvas.merge_with_requested.connect(self._handle_merge_panels)
         canvas.split_by_source_requested.connect(self._handle_split_by_source)
         canvas.split_by_type_requested.connect(self._handle_split_by_type)
+        canvas.channel_drop_requested.connect(self._handle_channel_drop)
+        canvas.panel_title_changed.connect(self._handle_panel_rename)
         # S6: route cursor movement through the controller to compute measurements
         canvas.measurement_cursors_moved.connect(
             lambda t_a, t_b, _c=canvas: self._on_canvas_measurement_moved(_c, t_a, t_b)
@@ -1163,6 +1395,11 @@ class SessionCanvasController:
             self._on_measurement_toggle_from_canvas
         )
         canvas.cursor_sync_toggle_requested.connect(self._on_cursor_sync_toggled)
+        # Hover crosshair: propagate to all other panels + live readout bar
+        canvas.crosshair_moved.connect(
+            lambda t, _c=canvas: self._on_crosshair_moved(_c, t)
+        )
+        canvas.crosshair_values_changed.connect(self._on_crosshair_values_changed)
 
     def _handle_legend_colour(
         self, source_id: str, channel_name: str, color_hex: str
@@ -1194,6 +1431,16 @@ class SessionCanvasController:
             self._session_ref.set_channel_visibility(source_id, channel_name, visible)
         for canvas in self._canvases.values():
             canvas.set_curve_visible(source_id, channel_name, visible)
+
+    def _handle_legend_batch_visibility(
+        self, keys: list, visible: bool
+    ) -> None:
+        for source_id, channel_name in keys:
+            if self._session_ref is not None:
+                self._session_ref.set_channel_visibility(source_id, channel_name, visible)
+            for canvas in self._canvases.values():
+                canvas.set_curve_visible(source_id, channel_name, visible)
+                canvas.legend.update_row_visible(source_id, channel_name, visible)
 
     def _handle_legend_line_style(
         self, source_id: str, channel_name: str, style: str

@@ -319,18 +319,8 @@ class TestDirectOpenResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _on_record_loaded dispatch logic (no Qt, via attribute inspection)
+# Attribute inspection helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_on_record_loaded_method_exists() -> None:
-    from app.ui.main_window.main_window import PowerwaveMainWindow
-    assert hasattr(PowerwaveMainWindow, "_on_record_loaded")
-
-
-def test_handle_direct_csv_excel_method_exists() -> None:
-    from app.ui.main_window.main_window import PowerwaveMainWindow
-    assert hasattr(PowerwaveMainWindow, "_handle_direct_csv_excel")
 
 
 def test_intelligent_load_worker_class_exists() -> None:

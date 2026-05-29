@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import colorsys
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QMimeData, QPoint, pyqtSignal
+from PyQt6.QtGui import QColor, QDrag, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QColorDialog,
     QHBoxLayout,
     QInputDialog,
@@ -32,6 +33,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+_CHANNEL_MIME = "application/x-powerwave-channel"
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +88,8 @@ _NAME_ACTIVE = "color: #ddd; font-size: 11px;"
 _NAME_HIDDEN = "color: #555; font-size: 11px;"
 _BADGE_STYLE = "font-size: 9px; color: #888; padding-left: 3px;"
 _UNIT_STYLE  = "font-size: 9px; font-style: italic; color: #666; padding-left: 2px;"
+_ROW_SELECTED_BG = "background: #1E3A5F;"
+_ROW_NORMAL_BG   = "background: transparent;"
 
 
 class _LegendRow(QWidget):
@@ -108,6 +113,8 @@ class _LegendRow(QWidget):
         self._colour = colour
         self._line_style = "solid"
         self._line_width = 1.0
+        self._panel_id: str = ""           # set by ChannelLegendWidget
+        self._drag_start_pos: QPoint | None = None
 
         # Callbacks wired by ChannelLegendWidget — keep as callables, not signals,
         # to avoid making _LegendRow a full QObject with its own signal table.
@@ -120,6 +127,11 @@ class _LegendRow(QWidget):
         self._cb_line_style: object = None
         self._cb_line_width: object = None
         self._cb_y_axis: object = None
+        self._cb_select: object = None           # toggle selection
+        self._cb_selection_count: object = None  # returns int
+        self._cb_batch_hide: object = None
+        self._cb_batch_show: object = None
+        self._selected: bool = False
         self._y_axis_side = "left"
 
         self._build_ui(display_name, source_badge, unit, colour, visible)
@@ -189,6 +201,10 @@ class _LegendRow(QWidget):
     def set_visible_state(self, visible: bool) -> None:
         self._name_lbl.setStyleSheet(_NAME_ACTIVE if visible else _NAME_HIDDEN)
 
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self.setStyleSheet(_ROW_SELECTED_BG if selected else _ROW_NORMAL_BG)
+
     # ------------------------------------------------------------------
     # Interaction handlers
     # ------------------------------------------------------------------
@@ -234,6 +250,44 @@ class _LegendRow(QWidget):
     def set_y_axis_side(self, side: str) -> None:
         self._y_axis_side = side
 
+    # ------------------------------------------------------------------
+    # Drag-and-drop (drag source)
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                if self._cb_select is not None:
+                    self._cb_select(self.source_id, self.channel_name)
+                return
+            self._drag_start_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_start_pos is not None
+            and (event.pos() - self._drag_start_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self._start_drag()
+        super().mouseMoveEvent(event)
+
+    def _start_drag(self) -> None:
+        mime = QMimeData()
+        payload = f"{self.source_id}|||{self.channel_name}|||{self._panel_id}"
+        mime.setData(_CHANNEL_MIME, payload.encode("utf-8"))
+
+        # Tiny colour-swatch pixmap as drag icon
+        pix = QPixmap(12, 12)
+        pix.fill(QColor(self._colour))
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(pix)
+        drag.setHotSpot(QPoint(6, 6))
+        drag.exec(Qt.DropAction.MoveAction)
+
     def _context_menu(self, pos) -> None:
         _MENU_SS = (
             "QMenu { background-color: #f0f0f0; color: #1a1a1a; border: 1px solid #b0b0b0; }"
@@ -242,6 +296,14 @@ class _LegendRow(QWidget):
         )
         menu = QMenu(self)
         menu.setStyleSheet(_MENU_SS)
+
+        # Batch operations block (visible when 2+ rows selected)
+        n_sel = self._cb_selection_count() if self._cb_selection_count else 0
+        batch_hide_act = batch_show_act = None
+        if n_sel > 1:
+            batch_hide_act = menu.addAction(f"Hide {n_sel} selected")
+            batch_show_act = menu.addAction(f"Show {n_sel} selected")
+            menu.addSeparator()
 
         hide_act = menu.addAction("Hide")
         menu.addSeparator()
@@ -278,6 +340,14 @@ class _LegendRow(QWidget):
 
         chosen = menu.exec(self.mapToGlobal(pos))
         if chosen is None:
+            return
+        if batch_hide_act is not None and chosen == batch_hide_act:
+            if self._cb_batch_hide:
+                self._cb_batch_hide()
+            return
+        if batch_show_act is not None and chosen == batch_show_act:
+            if self._cb_batch_show:
+                self._cb_batch_show()
             return
         data = chosen.data()
         if data is not None and isinstance(data, tuple):
@@ -324,11 +394,13 @@ class ChannelLegendWidget(QWidget):
     line_style_changed = pyqtSignal(str, str, str)    # source_id, channel_name, style
     line_width_changed = pyqtSignal(str, str, float)  # source_id, channel_name, width
     y_axis_changed = pyqtSignal(str, str, str)        # source_id, channel_name, side
+    batch_visibility_changed = pyqtSignal(list, bool) # [(source_id, channel_name), ...], visible
 
     def __init__(self, panel_id: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.panel_id = panel_id
         self._rows: dict[tuple[str, str], _LegendRow] = {}
+        self._selected_keys: set[tuple[str, str]] = set()
 
         self._build_ui()
 
@@ -338,6 +410,30 @@ class ChannelLegendWidget(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Compact batch toolbar
+        toolbar = QWidget()
+        toolbar.setFixedHeight(18)
+        toolbar.setStyleSheet("background: #141414;")
+        tb_lay = QHBoxLayout(toolbar)
+        tb_lay.setContentsMargins(4, 0, 4, 0)
+        tb_lay.setSpacing(4)
+        self._sel_lbl = QLabel("Ctrl+click to select")
+        self._sel_lbl.setStyleSheet("color: #555; font-size: 9px;")
+        tb_lay.addWidget(self._sel_lbl)
+        tb_lay.addStretch()
+        for label, slot in (("All", self._show_all), ("None", self._hide_all)):
+            btn = QPushButton(label)
+            btn.setFixedHeight(14)
+            btn.setFixedWidth(30)
+            btn.setStyleSheet(
+                "QPushButton { background: #2A2A2A; color: #888; font-size: 9px;"
+                " border: 1px solid #333; border-radius: 2px; padding: 0; }"
+                "QPushButton:hover { background: #333; color: #aaa; }"
+            )
+            btn.clicked.connect(slot)
+            tb_lay.addWidget(btn)
+        outer.addWidget(toolbar)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -384,6 +480,7 @@ class ChannelLegendWidget(QWidget):
                 source_badge, unit, colour, visible,
                 parent=self._container,
             )
+            row._panel_id = self.panel_id
             self._wire_row(row)
             # Insert before the trailing stretch
             insert_pos = self._row_layout.count() - 1
@@ -474,6 +571,55 @@ class ChannelLegendWidget(QWidget):
     # Signal wiring
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Batch / selection
+    # ------------------------------------------------------------------
+
+    def _toggle_row_selection(self, source_id: str, channel_name: str) -> None:
+        key = (source_id, channel_name)
+        row = self._rows.get(key)
+        if row is None:
+            return
+        if key in self._selected_keys:
+            self._selected_keys.discard(key)
+            row.set_selected(False)
+        else:
+            self._selected_keys.add(key)
+            row.set_selected(True)
+        n = len(self._selected_keys)
+        self._sel_lbl.setText(f"{n} selected" if n else "Ctrl+click to select")
+
+    def _selection_count(self) -> int:
+        return len(self._selected_keys)
+
+    def _batch_hide_selected(self) -> None:
+        keys = list(self._selected_keys)
+        if keys:
+            self.batch_visibility_changed.emit(keys, False)
+
+    def _batch_show_selected(self) -> None:
+        keys = list(self._selected_keys)
+        if keys:
+            self.batch_visibility_changed.emit(keys, True)
+
+    def _hide_all(self) -> None:
+        keys = list(self._rows.keys())
+        if keys:
+            self.batch_visibility_changed.emit(keys, False)
+
+    def _show_all(self) -> None:
+        keys = list(self._rows.keys())
+        if keys:
+            self.batch_visibility_changed.emit(keys, True)
+
+    def clear_selection(self) -> None:
+        for key in list(self._selected_keys):
+            row = self._rows.get(key)
+            if row is not None:
+                row.set_selected(False)
+        self._selected_keys.clear()
+        self._sel_lbl.setText("Ctrl+click to select")
+
     def _wire_row(self, row: _LegendRow) -> None:
         row._cb_colour = self._on_row_colour
         row._cb_name = self._on_row_name
@@ -484,6 +630,10 @@ class ChannelLegendWidget(QWidget):
         row._cb_line_style = self._on_row_line_style
         row._cb_line_width = self._on_row_line_width
         row._cb_y_axis = self._on_row_y_axis
+        row._cb_select = self._toggle_row_selection
+        row._cb_selection_count = self._selection_count
+        row._cb_batch_hide = self._batch_hide_selected
+        row._cb_batch_show = self._batch_show_selected
 
     def _on_row_colour(self, source_id: str, channel_name: str, colour: str) -> None:
         row = self._rows.get((source_id, channel_name))

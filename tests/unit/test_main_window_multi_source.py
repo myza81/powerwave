@@ -75,14 +75,6 @@ class TestMakeSourceRecord:
 
 
 class TestMultiSourceMenuAction:
-    def test_open_multi_source_dialog_method_exists(self) -> None:
-        from app.ui.main_window.main_window import PowerwaveMainWindow
-        assert callable(getattr(PowerwaveMainWindow, "_open_multi_source_dialog", None))
-
-    def test_load_multi_source_method_exists(self) -> None:
-        from app.ui.main_window.main_window import PowerwaveMainWindow
-        assert callable(getattr(PowerwaveMainWindow, "_load_multi_source", None))
-
     def test_on_multi_source_loaded_method_exists(self) -> None:
         from app.ui.main_window.main_window import PowerwaveMainWindow
         assert callable(getattr(PowerwaveMainWindow, "_on_multi_source_loaded", None))

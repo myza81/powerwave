@@ -480,6 +480,11 @@ class EventAnalysisSession:
     def remove_panel(self, panel_id: str) -> None:
         self._panels.pop(panel_id, None)
 
+    def set_panel_visible(self, panel_id: str, visible: bool) -> None:
+        panel = self._panels.get(panel_id)
+        if panel is not None:
+            panel.is_visible = visible
+
     def rename_panel(self, panel_id: str, title: str) -> None:
         panel = self._panels.get(panel_id)
         if panel is not None:

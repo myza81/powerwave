@@ -48,11 +48,17 @@ from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QPointF, pyqtSignal
+from PyQt6.QtGui import QAction, QCursor
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMenu,
+    QMessageBox,
+    QScrollBar,
     QVBoxLayout,
     QWidget,
 )
@@ -66,29 +72,110 @@ from app.visualization.axis.datetime_axis import DatetimeAxisItem
 # ---------------------------------------------------------------------------
 
 
+_CHANNEL_MIME = "application/x-powerwave-channel"
+
+
 class _PanelHeader(QWidget):
-    """Thin title bar above the plot — right-click for merge/split operations."""
+    """Thin title bar above the plot — collapse toggle, right-click merge/split, drop target."""
+
+    channel_dropped = pyqtSignal(str, str, str)   # source_id, channel_name, from_panel_id
+    collapse_toggled = pyqtSignal(bool)           # True = collapsed
+    rename_requested = pyqtSignal(str)            # new_title
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedHeight(20)
         self.setStyleSheet("background: #252525;")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(6, 0, 6, 0)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(4)
+
+        self._collapsed = False
+        self._collapse_btn = QLabel("▼")
+        self._collapse_btn.setFixedWidth(14)
+        self._collapse_btn.setStyleSheet(
+            "color: #888; font-size: 9px; background: transparent;"
+        )
+        self._collapse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collapse_btn.mousePressEvent = lambda _e: self._toggle_collapse()
+        lay.addWidget(self._collapse_btn)
+
         self._lbl = QLabel(title)
         self._lbl.setStyleSheet(
             "font-weight: bold; font-size: 11px; color: #ccc; "
             "background: transparent;"
         )
+        self._lbl.mouseDoubleClickEvent = lambda _e: self._start_rename()
         lay.addWidget(self._lbl)
         lay.addStretch()
-        hint = QLabel("▾")
-        hint.setStyleSheet("color: #666; font-size: 11px; background: transparent;")
-        lay.addWidget(hint)
+        self._drop_hint = QLabel("↓ drop here")
+        self._drop_hint.setStyleSheet("color: #555; font-size: 9px; background: transparent;")
+        self._drop_hint.setVisible(False)
+        lay.addWidget(self._drop_hint)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.setAcceptDrops(True)
 
     def set_title(self, title: str) -> None:
         self._lbl.setText(title)
+
+    def _start_rename(self) -> None:
+        current = self._lbl.text()
+        new_title, ok = QInputDialog.getText(
+            self, "Rename panel", "Panel name:", text=current
+        )
+        if ok and new_title.strip() and new_title.strip() != current:
+            self._lbl.setText(new_title.strip())
+            self.rename_requested.emit(new_title.strip())
+
+    def _toggle_collapse(self) -> None:
+        self._collapsed = not self._collapsed
+        self._collapse_btn.setText("▶" if self._collapsed else "▼")
+        self.collapse_toggled.emit(self._collapsed)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(_CHANNEL_MIME):
+            event.acceptProposedAction()
+            self.setStyleSheet("background: #3A5A3A;")
+            self._drop_hint.setVisible(True)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self.setStyleSheet("background: #252525;")
+        self._drop_hint.setVisible(False)
+
+    def dropEvent(self, event) -> None:
+        self.setStyleSheet("background: #252525;")
+        raw = bytes(event.mimeData().data(_CHANNEL_MIME)).decode("utf-8")
+        parts = raw.split("|||")
+        if len(parts) == 3:
+            source_id, channel_name, from_panel_id = parts
+            self.channel_dropped.emit(source_id, channel_name, from_panel_id)
+            event.acceptProposedAction()
+
+
+# ---------------------------------------------------------------------------
+# SI-prefix Y-axis
+# ---------------------------------------------------------------------------
+
+
+class _SIAxisItem(pg.AxisItem):
+    """Y-axis that renders large tick values with K / M SI prefix."""
+
+    def tickStrings(self, values, scale, spacing):
+        strings = []
+        for v in values:
+            vs = v * scale
+            abs_vs = abs(vs)
+            if vs == 0:
+                strings.append("0")
+            elif abs_vs >= 1_000_000:
+                strings.append(f"{vs / 1_000_000:.3g}M")
+            elif abs_vs >= 1_000:
+                strings.append(f"{vs / 1_000:.3g}K")
+            else:
+                strings.append(f"{vs:.4g}")
+        return strings
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +217,7 @@ class _RightAxisManager:
         if scene is not None:
             scene.addItem(vb)
 
-        ax = pg.AxisItem("right")
+        ax = _SIAxisItem("right")
         ax.enableAutoSIPrefix(False)
         ax.setLabel(label)
         ax.setPen(pg.mkPen(color))
@@ -262,11 +349,15 @@ class SessionCanvasWidget(QWidget):
     merge_with_requested = pyqtSignal(str, str)   # my_panel_id, target_panel_id
     split_by_source_requested = pyqtSignal(str)   # my_panel_id
     split_by_type_requested = pyqtSignal(str)     # my_panel_id
+    channel_drop_requested = pyqtSignal(str, str, str, str)  # source_id, ch_name, from_panel, to_panel
     measurement_cursors_moved = pyqtSignal(float, float)  # t_a, t_b  (S6)
     cursor_a_moved = pyqtSignal(float)            # t_a — for cross-panel sync
     cursor_b_moved = pyqtSignal(float)            # t_b — for cross-panel sync
     measurement_mode_toggle_requested = pyqtSignal(bool)  # from right-click menu
     cursor_sync_toggle_requested = pyqtSignal(bool)       # from right-click menu
+    crosshair_moved = pyqtSignal(float)           # hover crosshair x position
+    crosshair_values_changed = pyqtSignal(float, list)    # (t, [(name, value, unit, color), ...])
+    panel_title_changed = pyqtSignal(str, str)    # panel_id, new_title
 
     def __init__(
         self,
@@ -280,6 +371,9 @@ class SessionCanvasWidget(QWidget):
         self._mergeable_panels: list[tuple[str, str]] = []
 
         self._curves: dict[tuple[str, str], pg.PlotDataItem] = {}
+        self._digital_hi_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # thick — HIGH
+        self._digital_lo_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # thin  — LOW
+        self._digital_raw: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, str, str]] = {}  # key → (time, values, label, color)
         self._zero_lines: dict[str, pg.InfiniteLine] = {}
         self._trigger_markers: dict[str, pg.InfiniteLine] = {}  # S1
         self._rms_curves: dict[tuple[str, str], pg.PlotDataItem] = {}  # S2
@@ -291,6 +385,13 @@ class SessionCanvasWidget(QWidget):
         self._measurement_mode: bool = False           # S6
         self._cursor_sync: bool = True                 # mirrors controller state for menu display
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
+        self._digital_n_rows: int = 0                  # 0 = not a digital panel
+
+        self._annotations: dict[str, pg.InfiniteLine] = {}
+        self._annot_counter: int = 0
+        self._last_right_click_x: float = 0.0
+        self._hover_cursor: pg.InfiniteLine | None = None   # synchronized hover crosshair
+        self._hover_proxy: pg.SignalProxy | None = None     # rate-limited mouse-move relay
 
         self._build_ui()
 
@@ -303,21 +404,50 @@ class SessionCanvasWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Panel header strip (right-click → merge/split menu)
+        # Panel header strip (collapse toggle, right-click merge/split, drag target)
         self._header = _PanelHeader(self._panel_title, parent=self)
         self._header.customContextMenuRequested.connect(self._show_panel_menu)
+        self._header.channel_dropped.connect(
+            lambda sid, cname, from_pid: self.channel_drop_requested.emit(
+                sid, cname, from_pid, self.panel_id
+            )
+        )
+        self._header.collapse_toggled.connect(self._on_collapse_toggled)
+        self._header.rename_requested.connect(
+            lambda title: self.panel_title_changed.emit(self.panel_id, title)
+        )
         layout.addWidget(self._header)
 
         # Main plot area: GraphicsLayoutWidget hosts PlotItem at col=0;
         # _RightAxisManager adds secondary AxisItems at col=1, 2, …
         self._datetime_axis = DatetimeAxisItem(orientation="bottom")
+        self._left_axis = _SIAxisItem("left")
+        self._left_axis.enableAutoSIPrefix(False)
         self._glw = pg.GraphicsLayoutWidget()
         self._glw.setBackground("#1E1E1E")
         self._primary_plot: pg.PlotItem = self._glw.addPlot(
-            row=0, col=0, axisItems={"bottom": self._datetime_axis}
+            row=0, col=0, axisItems={"bottom": self._datetime_axis, "left": self._left_axis}
         )
         self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
         self._primary_plot.setLabel("bottom", "Time")
+
+        # Inject cursor items at the top of pyqtgraph's built-in right-click menu
+        self._inject_cursor_menu_items()
+
+        # Hover crosshair — thin semi-transparent white vertical line, always present
+        self._hover_cursor = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=False,
+            pen=pg.mkPen("#FFFFFF55", width=1),
+        )
+        self._hover_cursor.setVisible(False)
+        self._primary_plot.addItem(self._hover_cursor)
+
+        # Rate-limited mouse-move listener wired to the GLW scene
+        self._hover_proxy = pg.SignalProxy(
+            self._glw.scene().sigMouseMoved,
+            rateLimit=60, delay=0,
+            slot=self._on_scene_mouse_moved,
+        )
 
         # N-axis manager for independent right-side Y-axes (S1)
         self._right_mgr = _RightAxisManager(self._primary_plot, self._glw)
@@ -325,12 +455,162 @@ class SessionCanvasWidget(QWidget):
         # Legend below the plot (Phase 9E)
         self.legend = ChannelLegendWidget(self.panel_id, parent=self)
 
-        layout.addWidget(self._glw, stretch=4)
+        # Plot row: GLW + optional Y scrollbar for digital panels
+        self._plot_row_widget = QWidget()
+        plot_row = QHBoxLayout(self._plot_row_widget)
+        plot_row.setContentsMargins(0, 0, 0, 0)
+        plot_row.setSpacing(0)
+        plot_row.addWidget(self._glw, stretch=1)
+
+        self._y_scrollbar = QScrollBar(Qt.Orientation.Vertical)
+        self._y_scrollbar.setVisible(False)
+        self._y_scrollbar.setStyleSheet(
+            "QScrollBar:vertical { background: #1E1E1E; width: 12px; }"
+            "QScrollBar::handle:vertical { background: #555; min-height: 20px; border-radius: 4px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+        plot_row.addWidget(self._y_scrollbar)
+
+        layout.addWidget(self._plot_row_widget, stretch=4)
         layout.addWidget(self.legend, stretch=0)
+
+        self._install_keyboard_shortcuts()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Keyboard shortcuts (zoom / pan)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _install_keyboard_shortcuts(self) -> None:
+        ctx = Qt.ShortcutContext.WidgetWithChildrenShortcut
+        for key, slot in (
+            (Qt.Key.Key_Home,  self._kb_fit),
+            (Qt.Key.Key_Left,  self._kb_pan_left),
+            (Qt.Key.Key_Right, self._kb_pan_right),
+            (Qt.Key.Key_Plus,  self._kb_zoom_in),
+            (Qt.Key.Key_Equal, self._kb_zoom_in),   # unshifted + on most keyboards
+            (Qt.Key.Key_Minus, self._kb_zoom_out),
+        ):
+            sc = QShortcut(QKeySequence(key), self, context=ctx)
+            sc.activated.connect(slot)
+
+    def _kb_fit(self) -> None:
+        self._primary_plot.getViewBox().autoRange()
+
+    def _kb_pan_left(self) -> None:
+        vb = self._primary_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        step = (x_max - x_min) * 0.1
+        vb.translateBy(x=-step)
+
+    def _kb_pan_right(self) -> None:
+        vb = self._primary_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        step = (x_max - x_min) * 0.1
+        vb.translateBy(x=step)
+
+    def _kb_zoom_in(self) -> None:
+        self._primary_plot.getViewBox().scaleBy((0.7, 1.0))
+
+    def _kb_zoom_out(self) -> None:
+        self._primary_plot.getViewBox().scaleBy((1.3, 1.0))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Panel header context menu
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _inject_cursor_menu_items(self) -> None:
+        """Prepend Measurement Cursor items to pyqtgraph's ViewBox context menu."""
+        vb_menu = self._primary_plot.getViewBox().menu
+
+        self._cursor_menu_act = QAction("Measurement Cursors", vb_menu)
+        self._cursor_menu_act.setCheckable(True)
+
+        self._cursor_sync_menu_act = QAction("Sync Cursors Across Panels", vb_menu)
+        self._cursor_sync_menu_act.setCheckable(True)
+
+        sep = QAction(vb_menu)
+        sep.setSeparator(True)
+
+        first = vb_menu.actions()[0] if vb_menu.actions() else None
+        if first:
+            vb_menu.insertAction(first, self._cursor_menu_act)
+            vb_menu.insertAction(first, self._cursor_sync_menu_act)
+            vb_menu.insertAction(first, sep)
+        else:
+            vb_menu.addAction(self._cursor_menu_act)
+            vb_menu.addAction(self._cursor_sync_menu_act)
+
+        self._cursor_menu_act.triggered.connect(
+            lambda checked: self.measurement_mode_toggle_requested.emit(checked)
+        )
+        self._cursor_sync_menu_act.triggered.connect(
+            lambda checked: self.cursor_sync_toggle_requested.emit(checked)
+        )
+
+        # Annotation + export actions
+        sep2 = QAction(vb_menu)
+        sep2.setSeparator(True)
+        self._annot_add_act = QAction("Add annotation here…", vb_menu)
+        self._annot_clear_act = QAction("Clear annotations", vb_menu)
+        self._export_act = QAction("Export view…", vb_menu)
+        for act in (sep2, self._annot_add_act, self._annot_clear_act, self._export_act):
+            vb_menu.addAction(act)
+        self._annot_add_act.triggered.connect(self._add_annotation_at_last_x)
+        self._annot_clear_act.triggered.connect(self.clear_annotations)
+        self._export_act.triggered.connect(self.export_view)
+
+        vb_menu.aboutToShow.connect(self._sync_cursor_menu_state)
+
+    def _sync_cursor_menu_state(self) -> None:
+        """Update checkmarks/enabled state before the ViewBox menu is displayed."""
+        self._cursor_menu_act.blockSignals(True)
+        self._cursor_menu_act.setChecked(self._measurement_mode)
+        self._cursor_menu_act.blockSignals(False)
+
+        self._cursor_sync_menu_act.blockSignals(True)
+        self._cursor_sync_menu_act.setChecked(self._cursor_sync)
+        self._cursor_sync_menu_act.setEnabled(self._measurement_mode)
+        self._cursor_sync_menu_act.blockSignals(False)
+
+        # Capture the current cursor x position in view coordinates
+        vb = self._primary_plot.getViewBox()
+        global_pos = QCursor.pos()
+        widget_pos = self._glw.mapFromGlobal(global_pos)
+        scene_pos = self._glw.mapToScene(widget_pos.x(), widget_pos.y())
+        view_pt = vb.mapSceneToView(scene_pos)
+        self._last_right_click_x = float(view_pt.x())
+
+        self._annot_clear_act.setEnabled(bool(self._annotations))
+
+    def _add_annotation_at_last_x(self) -> None:
+        t = self._last_right_click_x
+        default = f"t={t:.3f}s"
+        label, ok = QInputDialog.getText(self, "Add Annotation", "Label:", text=default)
+        if ok and label.strip():
+            self._add_annotation(t, label.strip())
+
+    def _add_annotation(self, x: float, label: str) -> None:
+        self._annot_counter += 1
+        ann_id = f"annot_{self._annot_counter}"
+        line = pg.InfiniteLine(
+            pos=x,
+            angle=90,
+            movable=True,
+            pen=pg.mkPen("#FFB347", width=1, style=Qt.PenStyle.DashLine),
+            label=label,
+            labelOpts={"position": 0.5, "color": "#FFB347", "fill": (0, 0, 0, 100)},
+        )
+        self._primary_plot.addItem(line)
+        self._annotations[ann_id] = line
+
+    def clear_annotations(self) -> None:
+        """Remove all annotation markers from this panel."""
+        for line in self._annotations.values():
+            try:
+                self._primary_plot.removeItem(line)
+            except Exception:  # noqa: BLE001
+                pass
+        self._annotations.clear()
 
     def set_mergeable_panels(self, panels: list[tuple[str, str]]) -> None:
         """Update the panel list shown in the "Merge with →" submenu."""
@@ -365,6 +645,14 @@ class SessionCanvasWidget(QWidget):
         else:
             no_act = merge_menu.addAction("(no other panels)")
             no_act.setEnabled(False)
+
+        exp_act = menu.addAction("Export view…")
+        exp_act.triggered.connect(self.export_view)
+
+        menu.addSeparator()
+        clr_ann = menu.addAction(f"Clear annotations ({len(self._annotations)})")
+        clr_ann.setEnabled(bool(self._annotations))
+        clr_ann.triggered.connect(self.clear_annotations)
 
         menu.addSeparator()
         split_src = menu.addAction("Split by source")
@@ -524,9 +812,85 @@ class SessionCanvasWidget(QWidget):
             meta.visible = visible
         self.legend.update_row_visible(source_id, channel_name, visible)
 
+    def update_digital_curve(
+        self,
+        source_id: str,
+        channel_name: str,
+        time: np.ndarray,
+        values: np.ndarray,
+        *,
+        color: str = "#AAAAAA",
+        y_offset: float = 0.0,
+        visible: bool = True,
+        display_name: str | None = None,
+        source_badge: str = "",
+        unit: str | None = None,
+    ) -> None:
+        """Render a binary digital channel as thick (HIGH) / thin (LOW) horizontal lines.
+
+        Unlike update_curve(), no fill is drawn and the signal stays at a fixed Y
+        position (y_offset) rather than scaling between 0 and 1.
+        """
+        from app.visualization.rendering.digital_transforms import (
+            build_hi_lo_segments,
+            extract_transitions,
+        )
+        key = (source_id, channel_name)
+        _empty = np.empty(0, dtype=np.float64)
+        vb = self._primary_plot.getViewBox()
+
+        if len(time) >= 2:
+            t_tr, d_tr = extract_transitions(np.asarray(time, dtype=np.float64),
+                                             np.asarray(values, dtype=np.float64))
+            t_hi, y_hi = build_hi_lo_segments(t_tr, d_tr, y_offset, 1)
+            t_lo, y_lo = build_hi_lo_segments(t_tr, d_tr, y_offset, 0)
+        else:
+            t_hi = y_hi = t_lo = y_lo = _empty
+
+        for curves_dict, t_seg, y_seg, width, alpha in (
+            (self._digital_hi_curves, t_hi, y_hi, 3,   "FF"),
+            (self._digital_lo_curves, t_lo, y_lo, 1,   "44"),
+        ):
+            pen = pg.mkPen(color if alpha == "FF" else color + alpha, width=width)
+            if key not in curves_dict:
+                curve = pg.PlotDataItem(pen=pen, connect="finite")
+                vb.addItem(curve)
+                curves_dict[key] = curve
+            else:
+                curves_dict[key].setPen(pen)
+            curves_dict[key].setData(
+                t_seg if len(t_seg) else _empty,
+                y_seg if len(y_seg) else _empty,
+            )
+            curves_dict[key].setVisible(visible)
+
+        eff_display = display_name if display_name is not None else channel_name
+        self.legend.upsert_row(
+            source_id, channel_name, eff_display, source_badge, unit, color, visible
+        )
+        self._digital_raw[key] = (
+            np.asarray(time, dtype=np.float64),
+            np.asarray(values, dtype=np.float64),
+            eff_display,
+            color,
+        )
+
+    def _remove_digital_curve(self, key: tuple[str, str]) -> None:
+        """Remove both hi and lo digital curves."""
+        self._digital_raw.pop(key, None)
+        vb = self._primary_plot.getViewBox()
+        for curves_dict in (self._digital_hi_curves, self._digital_lo_curves):
+            curve = curves_dict.pop(key, None)
+            if curve is not None:
+                try:
+                    vb.removeItem(curve)
+                except Exception:  # noqa: BLE001
+                    pass
+
     def remove_curve(self, source_id: str, channel_name: str) -> None:
         """Remove one curve and all its overlays; clean up the legend row."""
         key = (source_id, channel_name)
+        self._remove_digital_curve(key)
         meta = self._metadata.pop(key, None)
         curve = self._curves.pop(key, None)
         if curve is not None:
@@ -545,6 +909,8 @@ class SessionCanvasWidget(QWidget):
         self.legend.remove_row(source_id, channel_name)
 
     def remove_source(self, source_id: str) -> None:
+        for key in [k for k in self._digital_hi_curves if k[0] == source_id]:
+            self._remove_digital_curve(key)
         stale = [k for k in self._curves if k[0] == source_id]
         for key in stale:
             meta = self._metadata.pop(key, None)
@@ -986,6 +1352,154 @@ class SessionCanvasWidget(QWidget):
         """Update local sync flag so the right-click menu shows the correct checkmark."""
         self._cursor_sync = enabled
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Hover crosshair (synchronized across all session panels)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_scene_mouse_moved(self, args: tuple) -> None:
+        """Rate-limited slot: move hover crosshair and emit crosshair_moved."""
+        pos: QPointF = args[0]
+        vb = self._primary_plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(pos):
+            if self._hover_cursor is not None:
+                self._hover_cursor.setVisible(False)
+            return
+        mouse_pt = vb.mapSceneToView(pos)
+        t = float(mouse_pt.x())
+        if self._hover_cursor is not None:
+            self._hover_cursor.setValue(t)
+            self._hover_cursor.setVisible(True)
+        self.crosshair_moved.emit(t)
+        # Compute and emit interpolated channel values for the readout bar
+        self._emit_crosshair_values(t)
+
+    def _emit_crosshair_values(self, t: float) -> None:
+        """Interpolate visible channel values at t and emit crosshair_values_changed."""
+        values: list[tuple[str, str, str, float | None, str, str]] = []
+        time_ref: np.ndarray | None = None
+        for key, curve in self._curves.items():
+            if not curve.isVisible():
+                continue
+            meta = self._metadata.get(key)
+            if meta is None:
+                continue
+            xdata, ydata = curve.getData()
+            if xdata is None or len(xdata) < 2:
+                continue
+            if time_ref is None:
+                time_ref = xdata
+            try:
+                v = float(np.interp(t, xdata, ydata))
+            except Exception:  # noqa: BLE001
+                v = None
+            label = meta.display_name or meta.channel_name
+            values.append((key[0], key[1], label, v, meta.unit or "", meta.colour))
+
+        for key, (t_arr, v_arr, label, color) in self._digital_raw.items():
+            hi_curve = self._digital_hi_curves.get(key)
+            if hi_curve is None or not hi_curve.isVisible():
+                continue
+            if len(t_arr) == 0:
+                continue
+            idx = max(0, int(np.searchsorted(t_arr, t, side="right")) - 1)
+            state = int(round(v_arr[idx]))
+            values.append((key[0], key[1], label, "HIGH" if state == 1 else "LOW", "", color))
+
+        if values:
+            self.crosshair_values_changed.emit(t, values)
+
+    def set_crosshair_pos(self, t: float) -> None:
+        """Move the hover crosshair to t without emitting crosshair_moved."""
+        if self._hover_cursor is not None:
+            self._hover_cursor.setValue(t)
+            self._hover_cursor.setVisible(True)
+        self._emit_crosshair_values(t)
+
+    def hide_crosshair(self) -> None:
+        """Hide the hover crosshair (e.g. when mouse leaves the canvas area)."""
+        if self._hover_cursor is not None:
+            self._hover_cursor.setVisible(False)
+
+    def _on_collapse_toggled(self, collapsed: bool) -> None:
+        self._plot_row_widget.setVisible(not collapsed)
+        self.legend.setVisible(not collapsed)
+        if collapsed:
+            self.setMinimumHeight(self._header.height())
+            self.setMaximumHeight(self._header.height())
+        else:
+            self.setMinimumHeight(80)
+            self.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Digital panel Y scrollbar
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def setup_digital_scroll(self, n_rows: int) -> None:
+        """Show a vertical scrollbar for a digital panel with n_rows channel rows.
+
+        Safe to call on every refresh — only rewires if n_rows changed.
+        """
+        if n_rows == self._digital_n_rows and self._y_scrollbar.isVisible():
+            return  # already configured for this row count, don't reset
+        self._digital_n_rows = n_rows
+
+        vb = self._primary_plot.getViewBox()
+        y_min, y_max = vb.viewRange()[1]
+        visible_span = max(0.5, y_max - y_min)
+        scroll_max = max(0, int((n_rows - visible_span) * 10 + 0.5))
+
+        # Disconnect stale connections before rewiring
+        try:
+            self._y_scrollbar.valueChanged.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            vb.sigYRangeChanged.disconnect(self._on_digital_y_range_changed)
+        except (RuntimeError, TypeError):
+            pass
+
+        if scroll_max <= 0:
+            self._y_scrollbar.setVisible(False)
+            return
+
+        self._y_scrollbar.blockSignals(True)
+        self._y_scrollbar.setRange(0, scroll_max)
+        self._y_scrollbar.setSingleStep(5)
+        self._y_scrollbar.setPageStep(max(5, int(visible_span * 10)))
+        self._y_scrollbar.setValue(0)
+        self._y_scrollbar.blockSignals(False)
+        self._y_scrollbar.setVisible(True)
+
+        self._y_scrollbar.valueChanged.connect(self._on_digital_y_scroll)
+        vb.sigYRangeChanged.connect(self._on_digital_y_range_changed)
+
+    def _on_digital_y_scroll(self, value: int) -> None:
+        """Scrollbar moved → shift the Y viewport."""
+        if self._digital_n_rows <= 0:
+            return
+        vb = self._primary_plot.getViewBox()
+        y_min, y_max = vb.viewRange()[1]
+        span = max(0.5, y_max - y_min)
+        new_y_min = -0.5 + value / 10.0
+        vb.blockSignals(True)
+        vb.setRange(yRange=(new_y_min, new_y_min + span), padding=0)
+        vb.blockSignals(False)
+
+    def _on_digital_y_range_changed(self, vb: pg.ViewBox, y_range: tuple) -> None:
+        """Y viewport changed (panel resize/pan) → sync the scrollbar."""
+        if self._digital_n_rows <= 0:
+            return
+        y_min, y_max = y_range
+        span = max(0.5, y_max - y_min)
+        scroll_max = max(0, int((self._digital_n_rows - span) * 10 + 0.5))
+        scroll_val = max(0, int((y_min + 0.5) * 10 + 0.5))
+        self._y_scrollbar.blockSignals(True)
+        self._y_scrollbar.setRange(0, scroll_max)
+        self._y_scrollbar.setPageStep(max(5, int(span * 10)))
+        self._y_scrollbar.setValue(min(scroll_val, scroll_max))
+        self._y_scrollbar.setVisible(scroll_max > 0)
+        self._y_scrollbar.blockSignals(False)
+
     def _emit_measurement(self) -> None:
         if self._cursor_a is None or self._cursor_b is None:
             return
@@ -997,6 +1511,41 @@ class SessionCanvasWidget(QWidget):
     # ─────────────────────────────────────────────────────────────────────────
     # Panel metadata & housekeeping
     # ─────────────────────────────────────────────────────────────────────────
+
+    def export_view(self) -> None:
+        """Grab this panel and save as PNG or PDF via a file dialog."""
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export panel view",
+            f"{self._panel_title}.png",
+            "PNG image (*.png);;PDF document (*.pdf)",
+        )
+        if not path:
+            return
+        pixmap = self.grab()
+        if path.lower().endswith(".pdf"):
+            try:
+                from PyQt6.QtGui import QPainter, QPageLayout, QPageSize
+                from PyQt6.QtPrintSupport import QPrinter
+                printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+                printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+                printer.setOutputFileName(path)
+                printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+                printer.setPageOrientation(QPageLayout.Orientation.Landscape)
+                painter = QPainter(printer)
+                rect = painter.viewport()
+                scaled = pixmap.size().scaled(rect.size(), Qt.AspectRatioMode.KeepAspectRatio)
+                painter.setViewport(rect.x(), rect.y(), scaled.width(), scaled.height())
+                painter.setWindow(pixmap.rect())
+                painter.drawPixmap(0, 0, pixmap)
+                painter.end()
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, "Export failed", str(exc))
+                return
+        else:
+            if not pixmap.save(path, "PNG"):
+                QMessageBox.warning(self, "Export failed", f"Could not write {path}")
+                return
 
     def set_time_reference(self, reference_time: datetime) -> None:
         """Switch the X-axis to absolute wall-clock labels anchored at reference_time."""
@@ -1024,6 +1573,17 @@ class SessionCanvasWidget(QWidget):
         self._remove_cursor_b()
         self._remove_cursor_a()
         self._measurement_mode = False
+        # Digital curves
+        vb = self._primary_plot.getViewBox()
+        for curves_dict in (self._digital_hi_curves, self._digital_lo_curves):
+            for curve in curves_dict.values():
+                try:
+                    vb.removeItem(curve)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._digital_hi_curves.clear()
+        self._digital_lo_curves.clear()
+        self._digital_raw.clear()
         # RMS overlays first (they hold ViewBox refs via getViewBox)
         for rms_curve in self._rms_curves.values():
             try:
@@ -1080,6 +1640,7 @@ class SessionCanvasWidget(QWidget):
         self._metadata.clear()
         self._right_mgr.clear()
         self.legend.clear_rows()
+        self.clear_annotations()
 
     @property
     def curve_count(self) -> int:

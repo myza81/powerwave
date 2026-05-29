@@ -300,7 +300,12 @@ class SynchronizationManager:
 
     @staticmethod
     def _extract_cursor(canvas: Any) -> pg.InfiniteLine | None:
+        # FlexiblePlotCanvas / DigitalEventTimeline use _cursor (single crosshair)
         cursor = getattr(canvas, "_cursor", None)
+        if cursor is not None and hasattr(cursor, "sigPositionChanged"):
+            return cursor
+        # SessionCanvasWidget uses _hover_cursor for the synchronized crosshair
+        cursor = getattr(canvas, "_hover_cursor", None)
         if cursor is not None and hasattr(cursor, "sigPositionChanged"):
             return cursor
         return None

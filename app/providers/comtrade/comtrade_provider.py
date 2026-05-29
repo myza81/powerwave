@@ -557,22 +557,22 @@ def _parse_binary_dat(
     row_size = 8 + 2 * cfg.n_analog + 2 * n_dwords  # 4(n) + 4(ts) + 2*nA + 2*nDw
 
     try:
-        raw_bytes = dat_path.read_bytes()
+        file_size = dat_path.stat().st_size
     except OSError as exc:
         raise ProviderLoadError(f"Cannot read DAT file '{dat_path}'") from exc
 
-    if not raw_bytes:
+    if file_size == 0:
         raise ProviderLoadError(f"DAT file '{dat_path}' is empty")
 
-    if len(raw_bytes) % row_size != 0:
+    if file_size % row_size != 0:
         raise ProviderLoadError(
-            f"Binary DAT '{dat_path}' file size {len(raw_bytes)} bytes is not a "
+            f"Binary DAT '{dat_path}' file size {file_size} bytes is not a "
             f"multiple of row size {row_size} (nA={cfg.n_analog}, nDw={n_dwords})"
         )
 
-    n_samples = len(raw_bytes) // row_size
+    n_samples = file_size // row_size
 
-    # Build structured dtype for vectorized frombuffer parsing
+    # Build structured dtype for vectorized parsing
     dtype_fields: list = [("n", "<u4"), ("ts", "<u4")]
     if cfg.n_analog > 0:
         dtype_fields.append(("ana", "<i2", (cfg.n_analog,)))
@@ -580,7 +580,10 @@ def _parse_binary_dat(
         dtype_fields.append(("dw", "<u2", (n_dwords,)))
     dt = np.dtype(dtype_fields)
 
-    rows = np.frombuffer(raw_bytes, dtype=dt, count=n_samples)
+    try:
+        rows = np.fromfile(dat_path, dtype=dt, count=n_samples)
+    except OSError as exc:
+        raise ProviderLoadError(f"Cannot read DAT file '{dat_path}'") from exc
 
     time_array = (rows["ts"].astype(np.float64) * cfg.timemult) / _MICROSECONDS_PER_SECOND
 
@@ -826,6 +829,12 @@ class ComtradeProvider(BaseProvider):
             raise ProviderLoadError(
                 f"Unexpected error parsing CFG '{path}': {exc}"
             ) from exc
+
+        if cfg.dat_format == "BINARY32":
+            raise ProviderLoadError(
+                "BINARY32 (COMTRADE 2013 float32) is not supported by this provider. "
+                f"Convert '{cfg.dat_file}' to ASCII or BINARY format before loading."
+            )
 
         try:
             return _build_record(cfg)

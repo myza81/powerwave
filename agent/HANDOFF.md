@@ -4348,3 +4348,67 @@ Use the new acceptance/dev workflow as the standard gate for Import Wizard
 maintenance. Next phase can move toward Phase 9 planning or CI wiring around
 these documented slices; avoid new Import Wizard features until the operational
 acceptance workflow is reviewed interactively.
+
+---
+
+## 2026-05-29 - Read-Only Full Codebase Audit
+
+### Agent
+Codex
+
+### Task
+Perform a read-only senior architecture, PyQt6/PyQtGraph, data workflow,
+visualization, performance, cleanup, and test coverage audit. Do not modify
+application source code.
+
+### Completed
+- Created `docs/CODEBASE_AUDIT_REPORT.md`.
+- Reviewed the documented target architecture, provider pattern, data contract,
+  visualization contract, import workflow, and performance requirements.
+- Audited canonical `app/` model/provider/import/session/visualization paths.
+- Compared active `app/` architecture with legacy `src/` modules and packaging.
+- Reviewed CSV/Excel Import Wizard flow against the requested preview, timestamp,
+  repair, label, normalize, save, and waveform sequence.
+- Reviewed COMTRADE, CSV, and Excel provider behavior and direct-load paths.
+- Reviewed grouped waveform routing, X-axis synchronization, cursor behavior,
+  digital event handling, and multi-source alignment.
+- Identified dead-code candidates, duplicate helpers, performance risks, and
+  missing validation gates.
+
+### Files Modified
+- docs/CODEBASE_AUDIT_REPORT.md
+- agent/HANDOFF.md
+- agent/TASK.md
+- agent/REPOSITORY_STATE.md
+
+### Source Code Changes
+None. This was a documentation-only audit.
+
+### Validation
+- `pytest -q` could not run because `pytest` was not on PATH.
+- `.venv\Scripts\python.exe -m pytest -q` failed during collection due to
+  `tests/unit/test_runtime_qt_widgets.py:446` syntax error.
+- `.venv\Scripts\python.exe -m pytest --collect-only -q --ignore=tests/unit/test_runtime_qt_widgets.py`
+  collected 4029 tests.
+- `.venv\Scripts\python.exe -m pytest -q --ignore=tests/unit/test_runtime_qt_widgets.py`
+  timed out after roughly 180 seconds before final pass/fail/skip counts.
+
+### Highest Risks Found
+- Full test suite cannot collect until `tests/unit/test_runtime_qt_widgets.py`
+  is repaired.
+- Packaging points at `src`, while the documented/current architecture is under
+  `app`.
+- Two `DisturbanceRecord` models exist (`app/models` and `src/models`).
+- CSV/Excel direct provider paths can bypass the Import Wizard normalization
+  workflow.
+- COMTRADE binary loading reads entire DAT files into memory and BINARY32 is
+  accepted then rejected late.
+- Visualization orchestration is split between `VisualizationManager` and the
+  session-canvas controller path.
+- Tests still reference signal-browser behavior while the widget appears deleted
+  in the current worktree.
+
+### Next Recommended Step
+Start with validation recovery: fix the runtime test syntax error, reconcile the
+deleted signal-browser/widget tests with the current UI, then run the full suite
+to establish an authoritative baseline before remediation work begins.

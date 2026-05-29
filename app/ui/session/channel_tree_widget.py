@@ -43,11 +43,12 @@ class ChannelTreeWidget(QTreeWidget):
         self._colour_swatches: dict[str, _ColourSwatch] = {}
         self._updating = False
 
-        self.setColumnCount(3)
-        self.setHeaderLabels(["Channel", "", "Panel"])
-        self.setColumnWidth(0, 160)
+        self.setColumnCount(4)
+        self.setHeaderLabels(["Channel", "", "Panel", "Readout"])
+        self.setColumnWidth(0, 130)
         self.setColumnWidth(1, 24)
-        self.setColumnWidth(2, 110)
+        self.setColumnWidth(2, 100)
+        self.setColumnWidth(3, 85)
         self.setIndentation(14)
         self.setAlternatingRowColors(True)
         self.setRootIsDecorated(True)
@@ -121,6 +122,17 @@ class ChannelTreeWidget(QTreeWidget):
             )
         finally:
             self._updating = False
+
+    def set_channel_readout(self, channel_name: str, value_str: str) -> None:
+        """Update the live readout value shown in column 3 for one channel."""
+        item = self._channel_items.get(channel_name)
+        if item is not None:
+            item.setText(3, value_str)
+
+    def clear_readouts(self) -> None:
+        """Clear all readout values (e.g. when the crosshair leaves the plot)."""
+        for item in self._channel_items.values():
+            item.setText(3, "")
 
     def update_panel_choices(self, panels: list[PanelConfig]) -> None:
         """Refresh panel options in all combos without rebuilding items."""
