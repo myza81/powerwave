@@ -28,8 +28,12 @@ _EXCEL_EPOCH = pd.Timestamp("1899-12-30")
 _EPOCH_SECONDS_LABEL = "epoch_seconds"
 _EPOCH_MS_LABEL = "epoch_milliseconds"
 _EXCEL_SERIAL_LABEL = "excel_serial"
+_ELAPSED_SECONDS_LABEL = "elapsed_seconds"
+_ELAPSED_MS_LABEL = "elapsed_milliseconds"
+_ELAPSED_MINUTES_LABEL = "elapsed_minutes"
 
 _EMPTY_DATETIME = pd.Series([], dtype="datetime64[ns]")
+_ELAPSED_ORIGIN = pd.Timestamp("2000-01-01")
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +77,22 @@ def _coerce_special(series: pd.Series, fmt: str) -> pd.Series:
         result = result.copy()
         result[valid_mask] = converted.values
     return result
+
+
+def _elapsed_unit_multiplier(unit: str | None) -> float:
+    """Return multiplier from elapsed source unit to seconds."""
+    normalized = (unit or _ELAPSED_SECONDS_LABEL).lower().strip()
+    if normalized in {_ELAPSED_MS_LABEL, "milliseconds", "millisecond", "msec", "ms"}:
+        return 0.001
+    if normalized in {_ELAPSED_MINUTES_LABEL, "minutes", "minute", "min", "mins"}:
+        return 60.0
+    return 1.0
+
+
+def coerce_elapsed_seconds(series: pd.Series, unit: str | None) -> pd.Series:
+    """Convert a relative elapsed-time Series to float seconds."""
+    numeric: pd.Series = pd.to_numeric(series, errors="coerce")  # type: ignore[assignment]
+    return numeric.astype("float64") * _elapsed_unit_multiplier(unit)
 
 
 def _build_diagnostics(
@@ -545,6 +565,85 @@ def execute_timezone_alignment(
     return normalized, diag, msgs
 
 
+def execute_parse_elapsed_time(
+    raw_series: pd.Series,
+    plan: TimestampRepairPlan,
+    aux_series: dict[str, pd.Series] | None = None,
+) -> tuple[pd.Series, RepairDiagnostics, list[ValidationMessage]]:
+    """Convert relative elapsed-time values to a compatibility datetime Series."""
+    msgs: list[ValidationMessage] = []
+    unit = plan.elapsed_time_unit or plan.detected_format or _ELAPSED_SECONDS_LABEL
+    seconds = coerce_elapsed_seconds(raw_series, unit)
+    normalized = _ELAPSED_ORIGIN + pd.to_timedelta(seconds, unit="s")
+    normalized = pd.Series(normalized, index=raw_series.index, dtype="datetime64[ns]")
+
+    repaired = int(normalized.notna().sum())
+    if normalized.isna().all():
+        msgs.append(ValidationMessage(
+            severity=ValidationSeverity.ERROR,
+            code="TS_ELAPSED_PARSE_FAILED",
+            message="Elapsed time conversion produced no valid time values.",
+        ))
+    else:
+        msgs.append(ValidationMessage(
+            severity=ValidationSeverity.INFO,
+            code="TS_ELAPSED_CONVERTED",
+            message=f"Relative elapsed time converted from {unit} to seconds.",
+        ))
+
+    diag = _build_diagnostics(plan.strategy, raw_series, normalized, repaired_rows=repaired)
+    msgs += _messages_from_diagnostics(diag)
+    return normalized, diag, msgs
+
+
+def execute_generate_synthetic_elapsed(
+    raw_series: pd.Series,
+    plan: TimestampRepairPlan,
+    aux_series: dict[str, pd.Series] | None = None,
+) -> tuple[pd.Series, RepairDiagnostics, list[ValidationMessage]]:
+    """Generate elapsed timestamps from row order and sample interval/rate."""
+    interval = plan.sampling_interval_seconds
+    if interval is None and plan.sample_rate_hz and plan.sample_rate_hz > 0:
+        interval = 1.0 / plan.sample_rate_hz
+    if interval is None or interval <= 0:
+        interval = 1.0
+
+    seconds = pd.Series(range(len(raw_series)), index=raw_series.index, dtype="float64") * float(interval)
+    normalized = _ELAPSED_ORIGIN + pd.to_timedelta(seconds, unit="s")
+    normalized = pd.Series(normalized, index=raw_series.index, dtype="datetime64[ns]")
+    diag = _build_diagnostics(plan.strategy, raw_series, normalized, repaired_rows=len(normalized))
+    msgs = [
+        ValidationMessage(
+            severity=ValidationSeverity.INFO,
+            code="TS_SYNTHETIC_ELAPSED_GENERATED",
+            message=f"Synthetic elapsed time generated using {interval:g} s sample interval.",
+        )
+    ]
+    msgs += _messages_from_diagnostics(diag)
+    return normalized, diag, msgs
+
+
+def execute_generate_sample_index(
+    raw_series: pd.Series,
+    plan: TimestampRepairPlan,
+    aux_series: dict[str, pd.Series] | None = None,
+) -> tuple[pd.Series, RepairDiagnostics, list[ValidationMessage]]:
+    """Generate compatibility timestamps from row order for sample-index axes."""
+    sample_index = pd.Series(range(len(raw_series)), index=raw_series.index, dtype="float64")
+    normalized = _ELAPSED_ORIGIN + pd.to_timedelta(sample_index, unit="s")
+    normalized = pd.Series(normalized, index=raw_series.index, dtype="datetime64[ns]")
+    diag = _build_diagnostics(plan.strategy, raw_series, normalized, repaired_rows=len(normalized))
+    msgs = [
+        ValidationMessage(
+            severity=ValidationSeverity.INFO,
+            code="TS_SAMPLE_INDEX_GENERATED",
+            message="Sample index axis generated from row order.",
+        )
+    ]
+    msgs += _messages_from_diagnostics(diag)
+    return normalized, diag, msgs
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -559,6 +658,9 @@ _EXECUTORS = {
     TimestampRepairStrategy.EXCEL_SERIAL_CONVERSION:   execute_excel_serial_conversion,
     TimestampRepairStrategy.TIMEZONE_ALIGNMENT:        execute_timezone_alignment,
     TimestampRepairStrategy.RECONSTRUCT_HYBRID:        execute_reconstruct_hybrid,
+    TimestampRepairStrategy.PARSE_ELAPSED_TIME:        execute_parse_elapsed_time,
+    TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED: execute_generate_synthetic_elapsed,
+    TimestampRepairStrategy.GENERATE_SAMPLE_INDEX:      execute_generate_sample_index,
 }
 
 

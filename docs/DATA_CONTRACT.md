@@ -101,13 +101,117 @@ synchronized timestamps
 scalable slicing
 efficient viewport extraction
 RECOMMENDED STRUCTURE
-timestamp | VA | VB | VC | IA | IB | IC | FREQ
+time | VA | VB | VC | IA | IB | IC | FREQ
 
 Each column represents a normalized signal channel.
 
-TIMESTAMP REQUIREMENTS
+TIME AXIS REQUIREMENTS
 
-Timestamps SHALL:
+The waveform_data time column SHALL represent the X-axis used for waveform
+display and analytics.
+
+Required internal representation:
+
+time
+
+Type:
+
+float64
+
+Meaning:
+
+seconds elapsed along the record's time axis for time-based modes, or sample
+number for sample-index mode.
+
+This column is authoritative for rendering. Visualization code SHALL use this
+normalized X-axis column and SHALL NOT require one absolute datetime value per
+sample.
+
+SOURCE TIME SEMANTICS
+
+Providers and import pipelines SHALL support five time-axis modes:
+
+1. Auto-detected time axis
+
+The import workflow MAY auto-select one of the supported concrete timing modes
+when the source column names, values, and sampling pattern make the intent clear.
+Auto-detection SHALL be conservative; ambiguous numeric columns SHALL NOT be
+silently treated as elapsed time.
+
+2. Absolute timestamp-based recordings
+
+Examples:
+
+2026-03-06 18:04:09.318
+2026-03-06 18:04:09.328
+COMTRADE start/trigger timestamps
+
+For absolute sources:
+
+start_time is the real first-sample timestamp.
+trigger_time is the real trigger timestamp when available.
+waveform_data["time"] is seconds elapsed from start_time.
+
+3. Relative elapsed-time recordings
+
+Examples:
+
+-0.002
+0.008
+0.018
+0.028
+
+For relative elapsed sources:
+
+the source duration values are the real engineering time axis.
+waveform_data["time"] SHALL preserve those elapsed values after unit conversion
+to seconds.
+start_time MAY use a synthetic compatibility origin.
+trigger_time MAY equal start_time unless a trigger offset is known.
+absolute calendar meaning SHALL NOT be inferred from the synthetic origin.
+
+Elapsed source units MAY include:
+
+seconds
+milliseconds
+minutes
+
+Detection of elapsed-time columns SHALL be conservative. Numeric columns SHALL
+only be auto-selected as elapsed time when column naming and monotonicity make
+the intent clear enough for engineering use.
+
+4. Synthetic elapsed time from sampling interval
+
+This mode is for sources that have no usable timestamp/duration column but have
+a known sample rate or sample interval.
+
+For synthetic elapsed-time sources:
+
+the operator SHALL provide either sample rate or sample interval.
+waveform_data["time"] SHALL be generated as elapsed seconds from row order.
+the generated axis SHALL be labelled as synthetic elapsed time in diagnostics.
+start_time MAY use a synthetic compatibility origin.
+absolute calendar meaning SHALL NOT be inferred.
+
+5. Sample-index axis
+
+This mode is for plotting ordered data series without timing metadata.
+
+For sample-index sources:
+
+no timestamp column is required.
+no sample rate or interval is required.
+waveform_data["time"] MAY carry sample indices for renderer compatibility.
+TimingInformation.timing_reference SHALL be "sample_index" or equivalent
+metadata SHALL identify the axis as non-time.
+time_axis_unit SHALL be "sample" or "index".
+visualization SHALL label the X-axis as Sample Index, not Time (s).
+sample index values SHALL NOT be used for duration, frequency, event timing, or
+cross-record synchronization calculations.
+
+ABSOLUTE TIMESTAMP REQUIREMENTS
+
+Absolute timestamps SHALL:
 
 remain precise
 support high-resolution alignment
@@ -139,6 +243,18 @@ class AnalogChannel:
     unit: str
     scale: float
     offset: float
+
+Analog channel metadata is authoritative for visualization axis grouping.
+Display features such as panel merge SHALL preserve AnalogChannel.unit and any
+available signal role/type metadata. Merged displays SHALL NOT discard units or
+replace them with a mixed arbitrary unit in order to force unrelated channels
+onto one Y-axis.
+
+When multiple waveform panels are merged into one canvas, the DisturbanceRecord
+contract still requires each analog channel to keep its own name, unit, scale,
+offset, and role metadata. Visualization may derive axis groups from these
+fields, but it SHALL NOT mutate the source record to make incompatible channels
+appear compatible.
 DIGITAL CHANNEL
 
 Digital channels represent:
@@ -195,6 +311,7 @@ Timing information SHALL support:
 trigger alignment
 event timing
 synchronized analysis
+absolute and relative elapsed source semantics
 
 Example:
 
@@ -203,6 +320,28 @@ class TimingInformation:
     start_time: datetime
     trigger_time: datetime
     time_multiplier: float
+
+TimingInformation SHALL distinguish the meaning of start_time and the X-axis:
+
+absolute
+    start_time and trigger_time represent real recording timestamps.
+
+relative_elapsed
+    waveform_data["time"] is the authoritative time axis. start_time is only a
+    synthetic compatibility anchor unless documented otherwise.
+
+synthetic_elapsed
+    waveform_data["time"] is generated from row order and an operator-supplied
+    sample rate or interval. start_time is synthetic unless documented
+    otherwise.
+
+sample_index
+    waveform_data["time"] represents ordered sample indices for display only.
+    start_time and trigger_time SHALL NOT be interpreted as real event timing.
+
+Implementations SHALL preserve the source timing mode and original elapsed-time
+unit when known, either directly on TimingInformation or through recording
+metadata until the TimingInformation schema is extended.
 DISTURBANCE INFORMATION
 
 Disturbance context SHALL support:
@@ -243,9 +382,21 @@ kV
 A
 MW
 Hz
-Timestamp Format
+Time Axis Format
 
-All timestamps SHALL use unified internal formatting.
+Absolute, relative elapsed, and synthetic elapsed axes SHALL use unified
+seconds-based representation:
+
+waveform_data["time"] as float64 seconds.
+
+Absolute source timestamps SHALL be normalized into start_time/trigger_time plus
+relative seconds. Relative elapsed source values SHALL be preserved as relative
+seconds and SHALL NOT be displayed as synthetic calendar timestamps.
+
+Sample-index axes SHALL be explicitly marked as non-time. Implementations MAY
+store sample indices in waveform_data["time"] for renderer compatibility, but
+the axis unit SHALL be "sample" or "index", and visualization SHALL NOT label or
+treat the values as seconds.
 
 PROVIDER RESPONSIBILITIES
 
@@ -335,6 +486,11 @@ Analytics systems SHALL remain provider-independent.
 RULE 4 — VISUALIZATION ISOLATION
 
 Visualization systems SHALL remain parser-independent.
+
+Visualization systems SHALL also remain unit-safe. Canvas merge, overlay, and
+panel layout features must use the normalized channel metadata in
+DisturbanceRecord and SHALL NOT collapse channels with different engineering
+units or signal roles onto one shared Y-axis.
 
 RULE 5 — PERFORMANCE FIRST
 

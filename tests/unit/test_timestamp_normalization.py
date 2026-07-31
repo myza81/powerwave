@@ -67,6 +67,33 @@ class TestTimestampNormalizationResult:
         assert result.diagnostics is not None
         assert result.diagnostics.total_rows == 5
 
+    def test_synthetic_elapsed_result_carries_seconds_axis(self):
+        series = pd.Series([0, 0, 0])
+        plan = _plan(
+            TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED,
+            sampling_interval_seconds=0.02,
+        )
+
+        result = normalize_timestamps(series, plan)
+
+        assert result.success
+        assert result.time_axis_mode == "synthetic_elapsed"
+        assert result.time_axis_unit == "s"
+        assert result.elapsed_seconds is not None
+        assert result.elapsed_seconds.tolist() == pytest.approx([0.0, 0.02, 0.04])
+
+    def test_sample_index_result_carries_sample_axis(self):
+        series = pd.Series([0, 0, 0])
+        plan = _plan(TimestampRepairStrategy.GENERATE_SAMPLE_INDEX)
+
+        result = normalize_timestamps(series, plan)
+
+        assert result.success
+        assert result.time_axis_mode == "sample_index"
+        assert result.time_axis_unit == "sample"
+        assert result.elapsed_seconds is not None
+        assert result.elapsed_seconds.tolist() == pytest.approx([0.0, 1.0, 2.0])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ISO timestamp normalization

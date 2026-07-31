@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import replace
 
 import numpy as np
 import pyqtgraph as pg
+from PyQt6 import sip
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtWidgets import QMenu, QWidget
 
 from app.analytics.harmonics.harmonic_models import HarmonicConfig, HarmonicDisplayMode
 from app.analytics.phasors.phasor_models import PhasorConfig, PhasorDisplayMode
@@ -30,6 +31,7 @@ from app.visualization.axis_management import (
     GROUPED_MAX_RIGHT_AXIS_WIDTH_PX,
     GROUPED_RIGHT_AXIS_WIDTH_PX,
     axis_group_for_signal,
+    normalize_signal_type_hint,
 )
 from app.visualization.managers.multi_axis_manager import MultiAxisManager
 from app.visualization.overlays.overlay_colors import (
@@ -41,11 +43,26 @@ from app.visualization.overlays.overlay_colors import (
 from app.visualization.performance import timed_section
 from app.visualization.rendering.downsampling import decimate_for_display
 from app.visualization.signal_visibility import default_visible_analog_names
+from app.visualization.widgets.plot_style import (
+    CROSSHAIR_LINE,
+    PLOT_BACKGROUND,
+    apply_plot_style,
+    get_plot_theme,
+    make_crosshair_label,
+    position_crosshair_label,
+    set_axis_label,
+    set_panel_title,
+)
 
 # Canonical phase-detection color heuristic (VIEWPORT_RENDERING_POLICY §9 + §16)
 _AXIS_COLORS = ["#FF4444", "#FFCC00", "#4488FF", "#44BB44", "#AAAAAA", "#FF8800"]
 _SPARSE_RATE_THRESHOLD_HZ = 2.0
 _SPARSE_INTERVAL_THRESHOLD_S = 2.0
+_LINE_STYLE_MAP = {
+    "solid": Qt.PenStyle.SolidLine,
+    "dashed": Qt.PenStyle.DashLine,
+    "dotted": Qt.PenStyle.DotLine,
+}
 
 
 def _phasor_mag_pen_color(hex_color: str) -> str:
@@ -198,6 +215,9 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
     measurement_cursors_moved = pyqtSignal(float, float)  # t_a, t_b
     # Emitted every cursor move: (t_seconds, [(name, value_or_None, unit, color), …])
     cursor_values_changed = pyqtSignal(float, list)
+    merge_with_requested = pyqtSignal(str, str)
+    merge_all_requested = pyqtSignal(str)
+    restore_groups_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -206,7 +226,8 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         axis_display_mode: AxisDisplayMode | str = AxisDisplayMode.SHARED,
     ) -> None:
         super().__init__(parent=parent)
-        self.setBackground("#1E1E1E")
+        self._canvas_theme = "dark"
+        self.setBackground(get_plot_theme(self._canvas_theme).background)
 
         self._max_pts = max_display_points
 
@@ -226,6 +247,15 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._trigger_line: pg.InfiniteLine | None = None
         self._event_markers: list[pg.InfiniteLine] = []   # Phase 2 detection markers
         self._reserved_right_axes: list[pg.AxisItem] = []
+        self._crosshair_v: pg.InfiniteLine | None = None
+        self._crosshair_h: pg.InfiniteLine | None = None
+        self._crosshair_label: pg.TextItem | None = None
+        self._crosshair_proxy: pg.SignalProxy | None = None
+        self._crosshair_snap_enabled: bool = False
+        self._info_box_visible: bool = False
+        self._curve_styles: dict[str, dict[str, object]] = {}
+        self._panel_key: str = ""
+        self._mergeable_panels: list[tuple[str, str]] = []
 
         # Engineering scaling state (Phase 5B)
         self._scaling_mode: EngineeringScalingMode = EngineeringScalingMode.RAW
@@ -273,8 +303,8 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._primary_plot: pg.PlotItem = self.addPlot(
             row=0, col=0, axisItems={"bottom": self._datetime_axis}
         )
-        self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
-        self._primary_plot.setLabel("bottom", "Time")
+        apply_plot_style(self._primary_plot, theme=self._canvas_theme)
+        set_axis_label(self._primary_plot, "bottom", "Time", theme=self._canvas_theme)
 
         self._axis_manager = MultiAxisManager(self._primary_plot, self)
 
@@ -287,6 +317,9 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._primary_plot.getViewBox().sigResized.connect(
             self._on_plot_resized
         )
+        self._install_mouse_crosshair()
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_panel_context_menu)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -369,6 +402,51 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._panel_base_title = title.strip()
         self._refresh_panel_title()
 
+    def set_panel_context(
+        self,
+        panel_key: str,
+        mergeable_panels: list[tuple[str, str]] | None = None,
+    ) -> None:
+        """Provide grouped-layout context-menu metadata for merge actions."""
+        self._panel_key = panel_key
+        self._mergeable_panels = list(mergeable_panels or [])
+
+    def _show_panel_context_menu(self, pos) -> None:
+        if not self._panel_key:
+            return
+        menu = QMenu(self)
+
+        merge_menu = menu.addMenu("Merge with")
+        if self._mergeable_panels:
+            for target_key, target_title in self._mergeable_panels:
+                action = merge_menu.addAction(target_title)
+                action.triggered.connect(
+                    lambda checked=False, _target=target_key: QTimer.singleShot(
+                        0,
+                        lambda _target=_target: self.merge_with_requested.emit(
+                            self._panel_key, _target
+                        ),
+                    )
+                )
+        else:
+            empty = merge_menu.addAction("(no other compatible panel)")
+            empty.setEnabled(False)
+
+        merge_all = menu.addAction("Merge all visible panels")
+        merge_all.triggered.connect(
+            lambda: QTimer.singleShot(
+                0, lambda: self.merge_all_requested.emit(self._panel_key)
+            )
+        )
+
+        menu.addSeparator()
+        restore = menu.addAction("Restore signal groups")
+        restore.triggered.connect(
+            lambda: QTimer.singleShot(0, self.restore_groups_requested.emit)
+        )
+
+        menu.exec(self.mapToGlobal(pos))
+
     def set_performance_timing(self, enabled: bool, sink=None) -> None:
         """Enable optional visualization timing callbacks for overlay hot paths."""
         self._performance_timing_enabled = bool(enabled)
@@ -385,21 +463,100 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         if axis_reference_time is not None:
             self._axis_reference_time = axis_reference_time
         self._time_axis_mode = display_mode
-        self._apply_datetime_axis_mode(
-            self._axis_reference_time if display_mode == TimeDisplayMode.ABSOLUTE else None
-        )
+        self._apply_time_axis_mode()
 
-    def _apply_datetime_axis_mode(self, start_time: datetime | None) -> None:
-        """Call set_start_time on the live bottom-axis object from the PlotItem.
+    def set_crosshair_snap_enabled(self, enabled: bool) -> None:
+        """Choose whether the mouse crosshair follows the mouse or nearest waveform."""
+        self._crosshair_snap_enabled = bool(enabled)
+
+    def set_info_box_visible(self, visible: bool) -> None:
+        """Show or hide the floating waveform information box."""
+        self._info_box_visible = bool(visible)
+        if self._crosshair_items_alive():
+            self._crosshair_label.setVisible(
+                self._info_box_visible and self._crosshair_v.isVisible()
+            )
+        else:
+            self._reset_crosshair_items()
+
+    def set_canvas_theme(self, theme: str) -> None:
+        """Switch between dark and light waveform canvas themes."""
+        self._canvas_theme = "light" if str(theme).lower() == "light" else "dark"
+        t = get_plot_theme(self._canvas_theme)
+        self.setBackground(t.background)
+        self._primary_plot.getViewBox().setBackgroundColor(t.background)
+        apply_plot_style(self._primary_plot, theme=self._canvas_theme)
+        self._apply_time_axis_mode()
+        self._refresh_panel_title()
+        self._reset_crosshair_items()
+        self._install_mouse_crosshair()
+
+    def set_waveform_style(
+        self,
+        channel_name: str,
+        *,
+        color: str | None = None,
+        line_width: float | None = None,
+        line_style: str | None = None,
+    ) -> None:
+        """Update one visible waveform's line color, width, and line style."""
+        style = self._curve_styles.setdefault(channel_name, {})
+        if color:
+            style["color"] = color
+        if line_width is not None:
+            style["line_width"] = float(line_width)
+        if line_style:
+            style["line_style"] = line_style
+        entry = self._axis_manager._axes.get(channel_name)
+        if entry is not None:
+            entry.curve.setPen(self._pen_for_channel(channel_name, entry.color))
+            entry.color = str(style.get("color", entry.color))
+
+    def waveform_style(self, channel_name: str) -> dict[str, object]:
+        entry = self._axis_manager._axes.get(channel_name)
+        style = self._curve_styles.get(channel_name, {})
+        return {
+            "color": style.get("color", entry.color if entry else "#AAAAAA"),
+            "line_width": float(style.get("line_width", 1.0)),
+            "line_style": str(style.get("line_style", "solid")),
+        }
+
+    def editable_waveform_channels(self) -> list[str]:
+        return self._axis_manager.parameter_names()
+
+    def _apply_time_axis_mode(self) -> None:
+        """Apply the current x-axis label and tick renderer to the live axis.
 
         Retrieving the axis through getAxis() each time avoids using a stale
         Python wrapper whose underlying C++ QGraphicsItem may have been deleted
         by PyQt6's ownership transfer during PlotItem.clear() calls.
         """
+        axis_label = (
+            "Sample Index"
+            if self._time_axis_mode == TimeDisplayMode.SAMPLE_INDEX
+            else "Time"
+        )
+        set_axis_label(self._primary_plot, "bottom", axis_label, theme=self._canvas_theme)
         bottom = self._primary_plot.getAxis("bottom")
         if isinstance(bottom, DatetimeAxisItem):
             self._datetime_axis = bottom  # keep our reference in sync
-            bottom.set_start_time(start_time)
+            bottom.set_display_mode(
+                self._time_axis_mode,
+                start_time=(
+                    self._axis_reference_time
+                    if self._time_axis_mode == TimeDisplayMode.ABSOLUTE
+                    else None
+                ),
+            )
+
+    def _apply_datetime_axis_mode(self, start_time: datetime | None) -> None:
+        """Compatibility wrapper for older callers/tests."""
+        self._time_axis_mode = (
+            TimeDisplayMode.ABSOLUTE if start_time is not None else TimeDisplayMode.RELATIVE
+        )
+        if start_time is not None:
+            self._axis_reference_time = start_time
+        self._apply_time_axis_mode()
 
     def set_axis_display_mode(self, mode: AxisDisplayMode | str) -> None:
         """Switch between shared and dedicated Y-axis grouping."""
@@ -688,9 +845,10 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._primary_plot.clear()
 
         # Restore primary plot appearance (clear() strips labels and grid)
-        self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
-        self._primary_plot.setLabel("bottom", "Time")
-        self._apply_datetime_axis_mode(None)
+        apply_plot_style(self._primary_plot, theme=self._canvas_theme)
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
+        self._axis_reference_time = None
+        self._apply_time_axis_mode()
         self._refresh_panel_title()
 
         # Fresh axis manager — its __init__ connects _sync_geometries FIRST
@@ -705,14 +863,16 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._scaled_data_cache.clear()
         self._effective_units.clear()
         self._sparse_mode = False
-        self._time_axis_mode = TimeDisplayMode.RELATIVE
-        self._axis_reference_time = None
         self._visible_channel_names.clear()
         self._cursor = None
         self._cursor_b = None  # removed by PlotItem.clear() above
         self._trigger_line = None
         self._event_markers.clear()  # items removed by PlotItem.clear() above
         self._curve_data_signatures.clear()
+        self._crosshair_v = None
+        self._crosshair_h = None
+        self._crosshair_label = None
+        self._install_mouse_crosshair()
 
         # RMS overlay — curves removed by PlotItem.clear() / scene removeItem;
         # only Python-side dicts need explicit reset here.
@@ -740,13 +900,22 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
     # Private helpers
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _make_curve(self, color: str) -> pg.PlotDataItem:
+    def _pen_for_channel(self, channel_name: str, default_color: str):
+        style = self.waveform_style(channel_name)
+        color = str(style.get("color") or default_color)
+        width = float(style.get("line_width") or 1.0)
+        line_style = _LINE_STYLE_MAP.get(str(style.get("line_style")), Qt.PenStyle.SolidLine)
+        return pg.mkPen(color, width=width, style=line_style)
+
+    def _make_curve(self, channel_name: str, color: str) -> pg.PlotDataItem:
+        pen = self._pen_for_channel(channel_name, color)
+        effective_color = pen.color().name()
         if self._sparse_mode:
             curve = pg.PlotDataItem(
-                pen=pg.mkPen(color, width=1.5),
+                pen=pen,
                 symbol="o",
                 symbolSize=7,
-                symbolBrush=pg.mkBrush(color),
+                symbolBrush=pg.mkBrush(effective_color),
                 symbolPen=pg.mkPen("#F0F0F0", width=0.75),
                 skipFiniteCheck=True,
             )
@@ -754,7 +923,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             return curve
 
         curve = pg.PlotDataItem(
-            pen=pg.mkPen(color, width=1),
+            pen=pen,
             skipFiniteCheck=True,
         )
         curve.setClipToView(True)
@@ -762,13 +931,16 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
 
     def _add_channel_axis(self, ch: AnalogChannel) -> None:
         """Create a visible axis and raw curve for one analog channel."""
-        color = _channel_color(ch)
+        color = str(self._curve_styles.get(ch.name, {}).get("color") or _channel_color(ch))
         effective_unit = self._effective_units.get(ch.name, ch.unit or "")
         # When scaling changes the unit (e.g. kV → pu) we still want voltage
         # channels to share a "Voltage (pu)" axis rather than merging with the
         # generic "per_unit" role.  Passing the original signal type as a hint
         # keeps the grouping key role-correct.
-        signal_hint = _infer_signal_type(ch.name, ch.unit or "")
+        signal_hint = (
+            normalize_signal_type_hint(getattr(ch, "parameter_type", None))
+            or _infer_signal_type(ch.name, ch.unit or "")
+        )
         group = axis_group_for_signal(
             ch.name,
             effective_unit,
@@ -782,7 +954,7 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             axis_key=group.key,
             axis_label=group.label,
         )
-        curve = self._make_curve(color)
+        curve = self._make_curve(ch.name, color)
         if vb is self._primary_plot.getViewBox():
             self._primary_plot.addItem(curve)
         else:
@@ -806,13 +978,8 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._remove_reserved_right_axes()
         self._axis_manager.clear()
         self._primary_plot.clear()
-        self._primary_plot.showGrid(x=True, y=True, alpha=0.2)
-        self._primary_plot.setLabel("bottom", "Time")
-        self._apply_datetime_axis_mode(
-            self._axis_reference_time
-            if self._time_axis_mode == TimeDisplayMode.ABSOLUTE
-            else None
-        )
+        apply_plot_style(self._primary_plot, theme=self._canvas_theme)
+        self._apply_time_axis_mode()
         self._refresh_panel_title()
 
         self._axis_manager = MultiAxisManager(self._primary_plot, self)
@@ -821,6 +988,10 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         self._cursor_b = None  # removed by PlotItem.clear() above
         self._trigger_line = None
         self._event_markers.clear()  # removed by PlotItem.clear() above
+        self._crosshair_v = None
+        self._crosshair_h = None
+        self._crosshair_label = None
+        self._install_mouse_crosshair()
 
     def _rebuild_visible_channel_axes(self) -> None:
         """Rebuild visible axes without reloading or mutating waveform data."""
@@ -1197,6 +1368,148 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
         )
         self._cursor.sigPositionChanged.connect(self._on_cursor_moved)
         self._primary_plot.addItem(self._cursor)
+
+    def _install_mouse_crosshair(self) -> None:
+        """Install non-draggable mouse-follow crosshair guides."""
+        if not self._crosshair_items_alive():
+            self._reset_crosshair_items()
+        if self._crosshair_v is None:
+            pen = pg.mkPen(get_plot_theme(self._canvas_theme).crosshair_line, width=1, style=Qt.PenStyle.DotLine)
+            self._crosshair_v = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+            self._crosshair_h = pg.InfiniteLine(angle=0, movable=False, pen=pen)
+            self._crosshair_label = make_crosshair_label(self._canvas_theme)
+            for item in (self._crosshair_v, self._crosshair_h, self._crosshair_label):
+                item.setZValue(10_000)
+                item.hide()
+                self._primary_plot.addItem(item, ignoreBounds=True)
+        if self._crosshair_proxy is None:
+            self._crosshair_proxy = pg.SignalProxy(
+                self.scene().sigMouseMoved,
+                rateLimit=60,
+                slot=self._on_mouse_crosshair_moved,
+            )
+
+    def _on_mouse_crosshair_moved(self, evt) -> None:
+        pos = evt[0] if isinstance(evt, tuple) else evt
+        self._update_mouse_crosshair(pos)
+
+    def _update_mouse_crosshair(self, scene_pos) -> None:
+        if (
+            not self._crosshair_items_alive()
+        ):
+            self._reset_crosshair_items()
+            self._install_mouse_crosshair()
+            return
+        if self._record is None or len(self._time_cache) == 0:
+            self._set_crosshair_visible(False)
+            return
+        viewbox = self._primary_plot.getViewBox()
+        if not self._primary_plot.sceneBoundingRect().contains(scene_pos):
+            self._set_crosshair_visible(False)
+            return
+        mapped = viewbox.mapSceneToView(scene_pos)
+        x = float(mapped.x())
+        y = float(mapped.y())
+        snapped = self._nearest_waveform_point(scene_pos, x) if self._crosshair_snap_enabled else None
+        snap_name = ""
+        if snapped is not None:
+            snap_name, x, y, _unit, _color = snapped
+        self._crosshair_v.setPos(x)
+        self._crosshair_h.setPos(y)
+        self._crosshair_label.setText(self._format_info_box_text(x, y, snap_name))
+        position_crosshair_label(self._crosshair_label, self._primary_plot)
+        self._set_crosshair_visible(True)
+        values = self._compute_cursor_values(x)
+        if values:
+            self.cursor_values_changed.emit(x, values)
+
+    def _set_crosshair_visible(self, visible: bool) -> None:
+        if not self._crosshair_items_alive():
+            self._reset_crosshair_items()
+            return
+        for item in (self._crosshair_v, self._crosshair_h):
+            if item is not None:
+                item.setVisible(visible)
+        if self._crosshair_label is not None:
+            self._crosshair_label.setVisible(visible and self._info_box_visible)
+
+    def _crosshair_items_alive(self) -> bool:
+        items = (self._crosshair_v, self._crosshair_h, self._crosshair_label)
+        return all(item is not None and not sip.isdeleted(item) for item in items)
+
+    def _reset_crosshair_items(self) -> None:
+        self._crosshair_v = None
+        self._crosshair_h = None
+        self._crosshair_label = None
+
+    def _format_crosshair_x(self, x: float) -> str:
+        if self._time_axis_mode == TimeDisplayMode.SAMPLE_INDEX:
+            return f"x = {x:.0f} sample"
+        if self._time_axis_mode == TimeDisplayMode.ABSOLUTE and self._axis_reference_time is not None:
+            try:
+                dt = self._axis_reference_time + timedelta(seconds=x)
+                return "x = " + dt.strftime("%Y-%m-%d %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                pass
+        if abs(x) < 1.0:
+            return f"x = {x * 1000:.3f} ms"
+        return f"x = {x:.4f} s"
+
+    def _format_info_box_text(self, x: float, y: float, snap_name: str = "") -> str:
+        rows = [
+            "Cursor",
+            f"X       {self._format_crosshair_x(x).removeprefix('x = ')}",
+            f"Y       {y:.4g}",
+        ]
+        if snap_name:
+            rows.append(f"Wave    {snap_name}")
+        if self._panel_title:
+            rows.append(f"Panel   {self._panel_title}")
+        elif self._record is not None:
+            station = getattr(self._record.metadata, "station_name", "") or ""
+            if station:
+                rows.append(f"Record  {station}")
+        return "\n".join(rows)
+
+    def _nearest_waveform_point(
+        self,
+        scene_pos,
+        mouse_x: float,
+    ) -> tuple[str, float, float, str, str] | None:
+        """Return the closest visible raw data point to the mouse in screen space."""
+        if len(self._time_cache) == 0:
+            return None
+        best: tuple[float, str, float, float, str, str] | None = None
+        for name, entry in self._axis_manager._axes.items():
+            data = self._get_display_data(name)
+            if data is None or len(data) == 0:
+                continue
+            limit = min(len(self._time_cache), len(data))
+            if limit == 0:
+                continue
+            time = self._time_cache[:limit]
+            data = data[:limit]
+            idx = int(np.searchsorted(time, mouse_x, side="left"))
+            candidate_indices = {
+                max(0, min(idx, limit - 1)),
+                max(0, min(idx - 1, limit - 1)),
+            }
+            for idx in candidate_indices:
+                x_val = float(time[idx])
+                y_val = float(data[idx])
+                if not np.isfinite(x_val) or not np.isfinite(y_val):
+                    continue
+                point = entry.viewbox.mapViewToScene(pg.Point(x_val, y_val))
+                dx = float(point.x() - scene_pos.x())
+                dy = float(point.y() - scene_pos.y())
+                distance_sq = dx * dx + dy * dy
+                if best is None or distance_sq < best[0]:
+                    unit = self._effective_units.get(name, "") or ""
+                    best = (distance_sq, name, x_val, y_val, unit, entry.color)
+        if best is None:
+            return None
+        _distance, name, x_val, y_val, unit, color = best
+        return name, x_val, y_val, unit, color
 
     def _on_cursor_moved(self, line: pg.InfiniteLine) -> None:
         t = float(line.value())
@@ -1875,4 +2188,4 @@ class FlexiblePlotCanvas(pg.GraphicsLayoutWidget):
             self._panel_base_title,
             self._rms_display_mode.value,
         )
-        self._primary_plot.setTitle(self._panel_title)
+        set_panel_title(self._primary_plot, self._panel_title, theme=self._canvas_theme)

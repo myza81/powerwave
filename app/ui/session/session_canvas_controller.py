@@ -36,6 +36,8 @@ from app.analytics.scaling.scaling_models import EngineeringScalingMode
 from app.analytics.scaling.scaling_registry import ScalingRegistry
 from app.visualization.widgets.session_canvas import SessionCanvasWidget
 from app.ui.session.legend_widget import generate_source_variant_colour
+from app.visualization.axis_management import AxisDisplayMode, axis_group_for_signal
+from app.visualization.axis.datetime_axis import TimeDisplayMode
 
 # Flat source palette (matplotlib default) — used for zero lines and non-phase channels
 _SOURCE_COLORS: list[str] = [
@@ -80,6 +82,23 @@ def _session_window(session) -> tuple[float, float]:
     span = t_max - t_min
     margin = max(span * 0.02, 0.001)
     return t_min - margin, t_max + margin
+
+
+def _session_time_display_mode(session) -> TimeDisplayMode:
+    """Infer the visualization x-axis semantics from active source records."""
+    references: set[str] = set()
+    for source in session.list_sources():
+        if not source.is_active:
+            continue
+        try:
+            references.add(str(getattr(source.record.timing_info, "timing_reference", "absolute")))
+        except Exception:  # noqa: BLE001
+            continue
+    if references and references <= {"sample_index"}:
+        return TimeDisplayMode.SAMPLE_INDEX
+    if references and references <= {"relative_elapsed", "synthetic_elapsed"}:
+        return TimeDisplayMode.RELATIVE
+    return TimeDisplayMode.ABSOLUTE
 
 
 _RIGHT_AXIS_TYPES = frozenset({"current", "mw", "mvar", "frequency"})
@@ -135,6 +154,15 @@ class SessionCanvasController:
         self._crosshair_readout_cb: object = None        # callable(t, values) for live readout
         self._navigator = None                           # WaveformNavigatorStrip | None
         self._channel_panel_changed_cb: object = None   # callable(source_id, ch_name, panel_id)
+        self._layout_rebuilt_callback: object = None
+
+    def set_layout_rebuilt_callback(self, callback) -> None:
+        """Notify the owner when panel merge/split produces a new splitter."""
+        self._layout_rebuilt_callback = callback
+
+    def _notify_layout_rebuilt(self, splitter: QSplitter) -> None:
+        if self._layout_rebuilt_callback is not None:
+            self._layout_rebuilt_callback(splitter)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Layout
@@ -390,7 +418,8 @@ class SessionCanvasController:
             self._session_ref.merge_panels(panel_id_a, panel_id_b)
         except KeyError:
             return
-        self.rebuild_layout(self._session_ref)
+        splitter = self.rebuild_layout(self._session_ref)
+        self._notify_layout_rebuilt(splitter)
         self.refresh_all(self._session_ref)
 
     def _handle_split_by_source(self, panel_id: str) -> None:
@@ -415,7 +444,8 @@ class SessionCanvasController:
             for sid, cname in refs:
                 session.set_channel_panel(sid, cname, new_pid)
 
-        self.rebuild_layout(session)
+        splitter = self.rebuild_layout(session)
+        self._notify_layout_rebuilt(splitter)
         self.refresh_all(session)
 
     def _handle_split_by_type(self, panel_id: str) -> None:
@@ -446,7 +476,8 @@ class SessionCanvasController:
             for sid, cname in refs:
                 session.set_channel_panel(sid, cname, new_pid)
 
-        self.rebuild_layout(session)
+        splitter = self.rebuild_layout(session)
+        self._notify_layout_rebuilt(splitter)
         self.refresh_all(session)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -490,8 +521,11 @@ class SessionCanvasController:
         ABSOLUTE re-derives the session origin from loaded sources; RELATIVE
         clears the reference so raw elapsed-second values are shown.
         """
-        from app.visualization.axis.datetime_axis import TimeDisplayMode
         m = TimeDisplayMode.coerce(mode)
+        if _session_time_display_mode(session) == TimeDisplayMode.SAMPLE_INDEX:
+            for canvas in self._canvases.values():
+                canvas.set_sample_index_axis()
+            return
         if m == TimeDisplayMode.ABSOLUTE:
             self._apply_time_reference(session)
         else:
@@ -540,6 +574,14 @@ class SessionCanvasController:
             for ch in session.list_analog_channels(active_only=False)
         }
 
+    @staticmethod
+    def _analog_channel_lookup(session) -> dict[tuple[str, str], object]:
+        lookup: dict[tuple[str, str], object] = {}
+        for source in session.list_sources():
+            for ch in source.record.analog_channels:
+                lookup[(source.source_id, ch.name)] = ch
+        return lookup
+
     def _paint_panel(
         self,
         canvas: SessionCanvasWidget,
@@ -557,13 +599,15 @@ class SessionCanvasController:
         }
         digital_row = 0
         digital_tick_labels: list[tuple[float, str]] = []
-
+        analog_channels = self._analog_channel_lookup(session)
+        panel_axis_sides: dict[str, str] = {}
         for source_id, channel_name in panel.channel_refs:
             if source_id not in active_sids:
                 canvas.set_curve_visible(source_id, channel_name, False)
                 continue
             ch = all_channels.get((source_id, channel_name))
             is_digital = (source_id, channel_name) in digital_keys
+            source_channel = analog_channels.get((source_id, channel_name))
             visible = ch.is_visible if ch is not None else True
             color = (ch.color_hex if (ch and ch.color_hex) else None) or self._auto_colour(source_id, channel_name)
             if not visible:
@@ -586,20 +630,36 @@ class SessionCanvasController:
                     )
                     digital_tick_labels.append((float(digital_row), label))
                     digital_row += 1
+                    continue
+
+                scaled_values, display_unit = self._scale_aligned(
+                    channel_name, aligned.values, aligned.unit
+                )
+                signal_type = str(getattr(source_channel, "parameter_type", "") or "") or None
+                axis_group = axis_group_for_signal(
+                    channel_name,
+                    display_unit,
+                    mode=AxisDisplayMode.SHARED,
+                    signal_type_hint=signal_type,
+                )
+                if ch is not None and ch.y_axis_side == "right":
+                    y_axis_side = "right"
                 else:
-                    scaled_values, display_unit = self._scale_aligned(
-                        channel_name, aligned.values, aligned.unit
+                    y_axis_side = panel_axis_sides.setdefault(
+                        axis_group.key,
+                        "left" if not panel_axis_sides else "right",
                     )
-                    canvas.update_curve(
-                        source_id, channel_name, aligned.time, scaled_values,
-                        color=color, visible=True,
-                        display_name=ch.display_name if ch else channel_name,
-                        source_badge=badge,
-                        unit=display_unit,
-                        line_style=ch.line_style if ch else "solid",
-                        line_width=ch.line_width if ch else 1.0,
-                        y_axis_side=ch.y_axis_side if ch else "left",
-                    )
+                canvas.update_curve(
+                    source_id, channel_name, aligned.time, scaled_values,
+                    color=color, visible=True,
+                    display_name=ch.display_name if ch else channel_name,
+                    source_badge=badge,
+                    unit=display_unit,
+                    line_style=ch.line_style if ch else "solid",
+                    line_width=ch.line_width if ch else 1.0,
+                    y_axis_side=y_axis_side,
+                    signal_type=signal_type,
+                )
             except Exception:  # noqa: BLE001
                 pass
 
@@ -636,6 +696,8 @@ class SessionCanvasController:
         # S4: compute harmonic magnitude overlays for this panel
         if self._harmonic_mode == HarmonicDisplayMode.HARMONIC_MAGNITUDE:
             self._compute_harmonic_for_panel(canvas, panel, session, all_channels, sources_by_id, t_start, t_end)
+
+        canvas.refresh_render_state()
 
     def _resize_digital_panels(self) -> None:
         """Size panels after rebuild: digital panels get a capped height, analog panels ~250px.
@@ -1212,6 +1274,8 @@ class SessionCanvasController:
             if not source.is_active:
                 continue
             try:
+                if getattr(source.record.timing_info, "timing_reference", "absolute") != "absolute":
+                    continue
                 start = source.record.timing_info.start_time
                 if start is None:
                     continue
@@ -1224,6 +1288,10 @@ class SessionCanvasController:
 
     def _apply_time_reference(self, session) -> None:
         """Push the session wall-clock origin to all canvas axes."""
+        if _session_time_display_mode(session) == TimeDisplayMode.SAMPLE_INDEX:
+            for canvas in self._canvases.values():
+                canvas.set_sample_index_axis()
+            return
         ref = self._compute_session_reference_time(session)
         for canvas in self._canvases.values():
             if ref is not None:

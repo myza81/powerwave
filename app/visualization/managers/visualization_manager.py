@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
+from PyQt6 import sip
 
 from app.models import AnalogChannel, DisturbanceRecord
 from app.visualization.axis.datetime_axis import (
@@ -84,6 +85,16 @@ def _make_filtered_record(
         timing_info=record.timing_info,
         disturbance_info=record.disturbance_info,
     )
+
+
+def _widget_alive(widget: object) -> bool:
+    """Return False only for Qt wrappers whose underlying C++ object is gone."""
+    if widget is None:
+        return False
+    try:
+        return not sip.isdeleted(widget)
+    except TypeError:
+        return True
 
 
 def _apply_time_offset(
@@ -240,6 +251,9 @@ class VisualizationManager:
         self._time_axis_mode = TimeDisplayMode.RELATIVE
         self._axis_reference_time: datetime | None = None
         self._axis_display_mode = AxisDisplayMode.SHARED
+        self._crosshair_snap_enabled = False
+        self._info_box_visible = False
+        self._canvas_theme = "dark"
 
         # Bidirectional cursor sync — receivers use blockSignals to prevent loops
         canvas.cursor_moved.connect(self._on_canvas_cursor_moved)
@@ -332,9 +346,9 @@ class VisualizationManager:
         reference = self._axis_reference_time
         targets = list(self._panel_canvases.values()) or [self._canvas]
         for canvas in targets:
-            if hasattr(canvas, "set_time_axis_mode"):
+            if _widget_alive(canvas) and hasattr(canvas, "set_time_axis_mode"):
                 canvas.set_time_axis_mode(display_mode, axis_reference_time=reference)
-        if hasattr(self._timeline, "set_time_axis_mode"):
+        if _widget_alive(self._timeline) and hasattr(self._timeline, "set_time_axis_mode"):
             self._timeline.set_time_axis_mode(display_mode, axis_reference_time=reference)
 
     def set_axis_display_mode(self, mode: AxisDisplayMode | str) -> None:
@@ -343,8 +357,34 @@ class VisualizationManager:
         self._axis_display_mode = axis_mode
         targets = list(self._panel_canvases.values()) or [self._canvas]
         for canvas in targets:
-            if hasattr(canvas, "set_axis_display_mode"):
+            if _widget_alive(canvas) and hasattr(canvas, "set_axis_display_mode"):
                 canvas.set_axis_display_mode(axis_mode)
+
+    def set_crosshair_snap_enabled(self, enabled: bool) -> None:
+        """Switch managed analog canvases between free and waveform-snapped crosshair."""
+        self._crosshair_snap_enabled = bool(enabled)
+        targets = list(self._panel_canvases.values()) or [self._canvas]
+        for canvas in targets:
+            if _widget_alive(canvas) and hasattr(canvas, "set_crosshair_snap_enabled"):
+                canvas.set_crosshair_snap_enabled(self._crosshair_snap_enabled)
+
+    def set_info_box_visible(self, visible: bool) -> None:
+        """Show or hide floating waveform information boxes on managed canvases."""
+        self._info_box_visible = bool(visible)
+        targets = list(self._panel_canvases.values()) or [self._canvas]
+        for canvas in targets:
+            if _widget_alive(canvas) and hasattr(canvas, "set_info_box_visible"):
+                canvas.set_info_box_visible(self._info_box_visible)
+
+    def set_canvas_theme(self, theme: str) -> None:
+        """Apply the canvas theme to all managed waveform canvases."""
+        self._canvas_theme = "light" if str(theme).lower() == "light" else "dark"
+        targets = list(self._panel_canvases.values()) or [self._canvas]
+        for canvas in targets:
+            if _widget_alive(canvas) and hasattr(canvas, "set_canvas_theme"):
+                canvas.set_canvas_theme(self._canvas_theme)
+        if _widget_alive(self._timeline) and hasattr(self._timeline, "set_canvas_theme"):
+            self._timeline.set_canvas_theme(self._canvas_theme)
 
     def clear(self) -> None:
         """Clear both widgets and discard the record reference."""
@@ -514,6 +554,12 @@ class VisualizationManager:
                 canvas.set_record(filtered, axis_mode=axis_mode)
             if hasattr(canvas, "set_axis_display_mode"):
                 canvas.set_axis_display_mode(self._axis_display_mode)
+            if hasattr(canvas, "set_crosshair_snap_enabled"):
+                canvas.set_crosshair_snap_enabled(self._crosshair_snap_enabled)
+            if hasattr(canvas, "set_info_box_visible"):
+                canvas.set_info_box_visible(self._info_box_visible)
+            if hasattr(canvas, "set_canvas_theme"):
+                canvas.set_canvas_theme(self._canvas_theme)
             if hasattr(canvas, "set_panel_title"):
                 canvas.set_panel_title(format_panel_title(group_name, len(channel_names)))
             panel_canvases[group_name] = canvas
@@ -601,6 +647,12 @@ class VisualizationManager:
                     canvas.set_record(display_record, axis_mode=axis_mode)
                 if hasattr(canvas, "set_axis_display_mode"):
                     canvas.set_axis_display_mode(self._axis_display_mode)
+                if hasattr(canvas, "set_crosshair_snap_enabled"):
+                    canvas.set_crosshair_snap_enabled(self._crosshair_snap_enabled)
+                if hasattr(canvas, "set_info_box_visible"):
+                    canvas.set_info_box_visible(self._info_box_visible)
+                if hasattr(canvas, "set_canvas_theme"):
+                    canvas.set_canvas_theme(self._canvas_theme)
                 panel_key = f"{source.source_id}/{group_name}"
                 if hasattr(canvas, "set_panel_title"):
                     canvas.set_panel_title(

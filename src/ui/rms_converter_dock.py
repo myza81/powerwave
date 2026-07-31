@@ -590,7 +590,7 @@ class RmsConverterDock(QDockWidget):
         self._readout.setStyleSheet(
             'background-color: rgba(15,15,35,220);'
             'color: #EEEEEE;'
-            'font-family: Monospace;'
+            "font-family: Menlo, Consolas, 'Courier New';"
             'font-size: 8pt;'
             'padding: 6px 8px;'
             'border-radius: 4px;'

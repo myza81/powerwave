@@ -19,7 +19,8 @@ import pandas as pd
 from app.import_wizard.contracts import ValidationMessage, ValidationSeverity
 from app.import_wizard.repair_diagnostics import RepairDiagnostics
 from app.import_wizard.timestamp_contracts import TimestampRepairPlan
-from app.import_wizard.timestamp_repair_executor import dispatch
+from app.import_wizard.timestamp_contracts import TimestampRepairStrategy
+from app.import_wizard.timestamp_repair_executor import coerce_elapsed_seconds, dispatch
 
 
 @dataclass
@@ -35,12 +36,20 @@ class TimestampNormalizationResult:
     validation_messages All warnings and errors generated during normalization.
     success             True when at least one non-NaT timestamp was produced
                         and no ERROR-severity messages are present.
+    time_axis_mode      "absolute", "relative_elapsed", "synthetic_elapsed",
+                        or "sample_index".
+    time_axis_unit      Source unit/format label used for the time axis.
+    elapsed_seconds     For relative elapsed sources, the authoritative time
+                        axis values converted to seconds.
     """
 
     normalized: pd.Series
     diagnostics: RepairDiagnostics
     validation_messages: list[ValidationMessage] = field(default_factory=list)
     success: bool = False
+    time_axis_mode: str = "absolute"
+    time_axis_unit: str | None = None
+    elapsed_seconds: pd.Series | None = None
 
     # ------------------------------------------------------------------
     # Convenience
@@ -91,8 +100,27 @@ def normalize_timestamps(
     extra_msgs: list[ValidationMessage] = []
 
     # Dispatch
+    elapsed_seconds: pd.Series | None = None
+    time_axis_mode = "absolute"
+    time_axis_unit = repair_plan.detected_format or repair_plan.user_format
     try:
         normalized, diagnostics, messages = dispatch(raw_copy, repair_plan, aux_series)
+        if repair_plan.strategy == TimestampRepairStrategy.PARSE_ELAPSED_TIME:
+            time_axis_mode = "relative_elapsed"
+            time_axis_unit = repair_plan.elapsed_time_unit or repair_plan.detected_format
+            elapsed_seconds = coerce_elapsed_seconds(raw_copy, time_axis_unit)
+        elif repair_plan.strategy == TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED:
+            time_axis_mode = "synthetic_elapsed"
+            interval = repair_plan.sampling_interval_seconds
+            if interval is None and repair_plan.sample_rate_hz and repair_plan.sample_rate_hz > 0:
+                interval = 1.0 / repair_plan.sample_rate_hz
+            interval = interval if interval is not None and interval > 0 else 1.0
+            time_axis_unit = "s"
+            elapsed_seconds = pd.Series(range(len(raw_copy)), index=raw_copy.index, dtype="float64") * float(interval)
+        elif repair_plan.strategy == TimestampRepairStrategy.GENERATE_SAMPLE_INDEX:
+            time_axis_mode = "sample_index"
+            time_axis_unit = "sample"
+            elapsed_seconds = pd.Series(range(len(raw_copy)), index=raw_copy.index, dtype="float64")
     except Exception as exc:
         diagnostics = RepairDiagnostics(
             strategy_used=repair_plan.strategy.value,
@@ -124,6 +152,9 @@ def normalize_timestamps(
         diagnostics=diagnostics,
         validation_messages=all_messages,
         success=success,
+        time_axis_mode=time_axis_mode,
+        time_axis_unit=time_axis_unit,
+        elapsed_seconds=elapsed_seconds,
     )
 
 

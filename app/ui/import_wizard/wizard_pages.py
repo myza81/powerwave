@@ -1,13 +1,18 @@
 """Page widgets used by the Import Wizard dialog."""
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -15,18 +20,26 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QSizePolicy,
     QTableView,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
+    QHeaderView,
 )
 
 from app.import_wizard.contracts import ValidationMessage
+from app.import_wizard.column_mapping import ParameterType
 from app.import_wizard.diagnostics_summary import build_import_diagnostics, _confidence_label
 from app.import_wizard.export_writer import ExportWriteResult
 from app.import_wizard.import_pipeline import ImportPipelineResult
 from app.import_wizard.models import ImportWizardSession
 from app.import_wizard.normalization_plan import NormalizationPlan
-from app.ui.import_wizard.column_mapping_model import ColumnMappingTableModel, ParameterTypeDelegate
+from app.ui.import_wizard.column_mapping_model import (
+    ColumnMappingTableModel,
+    ParameterTypeDelegate,
+    UnitDelegate,
+)
 from app.ui.import_wizard.diagnostics_panel import DiagnosticsPanel
 from app.ui.import_wizard.preview_table_model import PreviewTableModel
 from app.ui.import_wizard.timestamp_candidate_model import TimestampCandidateTableModel
@@ -137,25 +150,68 @@ class TimestampSelectPage(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table, 1)
 
-        # ── Format Override ───────────────────────────────────────────────
-        override_group = QGroupBox("Format Override")
-        form = QFormLayout(override_group)
+        mode_group = QGroupBox("Time Axis Mode")
+        mode_layout = QGridLayout(mode_group)
+        mode_layout.setHorizontalSpacing(12)
+        mode_layout.setVerticalSpacing(6)
+        self.time_axis_mode_combo = QComboBox()
+        self.time_axis_mode_combo.addItem("Auto-detect", "auto")
+        self.time_axis_mode_combo.addItem("Absolute timestamp", "absolute")
+        self.time_axis_mode_combo.addItem("Elapsed time values", "elapsed")
+        self.time_axis_mode_combo.addItem("Synthetic time from sample rate", "synthetic_elapsed")
+        self.time_axis_mode_combo.addItem("Sample index", "sample_index")
+        self.elapsed_unit_combo = QComboBox()
+        self.elapsed_unit_combo.addItem("Seconds", "elapsed_seconds")
+        self.elapsed_unit_combo.addItem("Milliseconds", "elapsed_milliseconds")
+        self.elapsed_unit_combo.addItem("Minutes", "elapsed_minutes")
+        self.synthetic_basis_combo = QComboBox()
+        self.synthetic_basis_combo.addItem("Sample rate (Hz)", "sample_rate")
+        self.synthetic_basis_combo.addItem("Sample interval (seconds)", "sample_interval")
+        self.synthetic_value_edit = QLineEdit()
+        self.synthetic_value_edit.setPlaceholderText("e.g. 100")
+        self.elapsed_unit_label = QLabel("Elapsed unit")
+        self.synthetic_basis_label = QLabel("Synthetic basis")
+        mode_layout.addWidget(QLabel("Mode"), 0, 0)
+        mode_layout.addWidget(self.time_axis_mode_combo, 0, 1)
+        mode_layout.addWidget(self.elapsed_unit_label, 1, 0)
+        mode_layout.addWidget(self.elapsed_unit_combo, 1, 1)
+        mode_layout.addWidget(self.synthetic_basis_label, 2, 0)
+        mode_layout.addWidget(self.synthetic_basis_combo, 2, 1)
+        mode_layout.addWidget(self.synthetic_value_edit, 2, 2)
+        mode_layout.setColumnStretch(1, 1)
+        layout.addWidget(mode_group)
+
+        self.override_group = QGroupBox("Format Override")
+        override_layout = QVBoxLayout(self.override_group)
+        override_layout.setSpacing(8)
+        details = QWidget()
+        details_layout = QGridLayout(details)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setHorizontalSpacing(12)
+        details_layout.setVerticalSpacing(6)
+        self.selected_column_caption = QLabel("Selected column")
+        self.detected_format_caption = QLabel("Detected format")
+        self.format_source_caption = QLabel("Format source")
+        self.manual_format_caption = QLabel("Manual format")
         self.selected_column_label = QLabel("None")
         self.detected_format_label = QLabel("auto")
         self.override_status_label = QLabel("Auto-detected")
         self.override_edit = QLineEdit()
         self.override_edit.setPlaceholderText("%Y-%m-%d %H:%M:%S")
+        self.override_edit.setMinimumWidth(320)
         self.reset_button = QPushButton("Reset to detected")
-        override_row = QWidget()
-        override_layout = QHBoxLayout(override_row)
-        override_layout.setContentsMargins(0, 0, 0, 0)
-        override_layout.addWidget(self.override_edit, 1)
-        override_layout.addWidget(self.reset_button)
-        form.addRow("Selected column", self.selected_column_label)
-        form.addRow("Detected format", self.detected_format_label)
-        form.addRow("Format source", self.override_status_label)
-        form.addRow("Manual format", override_row)
-        layout.addWidget(override_group)
+        details_layout.addWidget(self.selected_column_caption, 0, 0)
+        details_layout.addWidget(self.selected_column_label, 0, 1)
+        details_layout.addWidget(self.detected_format_caption, 1, 0)
+        details_layout.addWidget(self.detected_format_label, 1, 1)
+        details_layout.addWidget(self.format_source_caption, 2, 0)
+        details_layout.addWidget(self.override_status_label, 2, 1)
+        details_layout.addWidget(self.manual_format_caption, 3, 0)
+        details_layout.addWidget(self.override_edit, 3, 1)
+        details_layout.addWidget(self.reset_button, 3, 2)
+        details_layout.setColumnStretch(1, 1)
+        override_layout.addWidget(details)
+        layout.addWidget(self.override_group)
 
         # ── Timestamp Reconstruction ──────────────────────────────────────
         self._recon_group = QGroupBox("Timestamp Reconstruction")
@@ -202,7 +258,20 @@ class TimestampSelectPage(QWidget):
 
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
+        self._configure_feedback_text_block(self.message_label, min_height=54)
         layout.addWidget(self.message_label)
+        self.time_axis_mode_combo.currentIndexChanged.connect(self._refresh_mode_visibility)
+        self.elapsed_unit_combo.currentIndexChanged.connect(self._refresh_mode_visibility)
+        self._refresh_mode_visibility()
+
+    def _configure_feedback_text_block(self, label: QLabel, *, min_height: int) -> None:
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        label.setMinimumHeight(min_height)
+        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setFrameShape(QFrame.Shape.StyledPanel)
+        label.setContentsMargins(8, 6, 8, 6)
 
     # ── Reconstruction helpers ────────────────────────────────────────────
 
@@ -249,6 +318,7 @@ class TimestampSelectPage(QWidget):
     # ── Standard page API ─────────────────────────────────────────────────
 
     def refresh(self, session: ImportWizardSession | None) -> None:
+        self._refresh_mode_visibility()
         count = len(session.timestamp_candidates) if session else 0
         self.message_label.setText(
             "No timestamp candidate detected. Choose another file or provide a source with a timestamp column."
@@ -262,12 +332,91 @@ class TimestampSelectPage(QWidget):
         detected_format: str | None,
         feedback: str,
     ) -> None:
-        self.selected_column_label.setText(column_name or "None")
-        self.detected_format_label.setText(detected_format or "auto")
-        has_override = bool(self.override_edit.text().strip())
-        self.override_status_label.setText("User Override" if has_override else "Auto-detected")
+        self._refresh_time_axis_details(column_name, detected_format)
         if feedback:
             self.message_label.setText(feedback)
+
+    def selected_time_axis_mode(self) -> str:
+        return str(self.time_axis_mode_combo.currentData() or "auto")
+
+    def selected_elapsed_unit(self) -> str:
+        return str(self.elapsed_unit_combo.currentData() or "elapsed_seconds")
+
+    def synthetic_timing_basis(self) -> str:
+        return str(self.synthetic_basis_combo.currentData() or "sample_rate")
+
+    def synthetic_timing_value(self) -> float | None:
+        text = self.synthetic_value_edit.text().strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _refresh_mode_visibility(self) -> None:
+        mode = self.selected_time_axis_mode()
+        show_elapsed = mode == "elapsed"
+        show_synthetic = mode == "synthetic_elapsed"
+        self.elapsed_unit_label.setVisible(show_elapsed)
+        self.elapsed_unit_combo.setVisible(show_elapsed)
+        self.synthetic_basis_label.setVisible(show_synthetic)
+        self.synthetic_basis_combo.setVisible(show_synthetic)
+        self.synthetic_value_edit.setVisible(show_synthetic)
+        uses_manual_format = mode in {"auto", "absolute"}
+        self.manual_format_caption.setVisible(uses_manual_format)
+        self.override_edit.setVisible(uses_manual_format)
+        self.reset_button.setVisible(uses_manual_format)
+        self.override_edit.setEnabled(uses_manual_format)
+        self._refresh_time_axis_details(
+            self.selected_column_label.text() if self.selected_column_label.text() != "Not used" else None,
+            self.detected_format_label.text() if uses_manual_format else None,
+        )
+
+    def _refresh_time_axis_details(
+        self,
+        column_name: str | None,
+        detected_format: str | None,
+    ) -> None:
+        mode = self.selected_time_axis_mode()
+        if mode == "sample_index":
+            self.override_group.setTitle("Time Axis Details")
+            self.selected_column_caption.setText("Selected column")
+            self.selected_column_label.setText("Not used")
+            self.detected_format_caption.setText("Axis basis")
+            self.detected_format_label.setText("Sample index")
+            self.format_source_caption.setText("Source")
+            self.override_status_label.setText("User-selected mode")
+            return
+
+        if mode == "synthetic_elapsed":
+            self.override_group.setTitle("Time Axis Details")
+            self.selected_column_caption.setText("Selected column")
+            self.selected_column_label.setText("Not used")
+            self.detected_format_caption.setText("Axis basis")
+            self.detected_format_label.setText("Synthetic elapsed time")
+            self.format_source_caption.setText("Source")
+            self.override_status_label.setText("User-selected mode")
+            return
+
+        if mode == "elapsed":
+            self.override_group.setTitle("Time Axis Details")
+            self.selected_column_caption.setText("Selected column")
+            self.selected_column_label.setText(column_name or "None")
+            self.detected_format_caption.setText("Elapsed unit")
+            self.detected_format_label.setText(self.elapsed_unit_combo.currentText())
+            self.format_source_caption.setText("Source")
+            self.override_status_label.setText("User-selected mode")
+            return
+
+        self.override_group.setTitle("Format Override")
+        self.selected_column_caption.setText("Selected column")
+        self.selected_column_label.setText(column_name or "None")
+        self.detected_format_caption.setText("Detected format")
+        self.detected_format_label.setText(detected_format or "auto")
+        self.format_source_caption.setText("Format source")
+        has_override = bool(self.override_edit.text().strip())
+        self.override_status_label.setText("User Override" if has_override else "Auto-detected")
 
 
 class ColumnMappingPage(QWidget):
@@ -275,26 +424,75 @@ class ColumnMappingPage(QWidget):
 
     def __init__(self, model: ColumnMappingTableModel, parent=None) -> None:
         super().__init__(parent)
+        self._model = model
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Review detected mappings. User edits require re-import before export or waveform handoff."))
+        layout.addWidget(QLabel("Review detected signal mappings. The time axis is selected in the previous step."))
+        self.time_axis_label = QLabel("Time axis: not selected")
+        self.time_axis_label.setWordWrap(True)
+        layout.addWidget(self.time_axis_label)
         self.table = QTableView()
+        self.table.setMinimumWidth(860)
         self.table.setModel(model)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         self.table.setItemDelegateForColumn(3, ParameterTypeDelegate(self.table))
+        self.table.setItemDelegateForColumn(4, UnitDelegate(self.table))
+        model.modelReset.connect(self._schedule_mapping_select_refresh)
+        model.rowsInserted.connect(self._schedule_mapping_select_refresh)
+        model.layoutChanged.connect(self._schedule_mapping_select_refresh)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(72)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 72)
+        self.table.setColumnWidth(3, 220)
+        self.table.setColumnWidth(4, 140)
+        self.table.setColumnWidth(5, 104)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.verticalHeader().setMinimumSectionSize(32)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         layout.addWidget(self.table, 1)
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
         layout.addWidget(self.message_label)
 
+    def _schedule_mapping_select_refresh(self) -> None:
+        QTimer.singleShot(0, self._show_mapping_selects)
+
+    def _show_mapping_selects(self) -> None:
+        model = self.table.model()
+        if model is None:
+            return
+        for row in range(model.rowCount()):
+            self.table.openPersistentEditor(model.index(row, 3))
+            self.table.openPersistentEditor(model.index(row, 4))
+
     def refresh(self, session: ImportWizardSession | None) -> None:
-        mappings = session.column_mappings if session else []
+        mappings = self._model.visible_mappings
         included = sum(1 for mapping in mappings if not mapping.excluded)
         overrides = sum(1 for mapping in mappings if mapping.has_user_override or mapping.excluded)
+        time_axis = session.selected_timestamp_column if session else None
+        hidden = self._model.hidden_time_axis_count()
+        self.time_axis_label.setText(f"Time axis: {time_axis or 'not selected'}")
+        hidden_text = f" {hidden} time-axis column hidden." if hidden else ""
         self.message_label.setText(
             f"{included} included column(s), {len(mappings) - included} excluded. "
-            f"{overrides} user override(s)."
+            f"{overrides} user override(s).{hidden_text}"
         )
+        self._schedule_mapping_select_refresh()
 
 
 class ReviewImportPage(QWidget):
@@ -303,7 +501,7 @@ class ReviewImportPage(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        self.summary = QPlainTextEdit()
+        self.summary = QTextEdit()
         self.summary.setReadOnly(True)
         layout.addWidget(self.summary, 1)
 
@@ -315,19 +513,61 @@ class ReviewImportPage(QWidget):
         candidate = session.best_timestamp_candidate()
         fmt = candidate.detected_format if candidate else "unknown"
         mappings = session.column_mappings
-        included = [m for m in mappings if not m.excluded]
+        if plan is not None:
+            selected_sources = set(plan.selected_columns)
+            included = [m for m in mappings if m.source_name in selected_sources]
+            plan_messages = plan.validation_messages
+        else:
+            included = [
+                m
+                for m in mappings
+                if not m.excluded and m.effective_type != ParameterType.TIMESTAMP
+            ]
+            plan_messages = []
         digital = [m for m in included if m.effective_type.value == "digital"]
-        excluded = [m.source_name for m in mappings if m.excluded]
-        warnings = len(session.warnings())
-        errors = len(session.errors())
+        excluded = [
+            m.source_name
+            for m in mappings
+            if m.excluded and m.effective_type != ParameterType.TIMESTAMP
+        ]
+        warnings = len([m for m in plan_messages if m.severity.value == "warning"])
+        errors = len([m for m in plan_messages if m.severity.value == "error"])
         executable = plan.is_executable if plan is not None else False
+        blocking_issues: list[str] = []
+        if plan is None:
+            blocking_issues.append("Execution plan has not been built yet.")
+        elif not executable:
+            blocking_issues = [
+                message.message
+                for message in plan.validation_messages
+                if message.severity.value == "error"
+            ]
+            if plan.timestamp_plan is None:
+                blocking_issues.append("No validated time-axis repair plan is available.")
+            elif not plan.timestamp_plan.repair_validated:
+                blocking_issues.append("The selected time-axis parsing settings are not valid.")
+            if not plan.selected_columns:
+                blocking_issues.append("No signal/data columns are selected for import.")
+        warning_issues = [
+            message.message
+            for message in plan_messages
+            if message.severity.value == "warning"
+        ]
 
         lines = [
             f"File: {session.source_path}",
             f"Provider: {session.provider_type}",
+            f"Time axis mode: {session.time_axis_mode}",
             f"Timestamp column: {selected}",
             f"Timestamp format: {fmt or 'auto'}",
         ]
+        if session.time_axis_mode == "synthetic_elapsed":
+            if session.sample_rate_hz:
+                lines.append(f"Synthetic sample rate: {session.sample_rate_hz:g} Hz")
+            if session.sample_interval_seconds:
+                lines.append(f"Synthetic sample interval: {session.sample_interval_seconds:g} s")
+        elif session.time_axis_mode == "sample_index":
+            lines.append("X-axis: Sample Index (non-time sequence)")
         if candidate is not None:
             conf_label = _confidence_label(candidate.confidence)
             conf_pct = f"{candidate.confidence * 100:.0f}%"
@@ -341,7 +581,30 @@ class ReviewImportPage(QWidget):
             f"Errors: {errors}",
             f"Plan executable: {'yes' if executable else 'no'}",
         ]
-        self.summary.setPlainText("\n".join(lines))
+        if blocking_issues:
+            lines.append("Blocking issues:")
+            lines.extend(f"- {issue}" for issue in blocking_issues)
+        if warning_issues:
+            lines.append("Warning details:")
+            lines.extend(f"- {issue}" for issue in warning_issues)
+        self.summary.setHtml(self._format_review_html(lines, warning_issues))
+
+    def _format_review_html(self, lines: list[str], warning_issues: list[str]) -> str:
+        warning_start = lines.index("Warning details:") if warning_issues else len(lines)
+        normal_lines = lines[:warning_start]
+        warning_lines = lines[warning_start:]
+        html = [
+            "<div style='white-space: pre-wrap;'>",
+            "<br>".join(escape(line) for line in normal_lines),
+        ]
+        if warning_lines:
+            html.append(
+                "<br><span style='color: #C62828; font-weight: 600;'>"
+                + "<br>".join(escape(line) for line in warning_lines)
+                + "</span>"
+            )
+        html.append("</div>")
+        return "".join(html)
 
 
 class ImportRunningPage(QWidget):
@@ -375,7 +638,8 @@ class ImportCompletePage(QWidget):
         layout.addWidget(self.diagnostics_panel, 1)
 
         export_group = QGroupBox("Save Normalized File")
-        export_layout = QFormLayout(export_group)
+        export_layout = QVBoxLayout(export_group)
+        export_layout.setSpacing(8)
         self.export_format_combo = QComboBox()
         self.export_format_combo.addItem("CSV (.csv)", "csv")
         self.export_format_combo.addItem("Parquet (.parquet)", "parquet")
@@ -386,21 +650,51 @@ class ImportCompletePage(QWidget):
         self.overwrite_existing.setChecked(False)
         self.save_normalized_button = QPushButton("Save Normalized File...")
         self.export_status = QLabel("Run a successful import before exporting.")
-        self.export_status.setWordWrap(True)
         self.export_guidance = QLabel("Metadata sidecar is recommended for auditability.")
-        self.export_guidance.setWordWrap(True)
-        export_layout.addRow("Format", self.export_format_combo)
-        export_layout.addRow("", self.include_metadata_sidecar)
-        export_layout.addRow("", self.overwrite_existing)
-        export_layout.addRow("", self.save_normalized_button)
-        export_layout.addRow("Guidance", self.export_guidance)
-        export_layout.addRow("Status", self.export_status)
+        self._configure_export_text_block(self.export_guidance, min_height=46)
+        self._configure_export_text_block(self.export_status, min_height=82)
+
+        controls = QWidget()
+        controls_layout = QGridLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setHorizontalSpacing(12)
+        controls_layout.setVerticalSpacing(6)
+        controls_layout.addWidget(QLabel("Format"), 0, 0)
+        controls_layout.addWidget(self.export_format_combo, 0, 1)
+        controls_layout.addWidget(self.include_metadata_sidecar, 1, 1)
+        controls_layout.addWidget(self.overwrite_existing, 2, 1)
+        controls_layout.addWidget(self.save_normalized_button, 0, 2)
+        controls_layout.setColumnStretch(1, 1)
+        controls_layout.setColumnStretch(2, 0)
+        export_layout.addWidget(controls)
+        export_layout.addWidget(self._export_text_section("Guidance", self.export_guidance))
+        export_layout.addWidget(self._export_text_section("Status", self.export_status))
         layout.addWidget(export_group)
 
         self.open_waveform = QCheckBox("Open waveform after closing")
         self.open_waveform.setChecked(True)
         layout.addWidget(self.open_waveform)
         self.set_export_enabled(False)
+
+    def _configure_export_text_block(self, label: QLabel, *, min_height: int) -> None:
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        label.setMinimumHeight(min_height)
+        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setFrameShape(QFrame.Shape.StyledPanel)
+        label.setContentsMargins(8, 6, 8, 6)
+
+    def _export_text_section(self, title: str, content: QLabel) -> QWidget:
+        section = QWidget()
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        heading = QLabel(title)
+        heading.setStyleSheet("font-weight: 600;")
+        layout.addWidget(heading)
+        layout.addWidget(content)
+        return section
 
     def set_result(self, result: ImportPipelineResult | None, error_text: str | None = None) -> None:
         self._last_pipeline_result = result

@@ -262,6 +262,7 @@ class TestTimestampCandidate:
         assert c.detected_format is None
         assert c.example_values == []
         assert c.invalid_sample_count == 0
+        assert c.duplicate_sample_count == 0
         assert c.timezone_detected is None
         assert c.user_selected is False
 
@@ -280,6 +281,10 @@ class TestTimestampCandidate:
     def test_invalid_sample_count(self) -> None:
         c = TimestampCandidate("ts", 0, 0.6, invalid_sample_count=5)
         assert c.invalid_sample_count == 5
+
+    def test_duplicate_sample_count(self) -> None:
+        c = TimestampCandidate("ts", 0, 0.6, duplicate_sample_count=3)
+        assert c.duplicate_sample_count == 3
 
     def test_timezone_detected(self) -> None:
         c = TimestampCandidate("ts", 0, 0.9, timezone_detected="UTC")

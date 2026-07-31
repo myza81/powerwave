@@ -11,7 +11,9 @@ Usage
 """
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QPlainTextEdit, QVBoxLayout, QWidget
+from html import escape
+
+from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
 from app.import_wizard.diagnostics_summary import ImportDiagnosticsSummary
 
@@ -119,6 +121,127 @@ def render_diagnostics_text(summary: ImportDiagnosticsSummary) -> str:
     return "\n".join(lines)
 
 
+def render_diagnostics_html(summary: ImportDiagnosticsSummary) -> str:
+    """Format an ImportDiagnosticsSummary as a compact rich-text report."""
+    status_color = "#1B5E20" if summary.success else "#B71C1C"
+    status_word = "Import successful" if summary.success else "Import failed"
+    status_icon = "✓" if summary.success else "✗"
+
+    def esc(value: object) -> str:
+        return escape(str(value))
+
+    def section(title: str) -> str:
+        return (
+            "<div style='margin-top: 12px; margin-bottom: 6px; "
+            "font-weight: 700; color: #333333; letter-spacing: 0.3px;'>"
+            f"{esc(title)}</div>"
+        )
+
+    def row(label: str, value: str, *, alert: bool = False) -> str:
+        value_color = "#B71C1C" if alert else "#222222"
+        value_weight = "700" if alert else "400"
+        return (
+            "<tr>"
+            "<td style='padding: 2px 18px 2px 0; color: #555555; white-space: nowrap;'>"
+            f"{esc(label)}</td>"
+            f"<td style='padding: 2px 0; color: {value_color}; font-weight: {value_weight};'>"
+            f"{esc(value)}</td>"
+            "</tr>"
+        )
+
+    html: list[str] = [
+        "<div style='font-family: -apple-system, BlinkMacSystemFont, "
+        "&quot;Segoe UI&quot;, sans-serif; font-size: 13px; line-height: 1.35;'>",
+        f"<div style='font-weight: 700; color: {status_color};'>"
+        f"{esc(status_icon)} {esc(status_word)}</div>",
+    ]
+    if summary.source_file_name:
+        html.append(
+            "<div style='color: #444444;'>"
+            f"Source: {esc(summary.source_file_name)} "
+            f"<span style='color: #777777;'>({esc(summary.provider_type.upper())})</span>"
+            "</div>"
+        )
+    if summary.import_duration_s is not None:
+        html.append(f"<div style='color: #444444;'>Duration: {summary.import_duration_s:.2f} s</div>")
+
+    html.append(section("Data Summary"))
+    html.append("<table cellspacing='0' cellpadding='0'>")
+    html.append(row("Rows imported", f"{summary.normalized_rows:,}"))
+    if summary.dropped_rows > 0:
+        html.append(row("Rows dropped", f"{summary.dropped_rows:,} data loss", alert=True))
+    if summary.duplicate_timestamps > 0:
+        html.append(row("Duplicate timestamps", f"{summary.duplicate_timestamps:,}", alert=True))
+    if summary.invalid_value_count > 0:
+        html.append(row("Invalid values", f"{summary.invalid_value_count:,}", alert=True))
+    completeness = summary.data_completeness_pct
+    if completeness is not None and summary.total_rows > 0:
+        html.append(row("Data completeness", f"{completeness:.1f}%"))
+    html.append(row("Analog channels", str(summary.analog_channels)))
+    html.append(row("Digital channels", str(summary.digital_channels)))
+    if summary.excluded_column_count > 0:
+        html.append(row("Excluded columns", str(summary.excluded_column_count)))
+    if summary.user_overridden_count > 0:
+        html.append(row("User overrides applied", str(summary.user_overridden_count)))
+    html.append("</table>")
+
+    html.append(section("Timestamp"))
+    html.append("<table cellspacing='0' cellpadding='0'>")
+    if summary.timestamp_column:
+        html.append(row("Column", summary.timestamp_column))
+    html.append(row("Strategy", summary.timestamp_strategy))
+    if summary.timestamp_format:
+        html.append(row("Format", summary.timestamp_format))
+        html.append(row("Format source", summary.timestamp_format_source))
+    if summary.timestamp_confidence is not None:
+        conf_pct = f"{summary.timestamp_confidence * 100:.0f}%"
+        html.append(row("Detection confidence", f"{summary.timestamp_confidence_label} ({conf_pct})"))
+    html.append("</table>")
+    if summary.repair_actions:
+        html.append("<div style='margin-top: 4px; color: #555555;'>Repair actions</div><ul style='margin-top: 2px;'>")
+        html.extend(f"<li>{esc(action)}</li>" for action in summary.repair_actions)
+        html.append("</ul>")
+
+    html.append(section("Channel Classification"))
+    html.append("<table cellspacing='0' cellpadding='0'>")
+    html.append(row("Confidence", summary.classification_confidence_label))
+    if summary.low_confidence_columns:
+        html.append(row("Low-confidence channels", ", ".join(summary.low_confidence_columns), alert=True))
+    html.append("</table>")
+
+    n_errors = len(summary.errors)
+    n_warnings = len(summary.warnings)
+    n_infos = len(summary.infos)
+    if n_errors + n_warnings + n_infos > 0:
+        html.append(section(f"Validation ({n_errors} error(s), {n_warnings} warning(s), {n_infos} info(s))"))
+        html.append("<ul style='margin-top: 2px;'>")
+        for msg in summary.errors:
+            col = f" [{msg.affected_column}]" if msg.affected_column else ""
+            html.append(f"<li style='color: #B71C1C; font-weight: 700;'>ERROR {esc(msg.code)}{esc(col)}: {esc(msg.message)}</li>")
+        for msg in summary.warnings:
+            col = f" [{msg.affected_column}]" if msg.affected_column else ""
+            html.append(f"<li style='color: #B71C1C;'>WARNING {esc(msg.code)}{esc(col)}: {esc(msg.message)}</li>")
+        for msg in summary.infos:
+            col = f" [{msg.affected_column}]" if msg.affected_column else ""
+            html.append(f"<li style='color: #555555;'>INFO {esc(msg.code)}{esc(col)}: {esc(msg.message)}</li>")
+        html.append("</ul>")
+
+    if summary.export_guidance:
+        html.append(section("Export"))
+        html.append("<ul style='margin-top: 2px;'>")
+        html.extend(f"<li>{esc(tip)}</li>" for tip in summary.export_guidance)
+        html.append("</ul>")
+
+    if summary.large_file_guidance:
+        html.append(section("Performance Guidance"))
+        html.append("<ul style='margin-top: 2px;'>")
+        html.extend(f"<li>{esc(tip)}</li>" for tip in summary.large_file_guidance)
+        html.append("</ul>")
+
+    html.append("</div>")
+    return "".join(html)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Qt widget
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,7 +250,7 @@ def render_diagnostics_text(summary: ImportDiagnosticsSummary) -> str:
 class DiagnosticsPanel(QWidget):
     """Read-only engineering diagnostics panel.
 
-    Wraps a QPlainTextEdit to display a formatted ImportDiagnosticsSummary.
+    Wraps a QTextEdit to display a formatted ImportDiagnosticsSummary.
     Keeps the same widget style as the rest of the Import Wizard.
     """
 
@@ -135,7 +258,7 @@ class DiagnosticsPanel(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self._text = QPlainTextEdit()
+        self._text = QTextEdit()
         self._text.setReadOnly(True)
         self._text.setPlaceholderText(
             "Import diagnostics will appear here after a successful import."
@@ -144,7 +267,7 @@ class DiagnosticsPanel(QWidget):
 
     def set_summary(self, summary: ImportDiagnosticsSummary) -> None:
         """Render the diagnostics summary into the panel."""
-        self._text.setPlainText(render_diagnostics_text(summary))
+        self._text.setHtml(render_diagnostics_html(summary))
 
     def set_failure_text(self, text: str) -> None:
         """Show a plain failure/error message (no structured summary available)."""

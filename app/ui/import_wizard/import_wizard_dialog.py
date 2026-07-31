@@ -206,7 +206,7 @@ class ImportWizardDialog(QDialog):
     def __init__(self, parent=None, *, thread_pool=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import Wizard")
-        self.resize(980, 680)
+        self.resize(1120, 720)
         # Accept any object with a .start(worker) interface so tests can inject
         # an ImmediateThreadPool without inheriting from QThreadPool.
         self._thread_pool = thread_pool if thread_pool is not None else QThreadPool.globalInstance()
@@ -308,6 +308,10 @@ class ImportWizardDialog(QDialog):
         self.load_page.path_edit.textEdited.connect(self._on_source_path_edited)
         self.load_page.path_edit.returnPressed.connect(self.profile_selected_file)
         self.timestamp_page.table.clicked.connect(self._on_timestamp_clicked)
+        self.timestamp_page.time_axis_mode_combo.currentIndexChanged.connect(self._on_time_axis_mode_changed)
+        self.timestamp_page.elapsed_unit_combo.currentIndexChanged.connect(self._on_time_axis_mode_changed)
+        self.timestamp_page.synthetic_basis_combo.currentIndexChanged.connect(self._on_time_axis_mode_changed)
+        self.timestamp_page.synthetic_value_edit.textChanged.connect(self._on_time_axis_mode_changed)
         self.timestamp_page.override_edit.textChanged.connect(self._on_timestamp_override_changed)
         self.timestamp_page.reset_button.clicked.connect(self._reset_timestamp_override)
         self.timestamp_page.recon_enable_check.toggled.connect(self._on_recon_setting_changed)
@@ -477,6 +481,13 @@ class ImportWizardDialog(QDialog):
         self._refresh_timestamp_override_feedback()
         self._invalidate_execution_state("Timestamp format override changed.")
 
+    def _on_time_axis_mode_changed(self, *_args) -> None:
+        if self._session is None:
+            return
+        self._sync_timestamp_override_plan()
+        self._refresh_timestamp_override_feedback()
+        self._invalidate_execution_state("Time axis mode changed.")
+
     def _reset_timestamp_override(self) -> None:
         self.timestamp_page.override_edit.clear()
 
@@ -587,7 +598,8 @@ class ImportWizardDialog(QDialog):
             if self._profile.has_errors():
                 return
         elif step == WizardStep.TIMESTAMP_SELECT:
-            if not self.timestamp_model.selected_candidate():
+            mode = self.timestamp_page.selected_time_axis_mode()
+            if mode not in {"sample_index", "synthetic_elapsed"} and not self.timestamp_model.selected_candidate():
                 self.timestamp_page.set_candidate_details(None, None, "Select a timestamp column before continuing.")
                 return
             self._apply_timestamp_selection()
@@ -595,7 +607,7 @@ class ImportWizardDialog(QDialog):
             plan_result = self._rebuild_execution_plan()
             if plan_result is None or plan_result.normalization_plan is None:
                 return
-            if not self.column_model.mappings or all(m.excluded for m in self.column_model.mappings):
+            if not self.column_model.visible_mappings or all(m.excluded for m in self.column_model.visible_mappings):
                 return
         idx = self.stack.currentIndex()
         if idx + 1 < len(_PAGE_STEPS):
@@ -620,7 +632,7 @@ class ImportWizardDialog(QDialog):
         self._plan_build_result = plan_result
 
         if not plan_result.is_executable:
-            error_lines = [m.message for m in plan_result.errors()]
+            error_lines = self._plan_blocking_messages(plan_result)
             QMessageBox.critical(
                 self,
                 "Import Wizard — Cannot Import",
@@ -821,12 +833,21 @@ class ImportWizardDialog(QDialog):
     def _apply_timestamp_selection(self) -> None:
         """Sync the GUI's selected timestamp candidate into the session."""
         candidate = self.timestamp_model.selected_candidate()
-        if self._session is None or candidate is None:
+        if self._session is None:
             return
-        self._session.selected_timestamp_column = candidate.column_name
+        mode = self.timestamp_page.selected_time_axis_mode()
+        if mode in {"sample_index", "synthetic_elapsed"}:
+            candidate = None
+        self._session.time_axis_mode = mode
+        self._session.elapsed_time_unit = self.timestamp_page.selected_elapsed_unit()
+        value = self.timestamp_page.synthetic_timing_value()
+        basis = self.timestamp_page.synthetic_timing_basis()
+        self._session.sample_rate_hz = value if basis == "sample_rate" else None
+        self._session.sample_interval_seconds = value if basis == "sample_interval" else None
+        self._session.selected_timestamp_column = candidate.column_name if candidate is not None else None
         # Mark the candidate as user-selected so best_timestamp_candidate() finds it.
         for c in self._session.timestamp_candidates:
-            c.user_selected = c.column_name == candidate.column_name
+            c.user_selected = candidate is not None and c.column_name == candidate.column_name
         self._sync_timestamp_override_plan()
         self._refresh_timestamp_override_feedback()
 
@@ -834,6 +855,33 @@ class ImportWizardDialog(QDialog):
         """Build the current timestamp repair plan from selection + override."""
         if self._session is None:
             return
+        mode = self.timestamp_page.selected_time_axis_mode()
+        self._session.time_axis_mode = mode
+        self._session.elapsed_time_unit = self.timestamp_page.selected_elapsed_unit()
+        value = self.timestamp_page.synthetic_timing_value()
+        basis = self.timestamp_page.synthetic_timing_basis()
+        self._session.sample_rate_hz = value if basis == "sample_rate" else None
+        self._session.sample_interval_seconds = value if basis == "sample_interval" else None
+
+        if mode == "sample_index":
+            self._session.timestamp_repair_plan = TimestampRepairPlan(
+                strategy=TimestampRepairStrategy.GENERATE_SAMPLE_INDEX,
+                repair_validated=True,
+                repair_notes="Sample index axis generated from row order.",
+            )
+            return
+
+        if mode == "synthetic_elapsed":
+            valid = value is not None and value > 0
+            self._session.timestamp_repair_plan = TimestampRepairPlan(
+                strategy=TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED,
+                sample_rate_hz=self._session.sample_rate_hz,
+                sampling_interval_seconds=self._session.sample_interval_seconds,
+                repair_validated=valid,
+                repair_notes="Synthetic elapsed time generated from row order.",
+            )
+            return
+
         candidate = self.timestamp_model.selected_candidate()
         if candidate is None:
             return
@@ -853,6 +901,16 @@ class ImportWizardDialog(QDialog):
             )
             return
 
+        if mode == "elapsed":
+            self._session.timestamp_repair_plan = TimestampRepairPlan(
+                strategy=TimestampRepairStrategy.PARSE_ELAPSED_TIME,
+                detected_format=candidate.detected_format,
+                elapsed_time_unit=self.timestamp_page.selected_elapsed_unit(),
+                repair_validated=True,
+                repair_notes="Elapsed-time unit selected by operator.",
+            )
+            return
+
         manual_format = self.timestamp_page.override_edit.text().strip()
         if manual_format:
             validation = validate_user_timestamp_format(
@@ -866,6 +924,16 @@ class ImportWizardDialog(QDialog):
                 user_format=manual_format,
                 repair_validated=validation.is_valid,
                 repair_notes=f"User format override: {manual_format}",
+            )
+            return
+
+        elapsed_formats = {"elapsed_seconds", "elapsed_milliseconds", "elapsed_minutes"}
+        if candidate.detected_format in elapsed_formats:
+            self._session.timestamp_repair_plan = TimestampRepairPlan(
+                strategy=TimestampRepairStrategy.PARSE_ELAPSED_TIME,
+                detected_format=candidate.detected_format,
+                elapsed_time_unit=candidate.detected_format,
+                repair_validated=True,
             )
             return
 
@@ -884,6 +952,18 @@ class ImportWizardDialog(QDialog):
 
     def _refresh_timestamp_override_feedback(self) -> None:
         candidate = self.timestamp_model.selected_candidate()
+        mode = self.timestamp_page.selected_time_axis_mode()
+        if mode == "sample_index":
+            self.timestamp_page.set_candidate_details(None, None, "Using sample index axis from row order. No time metadata is required.")
+            return
+        if mode == "synthetic_elapsed":
+            value = self.timestamp_page.synthetic_timing_value()
+            if value is None or value <= 0:
+                self.timestamp_page.set_candidate_details(None, None, "Enter a positive sample rate or sample interval to generate synthetic elapsed time.")
+            else:
+                basis = "sample rate" if self.timestamp_page.synthetic_timing_basis() == "sample_rate" else "sample interval"
+                self.timestamp_page.set_candidate_details(None, None, f"Using synthetic elapsed time from {basis}: {value:g}.")
+            return
         if candidate is None:
             self.timestamp_page.set_candidate_details(None, None, "No timestamp candidate detected.")
             return
@@ -897,22 +977,29 @@ class ImportWizardDialog(QDialog):
             )
             message = validation.validation_messages[0].message if validation.validation_messages else ""
         else:
-            message = (
-                "Manual override is empty; using detected format."
-                if candidate.detected_format
-                else "Manual override is empty; using automatic timestamp parsing."
-            )
+            if candidate.detected_format in {
+                "elapsed_seconds",
+                "elapsed_milliseconds",
+                "elapsed_minutes",
+            }:
+                message = "Using detected relative elapsed-time axis."
+            else:
+                message = (
+                    "Manual override is empty; using detected format."
+                    if candidate.detected_format
+                    else "Manual override is empty; using automatic timestamp parsing."
+                )
         self.timestamp_page.set_candidate_details(
             candidate.column_name,
             candidate.detected_format,
             message,
         )
 
-    def _rebuild_execution_plan(self) -> PlanBuildResult | None:
+    def _sync_execution_plan(self) -> PlanBuildResult | None:
         """Build and cache the execution plan from live GUI state.
 
-        Called when the user advances from the column mapping page so the
-        review page shows validation results derived from the current GUI state.
+        Called when the user advances to or lands on the review page so the
+        review state is never stale, including when using the left step list.
         """
         if self._session is None:
             return None
@@ -922,6 +1009,12 @@ class ImportWizardDialog(QDialog):
         self._plan_build_result = plan_result
         self._normalization_plan = plan_result.normalization_plan
         self._session.normalization_plan = plan_result.normalization_plan
+        return plan_result
+
+    def _rebuild_execution_plan(self) -> PlanBuildResult | None:
+        plan_result = self._sync_execution_plan()
+        if plan_result is None:
+            return None
         self.review_page.refresh(self._session, plan_result.normalization_plan)
         self._update_buttons()
         return plan_result
@@ -956,6 +1049,8 @@ class ImportWizardDialog(QDialog):
             self._max_reached_idx = idx
         if self._session is not None:
             self._session.current_step = step
+        if step == WizardStep.NORMALIZATION_REVIEW:
+            self._sync_execution_plan()
         self._refresh_pages()
         self._update_buttons()
         self._update_step_list()
@@ -970,9 +1065,13 @@ class ImportWizardDialog(QDialog):
     def _update_buttons(self) -> None:
         step = self.current_step
         profile_has_errors = self._profile.has_errors() if self._profile is not None else False
-        has_candidates = bool(self._session and self._session.timestamp_candidates)
-        has_included_columns = bool(self.column_model.mappings) and any(
-            not mapping.excluded for mapping in self.column_model.mappings
+        mode = self.timestamp_page.selected_time_axis_mode()
+        has_candidates = bool(self._session and self._session.timestamp_candidates) or mode in {
+            "sample_index",
+            "synthetic_elapsed",
+        }
+        has_included_columns = bool(self.column_model.visible_mappings) and any(
+            not mapping.excluded for mapping in self.column_model.visible_mappings
         )
         plan_is_executable = (
             self._normalization_plan is not None
@@ -1015,7 +1114,30 @@ class ImportWizardDialog(QDialog):
         self.open_button.setEnabled(state.can_open_waveform)
         self.complete_page.set_export_enabled(state.can_export)
         self.cancel_button.setEnabled(state.can_close)
-        self.workflow_status_label.setText(state.status_text)
+        status_text = state.status_text
+        if step == WizardStep.NORMALIZATION_REVIEW and not state.can_import:
+            issues = self._plan_blocking_messages(self._plan_build_result)
+            if issues:
+                status_text = issues[0]
+        self.workflow_status_label.setText(status_text)
+
+    def _plan_blocking_messages(self, plan_result: PlanBuildResult | None) -> list[str]:
+        if plan_result is None:
+            return ["Execution plan is being prepared. Review will update automatically."]
+        errors = [m.message for m in plan_result.errors()]
+        if errors:
+            return errors
+        plan = plan_result.normalization_plan
+        if plan is None:
+            return ["Execution plan could not be built."]
+        issues: list[str] = []
+        if plan.timestamp_plan is None:
+            issues.append("No validated time-axis repair plan is available.")
+        elif not plan.timestamp_plan.repair_validated:
+            issues.append("The selected time-axis parsing settings are not valid.")
+        if not plan.selected_columns:
+            issues.append("No signal/data columns are selected for import.")
+        return issues or ["Execution plan is not ready to import."]
 
     def _has_discard_risk(self) -> bool:
         if self._import_running or self._export_running:

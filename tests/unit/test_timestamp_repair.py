@@ -11,6 +11,8 @@ from app.import_wizard.timestamp_repair_executor import (
     dispatch,
     execute_combine_date_time_columns,
     execute_excel_serial_conversion,
+    execute_generate_sample_index,
+    execute_generate_synthetic_elapsed,
     execute_interpolate_missing,
     execute_no_repair,
     execute_parse_detected_format,
@@ -63,6 +65,31 @@ class TestNoRepair:
         plan = _plan(TimestampRepairStrategy.NO_REPAIR)
         execute_no_repair(series, plan)
         pd.testing.assert_series_equal(series, original)
+
+
+class TestGeneratedAxes:
+    def test_generate_synthetic_elapsed_from_interval(self):
+        series = pd.Series([0, 0, 0, 0])
+        plan = _plan(
+            TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED,
+            sampling_interval_seconds=0.01,
+        )
+
+        norm, diag, msgs = execute_generate_synthetic_elapsed(series, plan)
+
+        assert norm.notna().all()
+        assert diag.strategy_used == "generate_synthetic_elapsed"
+        assert any(m.code == "TS_SYNTHETIC_ELAPSED_GENERATED" for m in msgs)
+
+    def test_generate_sample_index(self):
+        series = pd.Series([10, 20, 30])
+        plan = _plan(TimestampRepairStrategy.GENERATE_SAMPLE_INDEX)
+
+        norm, diag, msgs = execute_generate_sample_index(series, plan)
+
+        assert norm.notna().all()
+        assert diag.strategy_used == "generate_sample_index"
+        assert any(m.code == "TS_SAMPLE_INDEX_GENERATED" for m in msgs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

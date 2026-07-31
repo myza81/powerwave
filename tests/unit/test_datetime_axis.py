@@ -22,6 +22,7 @@ from app.visualization.axis.datetime_axis import _choose_format
 from app.visualization.axis.datetime_axis import (
     AXIS_MODE_ABSOLUTE,
     AXIS_MODE_RELATIVE,
+    AXIS_MODE_SAMPLE_INDEX,
     TimeDisplayMode,
 )
 
@@ -33,8 +34,14 @@ class TestTimeDisplayMode:
     def test_absolute_value_matches_axis_mode_constant(self) -> None:
         assert TimeDisplayMode.ABSOLUTE.value == AXIS_MODE_ABSOLUTE
 
+    def test_sample_index_value_matches_axis_mode_constant(self) -> None:
+        assert TimeDisplayMode.SAMPLE_INDEX.value == AXIS_MODE_SAMPLE_INDEX
+
     def test_coerce_accepts_legacy_axis_mode_string(self) -> None:
         assert TimeDisplayMode.coerce("absolute_datetime") is TimeDisplayMode.ABSOLUTE
+
+    def test_coerce_accepts_sample_index_string(self) -> None:
+        assert TimeDisplayMode.coerce("sample_index") is TimeDisplayMode.SAMPLE_INDEX
 
 
 class TestChooseFormat:
@@ -106,6 +113,11 @@ class TestDatetimeAxisItemNoStartTime:
     def test_no_start_time_float_format(self, axis) -> None:
         labels = axis.tickStrings([3.5], 1.0, 1.0)
         assert "3.500 s" in labels[0]
+
+    def test_sample_index_mode_returns_plain_index_labels(self, axis) -> None:
+        axis.set_display_mode(TimeDisplayMode.SAMPLE_INDEX)
+        labels = axis.tickStrings([0.0, 1.0, 1000.0], 1.0, 100.0)
+        assert labels == ["0", "1", "1000"]
 
 
 class TestDatetimeAxisItemWithStartTime:

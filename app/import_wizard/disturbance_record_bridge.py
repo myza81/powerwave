@@ -19,6 +19,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 from app.import_wizard.column_mapping import ParameterType
@@ -186,18 +187,25 @@ def _convert(
     """Core conversion — assumes dataset is non-empty."""
 
     # ── Time array ─────────────────────────────────────────────────────────────
-    ts_col = dataset.timestamp_column
-    if ts_col in dataset.data.columns:
-        ts_series = dataset.data[ts_col]
+    if (
+        dataset.time_axis_mode in {"relative_elapsed", "synthetic_elapsed", "sample_index"}
+        and dataset.time_axis_seconds is not None
+    ):
+        time_array, start_time, sample_rate = _build_elapsed_time_array(
+            dataset.time_axis_seconds
+        )
     else:
-        warnings_list.append(
-            f"Timestamp column '{ts_col}' not found; using index-based time."
-        )
-        ts_series = pd.Series(
-            pd.date_range(_EPOCH_FALLBACK, periods=len(dataset.data), freq="1s")
-        )
-
-    time_array, start_time, sample_rate = build_time_array(ts_series)
+        ts_col = dataset.timestamp_column
+        if ts_col in dataset.data.columns:
+            ts_series = dataset.data[ts_col]
+        else:
+            warnings_list.append(
+                f"Timestamp column '{ts_col}' not found; using index-based time."
+            )
+            ts_series = pd.Series(
+                pd.date_range(_EPOCH_FALLBACK, periods=len(dataset.data), freq="1s")
+            )
+        time_array, start_time, sample_rate = build_time_array(ts_series)
 
     # ── Parameter partitioning ─────────────────────────────────────────────────
     analog_params, digital_params = partition_parameters(dataset.parameters)
@@ -261,6 +269,8 @@ def _convert(
     timing_info = TimingInformation(
         start_time=start_time,
         trigger_time=start_time,  # no trigger info in CSV/Excel imports
+        timing_reference=dataset.time_axis_mode,
+        time_axis_unit=dataset.time_axis_unit,
     )
 
     # ── Sampling ───────────────────────────────────────────────────────────────
@@ -289,6 +299,28 @@ def _convert(
         validation_errors=validation_errors,
         warnings=warnings_list,
     )
+
+
+def _build_elapsed_time_array(
+    seconds_series: pd.Series,
+) -> tuple[np.ndarray, datetime, float]:
+    """Build DisturbanceRecord timing from an authoritative elapsed-seconds axis."""
+    numeric: pd.Series = pd.to_numeric(seconds_series, errors="coerce")  # type: ignore[assignment]
+    numeric = numeric.interpolate(method="linear", limit_direction="both")
+    time_array = numeric.to_numpy(dtype=np.float64)
+
+    valid = time_array[np.isfinite(time_array)]
+    if len(valid) < 2:
+        return time_array, _EPOCH_FALLBACK, 0.0
+
+    diffs = np.diff(valid)
+    pos_diffs = diffs[diffs > 0]
+    if len(pos_diffs) == 0:
+        sample_rate = 0.0
+    else:
+        median_dt = float(np.median(pos_diffs))
+        sample_rate = round(1.0 / median_dt, 6) if median_dt > 0 else 0.0
+    return time_array, _EPOCH_FALLBACK, sample_rate
 
 
 def _resolve_station_name(

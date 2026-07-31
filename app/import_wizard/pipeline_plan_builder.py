@@ -102,7 +102,17 @@ def build_execution_plan(
 
     # ── Step 1: Resolve the authoritative timestamp candidate ─────────────────
     candidate = session.best_timestamp_candidate()
-    if candidate is None:
+    generated_axis = (
+        session.timestamp_repair_plan is not None
+        and session.timestamp_repair_plan.strategy
+        in {
+            TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED,
+            TimestampRepairStrategy.GENERATE_SAMPLE_INDEX,
+        }
+    )
+    if generated_axis:
+        candidate = None
+    if candidate is None and not generated_axis:
         messages.append(ValidationMessage(
             severity=ValidationSeverity.ERROR,
             code="PLAN_NO_TIMESTAMP",
@@ -116,12 +126,33 @@ def build_execution_plan(
     if session.timestamp_repair_plan is not None:
         repair_plan = session.timestamp_repair_plan
     else:
+        assert candidate is not None
         repair_plan = _derive_repair_plan(candidate)
     repair_plan, repair_messages = _validate_repair_plan(repair_plan, candidate)
     messages.extend(repair_messages)
+    if (
+        candidate is not None
+        and candidate.duplicate_sample_count > 0
+        and repair_plan.strategy
+        not in {
+            TimestampRepairStrategy.GENERATE_SAMPLE_INDEX,
+            TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED,
+        }
+    ):
+        messages.append(ValidationMessage(
+            severity=ValidationSeverity.WARNING,
+            code="PLAN_DUPLICATE_TIMESTAMP_PREVIEW",
+            message=(
+                f"Selected time column '{candidate.column_name}' has "
+                f"{candidate.duplicate_sample_count} duplicate timestamp(s) in the preview sample. "
+                "Different values at the same timestamp can collapse on the waveform x-axis. "
+                "Use Sample index mode when the file only has sequence/category timing."
+            ),
+            affected_column=candidate.column_name,
+        ))
 
     # ── Step 3: Build column mapping from GUI state ───────────────────────────
-    ts_col = candidate.column_name
+    ts_col = candidate.column_name if candidate is not None else None
     selected: list[str] = []
     excluded: list[str] = []
     renames: dict[str, str] = {}
@@ -135,7 +166,7 @@ def build_execution_plan(
         src = mapping.source_name
 
         # Timestamp column and any TIMESTAMP-typed column are always excluded.
-        if src == ts_col or mapping.effective_type == ParameterType.TIMESTAMP:
+        if (ts_col is not None and src == ts_col) or mapping.effective_type == ParameterType.TIMESTAMP:
             excluded.append(src)
             continue
 
@@ -232,6 +263,15 @@ def _derive_repair_plan(candidate: TimestampCandidate) -> TimestampRepairPlan:
             repair_notes=f"Derived from {fmt} column.",
         )
 
+    if fmt in ("elapsed_seconds", "elapsed_milliseconds", "elapsed_minutes"):
+        return TimestampRepairPlan(
+            strategy=TimestampRepairStrategy.PARSE_ELAPSED_TIME,
+            detected_format=fmt,
+            elapsed_time_unit=fmt,
+            repair_validated=True,
+            repair_notes=f"Derived from {fmt} duration column.",
+        )
+
     if fmt is not None:
         return TimestampRepairPlan(
             strategy=TimestampRepairStrategy.PARSE_DETECTED_FORMAT,
@@ -249,7 +289,7 @@ def _derive_repair_plan(candidate: TimestampCandidate) -> TimestampRepairPlan:
 
 def _validate_repair_plan(
     repair_plan: TimestampRepairPlan,
-    candidate: TimestampCandidate,
+    candidate: TimestampCandidate | None,
 ) -> tuple[TimestampRepairPlan, list[ValidationMessage]]:
     """Validate timestamp repair settings before execution.
 
@@ -257,8 +297,35 @@ def _validate_repair_plan(
     timestamp; complete failure blocks execution instead of falling back to the
     detected format.
     """
+    if repair_plan.strategy == TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED:
+        interval = repair_plan.sampling_interval_seconds
+        sample_rate = repair_plan.sample_rate_hz
+        if interval is not None and interval > 0:
+            return repair_plan, []
+        if sample_rate is not None and sample_rate > 0:
+            return repair_plan, []
+        return repair_plan, [
+            ValidationMessage(
+                severity=ValidationSeverity.ERROR,
+                code="PLAN_INVALID_SYNTHETIC_TIMING",
+                message="Synthetic time requires a positive sample rate or sample interval.",
+            )
+        ]
+
+    if repair_plan.strategy == TimestampRepairStrategy.GENERATE_SAMPLE_INDEX:
+        return repair_plan, []
+
     if repair_plan.strategy != TimestampRepairStrategy.PARSE_USER_FORMAT:
         return repair_plan, []
+
+    if candidate is None:
+        return repair_plan, [
+            ValidationMessage(
+                severity=ValidationSeverity.ERROR,
+                code="PLAN_NO_TIMESTAMP",
+                message="A timestamp column is required for timestamp format parsing.",
+            )
+        ]
 
     fmt = (repair_plan.user_format or "").strip()
     if not fmt:

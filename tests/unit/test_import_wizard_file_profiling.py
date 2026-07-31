@@ -7,6 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 from app.import_wizard.contracts import ValidationSeverity
@@ -40,6 +41,18 @@ def _sample_csv_rows() -> list[list[str]]:
         ["2024-01-01 00:00:02", "230.0", "100.1", "22.9", "49.99"],
         ["2024-01-01 00:00:03", "230.3", "100.4", "23.2", "50.02"],
     ]
+
+
+def _write_xlsx(rows: list[list[object]], tmp_path: Path) -> str:
+    path = tmp_path / "sample.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Loss of 2000MW"
+    for row in rows:
+        ws.append(row)
+    wb.save(path)
+    return str(path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,6 +319,27 @@ class TestProfileImportFile:
         os.unlink(path)
         error_msgs = [m for m in result.validation_messages if m.severity == ValidationSeverity.ERROR]
         assert error_msgs == []
+
+    def test_excel_title_row_then_elapsed_time_header(self, tmp_path):
+        path = _write_xlsx([
+            [r"D:\Study_frequency\Loss of 2000MW.out", None, None, None],
+            ["Time", "1 - KAWA FREQ", "2 - TIE LINE 1", "3 - TIE LINE 2"],
+            [-0.002, 0.0, -0.673291, -0.673291],
+            [0.008, 0.00000542871, -0.671219, -0.671219],
+            [0.018, 0.00000524838, -0.669146, -0.669146],
+        ], tmp_path)
+        result = profile_import_file(path)
+        assert not result.has_errors()
+        assert result.raw_preview.header_row_index == 1
+        assert result.raw_preview.column_names[:4] == [
+            "Time",
+            "1 - KAWA FREQ",
+            "2 - TIE LINE 1",
+            "3 - TIE LINE 2",
+        ]
+        assert result.timestamp_candidates
+        assert result.timestamp_candidates[0].column_name == "Time"
+        assert result.timestamp_candidates[0].detected_format == "elapsed_seconds"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

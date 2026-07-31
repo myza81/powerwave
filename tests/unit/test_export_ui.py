@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pandas as pd
 import pytest
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QSizePolicy
 
 from app.import_wizard import (
     ExportWriteOptions,
@@ -124,6 +125,23 @@ def test_save_normalized_action_enabled_on_success(qapp, tmp_path) -> None:
     dlg = _dialog_with_result(qapp, _dataset(tmp_path / "source.csv"))
     try:
         assert dlg.complete_page.save_normalized_button.isEnabled()
+    finally:
+        dlg.close()
+        qapp.processEvents()
+
+
+def test_save_normalized_guidance_and_status_use_readable_full_width_blocks(qapp, tmp_path) -> None:
+    dlg = _dialog_with_result(qapp, _dataset(tmp_path / "source.csv"))
+    try:
+        page = dlg.complete_page
+
+        assert page.export_guidance.wordWrap()
+        assert page.export_status.wordWrap()
+        assert page.export_guidance.minimumHeight() >= 46
+        assert page.export_status.minimumHeight() >= 82
+        assert page.export_guidance.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Expanding
+        assert page.export_status.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Expanding
+        assert "Normalized dataset is ready to export." in page.export_status.text()
     finally:
         dlg.close()
         qapp.processEvents()

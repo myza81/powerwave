@@ -29,7 +29,7 @@ from PyQt6.QtCore import Qt
 
 _CSS = """
 <style>
-body  { font-family: 'Segoe UI', Arial, sans-serif; font-size: 9pt;
+body  { font-family: Arial, 'Helvetica Neue', 'Segoe UI'; font-size: 9pt;
         color: #DDDDDD; background-color: #1E1E1E; margin: 14px 18px; }
 h2    { color: #5BA4FF; margin-top: 0; margin-bottom: 6px;
         border-bottom: 1px solid #3A3A3A; padding-bottom: 5px; font-size: 13pt; }
@@ -37,7 +37,7 @@ h3    { color: #80C8FF; margin-top: 14px; margin-bottom: 3px; font-size: 10pt; }
 h4    { color: #AACCEA; margin-top: 10px; margin-bottom: 2px; font-size: 9pt; }
 p     { margin-top: 3px; margin-bottom: 6px; line-height: 1.55; }
 code  { background-color: #2A2A2A; color: #F0C060; padding: 1px 5px;
-        font-family: Consolas, 'Courier New', monospace; font-size: 8.5pt; }
+        font-family: Menlo, Consolas, 'Courier New'; font-size: 8.5pt; }
 ul    { margin-top: 2px; margin-bottom: 8px; padding-left: 18px; }
 ol    { margin-top: 2px; margin-bottom: 8px; padding-left: 20px; }
 li    { margin-bottom: 4px; line-height: 1.5; }

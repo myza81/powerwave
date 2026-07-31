@@ -28,6 +28,9 @@ _STRATEGY_DESCRIPTIONS: dict[str, str] = {
     "combine_date_time_columns": "Date and time columns merged",
     "excel_serial_conversion": "Excel date serial numbers converted",
     "timezone_alignment": "Timestamps converted to target timezone",
+    "parse_elapsed_time": "Relative elapsed time converted to seconds",
+    "generate_synthetic_elapsed": "Synthetic elapsed time generated from sample rate or interval",
+    "generate_sample_index": "Sample index axis generated",
 }
 
 
@@ -203,6 +206,20 @@ def _build_repair_actions(result) -> list[str]:  # type: ignore[type-arg]
             actions.append("Date and time columns merged into a single timestamp")
         elif strategy_val == "excel_serial_conversion":
             actions.append("Excel date serial numbers converted to datetime")
+        elif strategy_val == "parse_elapsed_time":
+            unit = getattr(repair_plan, "elapsed_time_unit", None) or "seconds"
+            actions.append(f"Relative elapsed time converted from {unit} to seconds")
+        elif strategy_val == "generate_synthetic_elapsed":
+            interval = getattr(repair_plan, "sampling_interval_seconds", None)
+            sample_rate = getattr(repair_plan, "sample_rate_hz", None)
+            if sample_rate is not None:
+                actions.append(f"Synthetic elapsed time generated from {sample_rate:g} Hz sample rate")
+            elif interval is not None:
+                actions.append(f"Synthetic elapsed time generated from {interval:g} s sample interval")
+            else:
+                actions.append("Synthetic elapsed time generated from row order")
+        elif strategy_val == "generate_sample_index":
+            actions.append("Sample index axis generated from row order")
 
         if repair_plan.user_format:
             actions.append(f"User-specified format applied: {repair_plan.user_format}")

@@ -64,7 +64,8 @@ from PyQt6.QtWidgets import (
 )
 
 from app.ui.session.legend_widget import ChannelLegendWidget
-from app.visualization.axis.datetime_axis import DatetimeAxisItem
+from app.visualization.axis_management import AxisDisplayMode, axis_group_for_signal
+from app.visualization.axis.datetime_axis import DatetimeAxisItem, TimeDisplayMode
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +214,7 @@ class _RightAxisManager:
 
         vb = pg.ViewBox()
         vb.setXLink(self._primary)
+        vb.setZValue(_SECONDARY_AXIS_Z)
         scene = self._primary.scene()
         if scene is not None:
             scene.addItem(vb)
@@ -255,6 +257,9 @@ class _RightAxisManager:
         self._entries.clear()
         self._next_col = 1
 
+    def sync(self) -> None:
+        self._sync()
+
     def _sync(self) -> None:
         primary_vb = self._primary.getViewBox()
         rect = primary_vb.sceneBoundingRect()
@@ -273,6 +278,8 @@ _STYLE_MAP = {
     "dashed": Qt.PenStyle.DashLine,
     "dotted": Qt.PenStyle.DotLine,
 }
+
+_SECONDARY_AXIS_Z = 100
 
 
 def _migrate_item(item: pg.PlotDataItem, old_vb: pg.ViewBox, new_vb: pg.ViewBox) -> None:
@@ -329,6 +336,7 @@ class _CurveMetadata:
     line_style: str = "solid"
     line_width: float = 1.0
     y_axis_side: str = "left"
+    signal_type: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +394,7 @@ class SessionCanvasWidget(QWidget):
         self._cursor_sync: bool = True                 # mirrors controller state for menu display
         self._metadata: dict[tuple[str, str], _CurveMetadata] = {}
         self._digital_n_rows: int = 0                  # 0 = not a digital panel
+        self._time_axis_mode = TimeDisplayMode.RELATIVE
 
         self._annotations: dict[str, pg.InfiniteLine] = {}
         self._annot_counter: int = 0
@@ -613,7 +622,7 @@ class SessionCanvasWidget(QWidget):
         self._annotations.clear()
 
     def set_mergeable_panels(self, panels: list[tuple[str, str]]) -> None:
-        """Update the panel list shown in the "Merge with →" submenu."""
+        """Update the panel list shown in the merge submenu."""
         self._mergeable_panels = panels
 
     def _show_panel_menu(self, pos) -> None:
@@ -633,7 +642,7 @@ class SessionCanvasWidget(QWidget):
 
         menu.addSeparator()
         # ── Panel layout ─────────────────────────────────────────────────────
-        merge_menu = menu.addMenu("Merge with →")
+        merge_menu = menu.addMenu("Merge Into This Panel →")
         if self._mergeable_panels:
             for pid, ptitle in self._mergeable_panels:
                 act = merge_menu.addAction(ptitle)
@@ -673,21 +682,71 @@ class SessionCanvasWidget(QWidget):
 
     def normalize_viewport(self, t_start: float, t_end: float) -> None:
         self._primary_plot.setXRange(t_start, t_end, padding=0)
+        self.refresh_render_state()
 
     def getViewBox(self) -> pg.ViewBox:
         return self._primary_plot.getViewBox()
+
+    def refresh_render_state(self) -> None:
+        """Resync overlaid axes after layout, theme, or viewport changes."""
+        self._right_mgr.sync()
+        self._refresh_y_ranges()
 
     # ─────────────────────────────────────────────────────────────────────────
     # ViewBox resolution helpers (S1)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _resolve_viewbox(self, y_axis_side: str, unit: str | None, color: str) -> pg.ViewBox:
+    def _resolve_viewbox(
+        self,
+        y_axis_side: str,
+        unit: str | None,
+        color: str,
+        *,
+        channel_name: str = "",
+        signal_type: str | None = None,
+    ) -> pg.ViewBox:
         """Return the ViewBox for a curve given its axis side and unit."""
         if y_axis_side == "right":
-            norm_unit = (unit or "other").lower().strip() or "other"
-            label = unit or "Level"
-            return self._right_mgr.get_or_create(norm_unit, label, color)
+            group = axis_group_for_signal(
+                channel_name,
+                unit,
+                mode=AxisDisplayMode.SHARED,
+                signal_type_hint=signal_type,
+            )
+            label = group.label.unit or group.label.text
+            return self._right_mgr.get_or_create(group.key, label, color)
         return self._primary_plot.getViewBox()
+
+    def _refresh_y_ranges(self) -> None:
+        data_by_viewbox: dict[pg.ViewBox, list[np.ndarray]] = {}
+        for key, meta in self._metadata.items():
+            if not meta.visible:
+                continue
+            curve = self._curves.get(key)
+            if curve is None or not curve.isVisible():
+                continue
+            _, y_data = curve.getData()
+            if y_data is None or len(y_data) == 0:
+                continue
+            viewbox = curve.getViewBox()
+            if viewbox is None:
+                continue
+            data_by_viewbox.setdefault(viewbox, []).append(
+                np.asarray(y_data, dtype=np.float64)
+            )
+        for viewbox, series_list in data_by_viewbox.items():
+            finite_parts = [
+                data[np.isfinite(data)]
+                for data in series_list
+                if len(data[np.isfinite(data)]) > 0
+            ]
+            if not finite_parts:
+                continue
+            finite = np.concatenate(finite_parts)
+            y_min = float(np.min(finite))
+            y_max = float(np.max(finite))
+            pad = max(abs(y_min) * 0.05, 1.0) if y_min == y_max else max((y_max - y_min) * 0.05, 1e-9)
+            viewbox.setYRange(y_min - pad, y_max + pad, padding=0)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Curve management
@@ -708,17 +767,27 @@ class SessionCanvasWidget(QWidget):
         line_style: str = "solid",
         line_width: float = 1.0,
         y_axis_side: str = "left",
+        signal_type: str | None = None,
     ) -> None:
         key = (source_id, channel_name)
         pen = pg.mkPen(color, width=line_width, style=_STYLE_MAP.get(line_style, Qt.PenStyle.SolidLine))
 
-        target_vb = self._resolve_viewbox(y_axis_side, unit, color)
+        target_vb = self._resolve_viewbox(
+            y_axis_side,
+            unit,
+            color,
+            channel_name=channel_name,
+            signal_type=signal_type,
+        )
         existing_meta = self._metadata.get(key)
 
         if key not in self._curves:
             curve = pg.PlotDataItem(pen=pen, skipFiniteCheck=True)
-            curve.setClipToView(True)
-            curve.setDownsampling(auto=True, method="peak")
+            curve.setClipToView(target_vb is self._primary_plot.getViewBox())
+            if target_vb is self._primary_plot.getViewBox():
+                curve.setDownsampling(auto=True, method="peak")
+            else:
+                curve.setZValue(_SECONDARY_AXIS_Z + 1)
             target_vb.addItem(curve)
             self._curves[key] = curve
         else:
@@ -726,12 +795,22 @@ class SessionCanvasWidget(QWidget):
             # Migrate ViewBox if axis side or unit changed
             if existing_meta is not None:
                 old_vb = self._resolve_viewbox(
-                    existing_meta.y_axis_side, existing_meta.unit, existing_meta.colour
+                    existing_meta.y_axis_side,
+                    existing_meta.unit,
+                    existing_meta.colour,
+                    channel_name=existing_meta.channel_name,
+                    signal_type=existing_meta.signal_type,
                 )
                 if old_vb is not target_vb:
                     _migrate_item(self._curves[key], old_vb, target_vb)
 
         curve = self._curves[key]
+        curve.setClipToView(target_vb is self._primary_plot.getViewBox())
+        curve.setZValue(
+            _SECONDARY_AXIS_Z + 1
+            if target_vb is not self._primary_plot.getViewBox()
+            else 0
+        )
         if len(time) > 0 and len(values) > 0:
             curve.setData(x=time, y=values)
         else:
@@ -750,7 +829,9 @@ class SessionCanvasWidget(QWidget):
             line_style=line_style,
             line_width=line_width,
             y_axis_side=y_axis_side,
+            signal_type=signal_type,
         )
+        self._refresh_y_ranges()
         self.legend.upsert_row(
             source_id, channel_name, eff_display, source_badge, unit, color, visible
         )
@@ -790,11 +871,24 @@ class SessionCanvasWidget(QWidget):
         curve = self._curves.get(key)
         if meta is None or curve is None or meta.y_axis_side == side:
             return
-        old_vb = self._resolve_viewbox(meta.y_axis_side, meta.unit, meta.colour)
-        new_vb = self._resolve_viewbox(side, meta.unit, meta.colour)
+        old_vb = self._resolve_viewbox(
+            meta.y_axis_side,
+            meta.unit,
+            meta.colour,
+            channel_name=meta.channel_name,
+            signal_type=meta.signal_type,
+        )
+        new_vb = self._resolve_viewbox(
+            side,
+            meta.unit,
+            meta.colour,
+            channel_name=meta.channel_name,
+            signal_type=meta.signal_type,
+        )
         if old_vb is not new_vb:
             _migrate_item(curve, old_vb, new_vb)
         meta.y_axis_side = side
+        self._refresh_y_ranges()
 
     def set_curve_visible(
         self, source_id: str, channel_name: str, visible: bool
@@ -811,6 +905,7 @@ class SessionCanvasWidget(QWidget):
         if meta is not None:
             meta.visible = visible
         self.legend.update_row_visible(source_id, channel_name, visible)
+        self._refresh_y_ranges()
 
     def update_digital_curve(
         self,
@@ -898,6 +993,8 @@ class SessionCanvasWidget(QWidget):
                 meta.y_axis_side if meta else "left",
                 meta.unit if meta else None,
                 meta.colour if meta else "#AAAAAA",
+                channel_name=meta.channel_name if meta else channel_name,
+                signal_type=meta.signal_type if meta else None,
             )
             try:
                 vb.removeItem(curve)
@@ -907,6 +1004,7 @@ class SessionCanvasWidget(QWidget):
         self.remove_phasor_curve(source_id, channel_name)
         self.remove_harmonic_curves(source_id, channel_name)
         self.legend.remove_row(source_id, channel_name)
+        self._refresh_y_ranges()
 
     def remove_source(self, source_id: str) -> None:
         for key in [k for k in self._digital_hi_curves if k[0] == source_id]:
@@ -919,6 +1017,8 @@ class SessionCanvasWidget(QWidget):
                 meta.y_axis_side if meta else "left",
                 meta.unit if meta else None,
                 meta.colour if meta else "#AAAAAA",
+                channel_name=meta.channel_name if meta else key[1],
+                signal_type=meta.signal_type if meta else None,
             )
             try:
                 vb.removeItem(curve)
@@ -939,6 +1039,7 @@ class SessionCanvasWidget(QWidget):
         self.legend.remove_source_rows(source_id)
         self.remove_zero_line(source_id)
         self.remove_trigger_marker(source_id)
+        self._refresh_y_ranges()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Zero-line markers (source time-offset indicators)
@@ -1032,6 +1133,8 @@ class SessionCanvasWidget(QWidget):
             meta.y_axis_side if meta else "left",
             meta.unit if meta else unit,
             color,
+            channel_name=meta.channel_name if meta else channel_name,
+            signal_type=meta.signal_type if meta else None,
         )
 
         if key not in self._rms_curves:
@@ -1126,6 +1229,8 @@ class SessionCanvasWidget(QWidget):
             meta.y_axis_side if meta else "left",
             meta.unit if meta else None,
             color,
+            channel_name=meta.channel_name if meta else channel_name,
+            signal_type=meta.signal_type if meta else None,
         )
 
         if key not in self._phasor_curves:
@@ -1190,6 +1295,8 @@ class SessionCanvasWidget(QWidget):
             meta.y_axis_side if meta else "left",
             meta.unit if meta else None,
             meta.colour if meta else "#AAAAAA",
+            channel_name=meta.channel_name if meta else channel_name,
+            signal_type=meta.signal_type if meta else None,
         )
 
         if key not in self._harmonic_curves:
@@ -1549,17 +1656,32 @@ class SessionCanvasWidget(QWidget):
 
     def set_time_reference(self, reference_time: datetime) -> None:
         """Switch the X-axis to absolute wall-clock labels anchored at reference_time."""
-        bottom = self._primary_plot.getAxis("bottom")
-        if isinstance(bottom, DatetimeAxisItem):
-            self._datetime_axis = bottom
-            bottom.set_start_time(reference_time)
+        self.set_time_axis_mode(
+            TimeDisplayMode.ABSOLUTE,
+            axis_reference_time=reference_time,
+        )
 
     def clear_time_reference(self) -> None:
         """Revert the X-axis to elapsed-seconds labels."""
+        self.set_time_axis_mode(TimeDisplayMode.RELATIVE)
+
+    def set_sample_index_axis(self) -> None:
+        """Render x-axis coordinates as sample ordinals instead of time."""
+        self.set_time_axis_mode(TimeDisplayMode.SAMPLE_INDEX)
+
+    def set_time_axis_mode(
+        self,
+        mode: TimeDisplayMode | str,
+        *,
+        axis_reference_time: datetime | None = None,
+    ) -> None:
+        """Switch the X-axis tick formatter."""
+        display_mode = TimeDisplayMode.coerce(mode)
+        self._time_axis_mode = display_mode
         bottom = self._primary_plot.getAxis("bottom")
         if isinstance(bottom, DatetimeAxisItem):
             self._datetime_axis = bottom
-            bottom.set_start_time(None)
+            bottom.set_display_mode(display_mode, start_time=axis_reference_time)
 
     def set_panel_title(self, title: str) -> None:
         self._panel_title = title
@@ -1619,6 +1741,8 @@ class SessionCanvasWidget(QWidget):
                 meta.y_axis_side if meta else "left",
                 meta.unit if meta else None,
                 meta.colour if meta else "#AAAAAA",
+                channel_name=meta.channel_name if meta else key[1],
+                signal_type=meta.signal_type if meta else None,
             )
             try:
                 vb.removeItem(curve)

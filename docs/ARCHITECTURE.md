@@ -295,6 +295,7 @@ Time Alignment
 Requirements:
 
 precise timestamp handling
+relative elapsed-time handling for duration-based waveform records
 cross-source synchronization capability
 PROVIDER PATTERN ARCHITECTURE
 

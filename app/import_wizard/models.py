@@ -70,6 +70,8 @@ class TimestampCandidate:
     detected_format     strptime format string inferred from example values.
     example_values      Small sample of raw cell values used for detection.
     invalid_sample_count  Number of cells that failed to parse with detected_format.
+    duplicate_sample_count  Number of duplicate parsed timestamp values in the
+                        preview sample. The first occurrence is not counted.
     timezone_detected   IANA timezone string if one was embedded in the values.
     user_selected       True when the user explicitly chose this column.
     """
@@ -80,6 +82,7 @@ class TimestampCandidate:
     detected_format: str | None = None
     example_values: list[str] = field(default_factory=list)
     invalid_sample_count: int = 0
+    duplicate_sample_count: int = 0
     timezone_detected: str | None = None
     user_selected: bool = False
 
@@ -189,6 +192,10 @@ class ImportWizardSession:
     raw_preview: RawPreviewModel | None = None
     timestamp_candidates: list[TimestampCandidate] = field(default_factory=list)
     selected_timestamp_column: str | None = None
+    time_axis_mode: str = "auto"
+    elapsed_time_unit: str | None = None
+    sample_rate_hz: float | None = None
+    sample_interval_seconds: float | None = None
     timestamp_repair_plan: TimestampRepairPlan | None = None
     column_mappings: list[ColumnMappingCandidate] = field(default_factory=list)
     normalization_plan: NormalizationPlan | None = None

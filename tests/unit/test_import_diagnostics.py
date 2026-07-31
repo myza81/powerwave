@@ -58,6 +58,7 @@ from app.import_wizard.normalized_dataset import (
 )
 from app.import_wizard.timestamp_contracts import TimestampRepairPlan, TimestampRepairStrategy
 from app.ui.import_wizard.diagnostics_panel import render_diagnostics_text
+from app.ui.import_wizard.diagnostics_panel import render_diagnostics_html
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -600,6 +601,19 @@ def test_render_text_includes_all_sections() -> None:
     assert "50" in text   # normalized rows
     assert "2" in text    # dropped rows
     assert "test warning" in text
+
+
+def test_render_html_uses_structured_sections_and_alert_colour() -> None:
+    dataset = _make_dataset(rows=50, dropped=2, duplicates=1)
+    result = _make_result(dataset=dataset)
+    summary = build_import_diagnostics(result)
+    html = render_diagnostics_html(summary)
+
+    assert "Data Summary" in html
+    assert "Timestamp" in html
+    assert "Channel Classification" in html
+    assert "Rows imported" in html
+    assert "#B71C1C" in html
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -21,13 +21,21 @@ class SamplingInformation:
 
 @dataclass(slots=True)
 class TimingInformation:
-    """Absolute time references for a disturbance recording."""
+    """Time references for a disturbance recording.
+
+    timing_reference is "absolute" when start_time/trigger_time are real
+    recording timestamps, and "relative_elapsed" when waveform_data["time"] is
+    the authoritative duration axis and start_time is only a compatibility
+    anchor.
+    """
 
     start_time: datetime
     trigger_time: datetime
 
     time_multiplier: float = 1.0
     timezone: str | None = None
+    timing_reference: str = "absolute"
+    time_axis_unit: str | None = None
 
 
 @dataclass(slots=True)

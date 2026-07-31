@@ -307,11 +307,17 @@ def assemble_normalized_dataset(
 
     data_df.insert(0, _TIMESTAMP_COLUMN, ts_series.values)
     data_df = data_df.reset_index(drop=True)
+    time_axis_seconds = None
+    if timestamp_result.elapsed_seconds is not None:
+        time_axis_seconds = timestamp_result.elapsed_seconds.reset_index(drop=True)
 
     # ── Drop NaT timestamp rows ────────────────────────────────────────────────
     pre_drop = len(data_df)
     if drop_nat_rows:
-        data_df = data_df[data_df[_TIMESTAMP_COLUMN].notna()].reset_index(drop=True)
+        valid_ts_mask = data_df[_TIMESTAMP_COLUMN].notna()
+        data_df = data_df[valid_ts_mask].reset_index(drop=True)
+        if time_axis_seconds is not None:
+            time_axis_seconds = time_axis_seconds[valid_ts_mask].reset_index(drop=True)
     dropped_rows = pre_drop - len(data_df)
 
     # ── Post-assembly statistics ───────────────────────────────────────────────
@@ -359,5 +365,8 @@ def assemble_normalized_dataset(
         source_path=source_path,
         source_file_name=source_file_name,
         timestamp_repair_strategy=repair_strategy,
+        time_axis_mode=timestamp_result.time_axis_mode,
+        time_axis_unit=timestamp_result.time_axis_unit,
+        time_axis_seconds=time_axis_seconds,
         is_valid=is_valid,
     )

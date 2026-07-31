@@ -11,7 +11,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QSizePolicy
 
 from app.import_wizard.column_mapping import ParameterType
 from app.import_wizard.contracts import ValidationSeverity
@@ -109,6 +109,21 @@ def test_valid_override_preview_feedback() -> None:
     assert result.is_valid
     assert result.parsed_count == 2
     assert result.validation_messages[0].code == "PLAN_TIMESTAMP_FORMAT_VALID"
+
+
+def test_format_override_layout_uses_readable_full_width_fields(monkeypatch, qapp, local_tmp) -> None:
+    dlg = _dialog(monkeypatch, local_tmp)
+    try:
+        page = dlg.timestamp_page
+
+        assert page.override_edit.minimumWidth() >= 320
+        assert page.message_label.wordWrap()
+        assert page.message_label.minimumHeight() >= 54
+        assert page.message_label.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Expanding
+        assert "Manual override" in page.message_label.text()
+    finally:
+        dlg.close()
+        qapp.processEvents()
 
 
 def test_invalid_override_validation_error() -> None:

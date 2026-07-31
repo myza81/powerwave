@@ -51,9 +51,44 @@ Visualization Manager
 │  (N-Axis analog canvas) │  │  (digital state tracks)   │
 └─────────────────────────┘  └──────────────────────────┘
         ↓                              ↓
-PyQtGraph Rendering Engine  (shared X-axis time domain)
+PyQtGraph Rendering Engine  (shared X-axis domain)
         ↓
 OpenGL Rendering Pipeline
+
+X-AXIS CONTRACT
+
+Visualization consumes DisturbanceRecord.waveform_data["time"] as the
+authoritative X-axis.
+
+Supported representations:
+
+float64 seconds for absolute, relative elapsed, and synthetic elapsed axes
+float64 sample indices for sample-index axes
+
+Supported source semantics:
+
+absolute timestamp source
+    The time column is seconds elapsed from the real first-sample timestamp.
+
+relative elapsed-time source
+    The time column is the source duration axis converted to seconds. The
+    display SHALL show elapsed time values, not a synthetic calendar timestamp.
+
+synthetic elapsed source
+    The time column is generated from row order and an operator-provided sample
+    rate or interval. The display SHALL label it as elapsed time and indicate
+    synthetic timing in cursor/diagnostic wording when available.
+
+sample-index source
+    The X-axis is ordered sample number only. The display SHALL label it as
+    Sample Index, not Time (s). Sample-index axes SHALL NOT be used for duration
+    measurement, frequency inference, event timing, or cross-record time
+    synchronization.
+
+The visualization layer SHALL remain parser-agnostic. It may inspect normalized
+TimingInformation or metadata to choose axis labels and cursor readout wording,
+but it SHALL NOT re-parse source files or infer file-format-specific timing
+rules.
 
 PRIMARY VISUALIZATION COMPONENTS
 
@@ -80,7 +115,7 @@ Powerwave uses SIGRA-style N-Axis Single Canvas visualization for analog signals
 
 Architecture mandates:
 
-One shared X-axis (time domain) across all parameters
+One shared X-axis across all parameters in a record
 One independent ViewBox per analog parameter
 One color-coded AxisItem per parameter
 N ViewBoxes = N independent Y-axis scales
@@ -91,7 +126,7 @@ This provides:
 True independent Y-axis scaling per parameter
 No fixed stacking layout (all parameters co-exist on one canvas)
 Engineering-grade multi-parameter comparison at a glance
-Shared time navigation (all parameters zoom/pan together)
+Shared X-axis navigation (all parameters zoom/pan together)
 
 Axis behavior:
 
@@ -106,6 +141,51 @@ Primary PlotItem hosts the X-axis and first parameter
 Additional parameters use pg.ViewBox() linked via setXLink(primary_plot)
 Geometry synchronized on sigResized (see VIEWPORT_RENDERING_POLICY §16)
 Procedural axis generation — axes are not pre-allocated
+
+MERGED CANVAS CONTRACT
+
+Powerwave may allow users to merge multiple waveform panels into one visual
+canvas for comparison. A merge operation SHALL mean:
+
+one shared X-axis canvas
+multiple independent Y-axis groups
+
+A merge operation SHALL NOT mean collapsing every waveform onto one shared
+Y-axis. Different engineering units, signal roles, and scales must remain
+independent.
+
+Examples:
+
+Power (MW) + Frequency (Hz)
+    One canvas, shared X-axis.
+    Power remains on a MW Y-axis.
+    Frequency remains on a Hz Y-axis.
+
+ROCOF (Hz/s) + Frequency (Hz)
+    One canvas, shared X-axis.
+    ROCOF remains on a Hz/s Y-axis.
+    Frequency remains on a Hz Y-axis.
+
+Voltage (kV) + Current (A)
+    One canvas, shared X-axis.
+    Voltage and current remain on separate Y-axes.
+
+Merge guardrails:
+
+The selected panels SHALL share a compatible X-axis before merge. If the time
+or sample-index vectors differ and cannot be safely aligned, the UI SHALL warn
+or block the merge.
+
+The visualization layer SHALL preserve channel unit and signal role metadata
+when constructing a merged canvas.
+
+Axis grouping in a merged canvas SHALL be based on engineering meaning, not on
+panel origin. At minimum, the grouping key must include normalized signal type
+and unit. Same-unit but different-role channels SHOULD NOT be silently forced
+onto one scale without a clear user override.
+
+If a merge would produce too many independent Y-axes to read comfortably, the UI
+SHOULD warn the user before proceeding.
 
 DIGITAL EVENT TIMELINE
 
@@ -228,6 +308,7 @@ Behavior:
 
 dragging cursor in one pane updates all panes
 all visible waveforms align to same timestamp
+relative elapsed-time recordings align to the same elapsed-time value
 
 Purpose:
 
@@ -262,11 +343,12 @@ X-AXIS
 
 The X-axis SHALL represent:
 
-synchronized time domain
+elapsed seconds for time-based records, or sample index for sequence-only
+records
 
 All panes SHALL:
 
-share time alignment
+share X-axis alignment
 maintain synchronized navigation
 Y-AXIS
 
@@ -275,6 +357,10 @@ Each pane SHALL support:
 independent engineering units
 scalable vertical zoom
 configurable scaling
+
+Merged canvases SHALL preserve this rule. Combining panels SHALL NOT combine
+their Y-axis scales unless the signals are explicitly compatible by signal type
+and unit.
 
 Examples:
 

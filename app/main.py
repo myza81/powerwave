@@ -2,6 +2,7 @@ import os
 import sys
 
 import pyqtgraph as pg
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication
 
 from app.ui.main_window import PowerwaveMainWindow
@@ -22,6 +23,7 @@ pg.setConfigOptions(
 
 
 def main() -> int:
+    QApplication.setFont(QFont("Arial"))
     app = QApplication(sys.argv)
     window = PowerwaveMainWindow()
     window.show()

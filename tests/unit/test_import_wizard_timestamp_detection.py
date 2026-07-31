@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.import_wizard.timestamp_detector import (
+    _detect_elapsed_format,
     _detect_special_format,
     _extract_timezone,
     _is_monotonic_increasing,
@@ -77,6 +78,29 @@ class TestDetectSpecialFormat:
 
     def test_very_large_number_returns_none(self):
         assert _detect_special_format("9e20") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _detect_elapsed_format
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDetectElapsedFormat:
+    def test_elapsed_seconds_from_time_name(self):
+        fmt, invalid = _detect_elapsed_format(
+            ["-0.002", "0.008", "0.018", "0.028"],
+            "Time",
+        )
+        assert fmt == "elapsed_seconds"
+        assert invalid == 0
+
+    def test_elapsed_milliseconds_from_ms_name(self):
+        fmt, invalid = _detect_elapsed_format(["0", "10", "20"], "Time_ms")
+        assert fmt == "elapsed_milliseconds"
+        assert invalid == 0
+
+    def test_numeric_data_column_not_elapsed_without_name_hint(self):
+        fmt, _ = _detect_elapsed_format(["1", "2", "3"], "MW")
+        assert fmt is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +261,19 @@ class TestDetectTimestampCandidates:
         if ts_candidates:
             assert ts_candidates[0].detected_format == "epoch_seconds"
 
+    def test_elapsed_seconds_detected(self):
+        cols = ["Time", "Frequency", "TieLine"]
+        rows = [
+            ["-0.002", "50.0", "-0.67"],
+            ["0.008", "50.1", "-0.66"],
+            ["0.018", "50.1", "-0.65"],
+            ["0.028", "50.2", "-0.64"],
+        ]
+        candidates = detect_timestamp_candidates(cols, rows)
+        assert candidates
+        assert candidates[0].column_name == "Time"
+        assert candidates[0].detected_format == "elapsed_seconds"
+
     def test_non_timestamp_columns_excluded(self):
         cols = ["Voltage", "Current", "MW"]
         rows = [[str(230.0 + i), str(100.0 + i), str(23.0 + i)] for i in range(5)]
@@ -261,6 +298,19 @@ class TestDetectTimestampCandidates:
         ts = [c for c in candidates if c.column_name == "Timestamp"]
         if ts:
             assert ts[0].invalid_sample_count >= 0
+
+    def test_duplicate_timestamp_sample_count_tracked(self):
+        cols = ["Time", "Value"]
+        rows = [
+            ["7/18/2026 12:39", "53.63"],
+            ["7/18/2026 12:39", "-224.84"],
+            ["7/18/2026 12:39", "-234.07"],
+            ["7/18/2026 12:40", "-254.95"],
+        ]
+        candidates = detect_timestamp_candidates(cols, rows)
+        ts = [c for c in candidates if c.column_name == "Time"]
+        assert ts
+        assert ts[0].duplicate_sample_count == 2
 
     def test_multiple_time_columns_both_detected(self):
         cols = ["Date", "Time", "Voltage"]

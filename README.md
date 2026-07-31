@@ -34,6 +34,15 @@ pip install -r requirements.txt
 
 ## Running
 
+From the project root:
+
 ```bash
-python app/main.py
+python -m app.main
+```
+
+If you need to run the file path directly, set the project root on
+`PYTHONPATH`:
+
+```bash
+PYTHONPATH=. python app/main.py
 ```

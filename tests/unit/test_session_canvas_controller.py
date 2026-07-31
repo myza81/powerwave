@@ -28,8 +28,11 @@ from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pandas as pd
+import pyqtgraph as pg
 import pytest
 
+from PyQt6.QtGui import QColor, QImage, QPainter
 from PyQt6.QtWidgets import QApplication, QSplitter
 
 from app.sessions import EventAnalysisSession
@@ -37,6 +40,7 @@ from app.ui.session.session_canvas_controller import (
     SessionCanvasController,
     _session_window,
 )
+from app.visualization.axis.datetime_axis import TimeDisplayMode
 from app.visualization.widgets.session_canvas import SessionCanvasWidget
 
 
@@ -88,6 +92,14 @@ def _make_record(n_analog: int = 3, n_samples: int = 100, dt: float = 0.001):
         ),
         disturbance_info=None,
     )
+
+
+def _make_sample_index_record(n_analog: int = 2, n_samples: int = 100):
+    record = _make_record(n_analog=n_analog, n_samples=n_samples, dt=1.0)
+    record.waveform_data["time"] = np.arange(n_samples, dtype=np.float64)
+    record.timing_info.timing_reference = "sample_index"
+    record.timing_info.time_axis_unit = "sample"
+    return record
 
 
 def _build_session(n_sources: int = 2, n_analog: int = 3) -> EventAnalysisSession:
@@ -299,6 +311,24 @@ def test_zero_markers_created_for_active_sources(qapp) -> None:
         assert set(canvas._zero_lines.keys()) == active_sids
 
 
+def test_sample_index_session_uses_index_axis_labels(qapp) -> None:
+    session = EventAnalysisSession()
+    session.add_source(_make_sample_index_record(), "SampleIndex", "excel")
+    session.default_layout()
+    ctrl = SessionCanvasController()
+    splitter = ctrl.rebuild_layout(session)
+    try:
+        ctrl.refresh_all(session)
+
+        canvas = next(iter(ctrl._canvases.values()))
+        bottom = canvas._primary_plot.getAxis("bottom")
+        labels = bottom.tickStrings([0.0, 1.0, 1000.0], 1.0, 100.0)
+        assert labels == ["0", "1", "1000"]
+        assert canvas._time_axis_mode.value == "sample_index"
+    finally:
+        splitter.close()
+
+
 # ---------------------------------------------------------------------------
 # 10. Zero marker removed when source is deactivated
 # ---------------------------------------------------------------------------
@@ -446,6 +476,234 @@ def test_session_canvas_widget_clear_all(qapp) -> None:
     canvas.clear_all()
     assert canvas.curve_count == 0
     assert canvas.zero_line_count == 0
+
+
+def test_session_canvas_right_axes_group_by_signal_type_and_unit(qapp) -> None:
+    canvas = SessionCanvasWidget("p1", "Panel 1")
+    time = np.array([0.0, 1.0])
+    canvas.update_curve(
+        "s1",
+        "MW",
+        time,
+        np.array([10.0, 11.0]),
+        unit="MW",
+        y_axis_side="right",
+        signal_type="mw",
+    )
+    canvas.update_curve(
+        "s1",
+        "Frequency",
+        time,
+        np.array([50.0, 50.1]),
+        unit="Hz",
+        y_axis_side="right",
+        signal_type="frequency",
+    )
+
+    assert set(canvas._right_mgr._entries) == {"active_power:mw", "frequency:hz"}
+
+
+def test_session_controller_merged_panel_keeps_role_unit_axes(qapp) -> None:
+    from app.models.channels import AnalogChannel
+    from app.models.disturbance_record import DisturbanceRecord
+    from app.models.metadata import RecordingMetadata
+    from app.models.timing import SamplingInformation, TimingInformation
+
+    time = np.array([0.0, 1.0, 2.0])
+    record = DisturbanceRecord(
+        metadata=RecordingMetadata("TEST", "REC", "merge.csv", "csv", 50.0),
+        waveform_data=pd.DataFrame({
+            "time": time,
+            "MW": np.array([10.0, 11.0, 12.0]),
+            "Frequency": np.array([50.0, 50.1, 49.9]),
+        }),
+        analog_channels=[
+            AnalogChannel(name="MW", unit="MW", index=0, parameter_type="mw"),
+            AnalogChannel(name="Frequency", unit="Hz", index=1, parameter_type="frequency"),
+        ],
+        digital_channels=[],
+        sampling_info=SamplingInformation([1.0], [len(time)]),
+        timing_info=TimingInformation(datetime(2024, 1, 1), datetime(2024, 1, 1)),
+        disturbance_info=None,
+    )
+    session = EventAnalysisSession()
+    source_id = session.add_source(record, "Source", "csv")
+    panel_id = session.add_panel("Merged")
+    session.set_channel_panel(source_id, "MW", panel_id)
+    session.set_channel_panel(source_id, "Frequency", panel_id)
+
+    ctrl = SessionCanvasController()
+    ctrl.rebuild_layout(session)
+    ctrl.refresh_all(session)
+
+    canvas = ctrl._canvases[panel_id]
+    assert canvas._metadata[(source_id, "MW")].y_axis_side == "left"
+    assert canvas._metadata[(source_id, "Frequency")].y_axis_side == "right"
+    assert set(canvas._right_mgr._entries) == {"frequency:hz"}
+
+
+def test_session_controller_secondary_axis_ranges_second_unit_group(qapp) -> None:
+    from app.models.channels import AnalogChannel
+    from app.models.disturbance_record import DisturbanceRecord
+    from app.models.metadata import RecordingMetadata
+    from app.models.timing import SamplingInformation, TimingInformation
+
+    time = np.array([0.0, 1.0, 2.0])
+    record = DisturbanceRecord(
+        metadata=RecordingMetadata("TEST", "REC", "merge.csv", "csv", 50.0),
+        waveform_data=pd.DataFrame({
+            "time": time,
+            "Frequency": np.array([-0.1, -16.0, -8.0]),
+            "MW": np.array([-372.0, -620.0, -360.0]),
+        }),
+        analog_channels=[
+            AnalogChannel(name="Frequency", unit="Hz", index=0, parameter_type="frequency"),
+            AnalogChannel(name="MW", unit="MW", index=1, parameter_type="mw"),
+        ],
+        digital_channels=[],
+        sampling_info=SamplingInformation([1.0], [len(time)]),
+        timing_info=TimingInformation(datetime(2024, 1, 1), datetime(2024, 1, 1)),
+        disturbance_info=None,
+    )
+    session = EventAnalysisSession()
+    source_id = session.add_source(record, "Source", "csv")
+    panel_id = session.add_panel("Merged")
+    session.set_channel_panel(source_id, "Frequency", panel_id)
+    session.set_channel_panel(source_id, "MW", panel_id)
+
+    ctrl = SessionCanvasController()
+    ctrl.rebuild_layout(session)
+    ctrl.refresh_all(session)
+
+    canvas = ctrl._canvases[panel_id]
+    mw_axis = canvas._right_mgr._entries["active_power:mw"].viewbox
+    mw_curve = canvas._curves[(source_id, "MW")]
+    y_min, y_max = mw_axis.viewRange()[1]
+
+    assert canvas._metadata[(source_id, "Frequency")].y_axis_side == "left"
+    assert canvas._metadata[(source_id, "MW")].y_axis_side == "right"
+    assert mw_curve.getViewBox() is mw_axis
+    assert not mw_curve.opts["clipToView"]
+    assert not mw_curve.opts["autoDownsample"]
+    assert mw_axis.zValue() > canvas._primary_plot.getViewBox().zValue()
+    assert y_min < -620.0
+    assert y_max > -360.0
+
+
+def test_session_controller_merge_keeps_curves_from_both_panels(qapp) -> None:
+    from app.models.channels import AnalogChannel
+    from app.models.disturbance_record import DisturbanceRecord
+    from app.models.metadata import RecordingMetadata
+    from app.models.timing import SamplingInformation, TimingInformation
+
+    time = np.array([0.0, 1.0, 2.0])
+    record = DisturbanceRecord(
+        metadata=RecordingMetadata("TEST", "REC", "merge.csv", "csv", 50.0),
+        waveform_data=pd.DataFrame({
+            "time": time,
+            "Original": np.array([-0.1, -16.0, -8.0]),
+            "Imported": np.array([-372.0, -620.0, -360.0]),
+        }),
+        analog_channels=[
+            AnalogChannel(name="Original", unit="Hz", index=0, parameter_type="frequency"),
+            AnalogChannel(name="Imported", unit="MW", index=1, parameter_type="mw"),
+        ],
+        digital_channels=[],
+        sampling_info=SamplingInformation([1.0], [len(time)]),
+        timing_info=TimingInformation(datetime(2024, 1, 1), datetime(2024, 1, 1)),
+        disturbance_info=None,
+    )
+    session = EventAnalysisSession()
+    source_id = session.add_source(record, "Source", "csv")
+    original_panel = session.add_panel("Original")
+    imported_panel = session.add_panel("Imported")
+    session.set_channel_panel(source_id, "Original", original_panel)
+    session.set_channel_panel(source_id, "Imported", imported_panel)
+
+    ctrl = SessionCanvasController()
+    ctrl.rebuild_layout(session)
+    ctrl.refresh_all(session)
+    ctrl._handle_merge_panels(original_panel, imported_panel)
+
+    merged_canvas = ctrl._canvases[original_panel]
+
+    assert imported_panel not in ctrl._canvases
+    assert set(merged_canvas._curves) == {
+        (source_id, "Original"),
+        (source_id, "Imported"),
+    }
+    assert merged_canvas._curves[(source_id, "Original")].isVisible()
+    assert merged_canvas._curves[(source_id, "Imported")].isVisible()
+
+
+def test_session_canvas_renders_secondary_axis_curve(qapp) -> None:
+    canvas = SessionCanvasWidget("p1", "Merged")
+    canvas.resize(900, 600)
+    canvas.show()
+    time = np.linspace(0.0, 50.0, 300)
+    canvas.update_curve(
+        "s1",
+        "Frequency",
+        time,
+        -8.0 - 8.0 * np.sin(time / 8.0),
+        color="#1f77b4",
+        unit="Hz",
+        y_axis_side="left",
+        signal_type="frequency",
+    )
+    canvas.update_curve(
+        "s1",
+        "MW",
+        time,
+        -500.0 + 150.0 * np.sin(time / 5.0),
+        color="#ff7f0e",
+        unit="MW",
+        y_axis_side="right",
+        signal_type="mw",
+    )
+    canvas.update_curve(
+        "s1",
+        "MW duplicate",
+        time,
+        -450.0 + 100.0 * np.cos(time / 6.0),
+        color="#ffd500",
+        unit="MW",
+        y_axis_side="right",
+        signal_type="mw",
+    )
+    qapp.processEvents()
+
+    image = QImage(canvas.size(), QImage.Format.Format_RGB32)
+    image.fill(QColor("#000000"))
+    painter = QPainter(image)
+    canvas.render(painter)
+    painter.end()
+
+    orange_pixels = 0
+    yellow_pixels = 0
+    blue_pixels = 0
+    for y in range(image.height()):
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            if color.red() > 180 and 70 < color.green() < 190 and color.blue() < 80:
+                orange_pixels += 1
+            if color.red() > 180 and color.green() > 160 and color.blue() < 80:
+                yellow_pixels += 1
+            if color.blue() > 100 and color.red() < 120:
+                blue_pixels += 1
+
+    assert blue_pixels > 0
+    assert orange_pixels > 0
+    assert yellow_pixels > 0
+
+
+def test_session_canvas_crosshair_formats_sample_index_axis(qapp) -> None:
+    canvas = SessionCanvasWidget("p1", "Panel 1")
+
+    canvas.set_time_axis_mode(TimeDisplayMode.SAMPLE_INDEX)
+    bottom = canvas._primary_plot.getAxis("bottom")
+
+    assert bottom.tickStrings([12.0, 12.4], 1.0, 1.0) == ["12", "12.400"]
 
 
 # ---------------------------------------------------------------------------

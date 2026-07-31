@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -165,6 +166,12 @@ class TestBuildRepairPlan:
         assert plan.strategy == TimestampRepairStrategy.PARSE_DETECTED_FORMAT
         assert plan.detected_format == "epoch_milliseconds"
 
+    def test_elapsed_seconds_uses_elapsed_strategy(self):
+        c = _make_ts_candidate(fmt="elapsed_seconds")
+        plan = _build_repair_plan(c)
+        assert plan.strategy == TimestampRepairStrategy.PARSE_ELAPSED_TIME
+        assert plan.elapsed_time_unit == "elapsed_seconds"
+
     def test_none_format_uses_no_repair(self):
         c = _make_ts_candidate(fmt=None)
         plan = _build_repair_plan(c)
@@ -295,6 +302,38 @@ class TestBuildNormalizationPlan:
         msgs: list[ValidationMessage] = []
         plan = _build_normalization_plan(profile, candidate, repair, msgs)
         assert plan.selected_columns == []
+
+
+class TestElapsedExcelPipeline:
+    def test_elapsed_excel_preserves_duration_axis(self, tmp_path: Path):
+        path = tmp_path / "tieline.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        assert ws is not None
+        ws.title = "Loss of 2000MW"
+        ws.append([r"D:\Study_frequency\Loss of 2000MW.out", None, None, None])
+        ws.append(["Time", "1 - KAWA FREQ", "2 - TIE LINE 1", "3 - TIE LINE 2"])
+        ws.append([-0.002, 0.0, -0.673291, -0.673291])
+        ws.append([0.008, 0.00000542871, -0.671219, -0.671219])
+        ws.append([0.018, 0.00000524838, -0.669146, -0.669146])
+        ws.append([0.028, 0.00000449035, -0.666713, -0.666713])
+        wb.save(path)
+
+        result = run_import_pipeline(str(path))
+
+        assert result.success
+        assert result.repair_plan is not None
+        assert result.repair_plan.strategy == TimestampRepairStrategy.PARSE_ELAPSED_TIME
+        assert result.dataset is not None
+        assert result.dataset.time_axis_mode == "relative_elapsed"
+        assert result.record is not None
+        assert result.record.timing_info.timing_reference == "relative_elapsed"
+        assert result.record.waveform_data["time"].tolist()[:4] == pytest.approx([
+            -0.002,
+            0.008,
+            0.018,
+            0.028,
+        ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

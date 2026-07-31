@@ -262,6 +262,18 @@ class TestBuildExecutionPlanColumnAuthority:
         rp = result.normalization_plan.timestamp_plan
         assert rp.strategy == TimestampRepairStrategy.NO_REPAIR
 
+    def test_duplicate_timestamp_preview_returns_warning(self) -> None:
+        candidate = _make_candidate()
+        candidate.duplicate_sample_count = 3
+        session = _make_session(candidate=candidate)
+        mappings = [_make_mapping("mw")]
+        result = build_execution_plan(session, mappings)
+
+        assert result.is_executable
+        codes = [m.code for m in result.warnings()]
+        assert "PLAN_DUPLICATE_TIMESTAMP_PREVIEW" in codes
+        assert any("Sample index" in m.message for m in result.warnings())
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # run_import_pipeline_with_plan — authoritative execution

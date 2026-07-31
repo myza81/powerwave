@@ -67,6 +67,17 @@ _SUPPORTED_EXCEL_EXTENSIONS: frozenset[str] = frozenset({".xlsx", ".xls", ".xlsm
 _SUPPORTED_EXTENSIONS: frozenset[str] = _SUPPORTED_CSV_EXTENSIONS | _SUPPORTED_EXCEL_EXTENSIONS
 
 
+def repair_plan_is_generated(repair_plan: TimestampRepairPlan | None) -> bool:
+    return (
+        repair_plan is not None
+        and repair_plan.strategy
+        in {
+            TimestampRepairStrategy.GENERATE_SYNTHETIC_ELAPSED,
+            TimestampRepairStrategy.GENERATE_SAMPLE_INDEX,
+        }
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public data classes
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +409,7 @@ def _build_repair_plan(candidate: TimestampCandidate) -> TimestampRepairPlan:
     Strategy selection:
     - excel_serial          → EXCEL_SERIAL_CONVERSION
     - epoch_seconds / _ms   → PARSE_DETECTED_FORMAT (executor handles unit conversion)
+    - elapsed_*             → PARSE_ELAPSED_TIME (executor preserves duration axis)
     - strptime format       → PARSE_DETECTED_FORMAT
     - None (no format)      → NO_REPAIR (pandas auto-detection)
     """
@@ -416,6 +428,15 @@ def _build_repair_plan(candidate: TimestampCandidate) -> TimestampRepairPlan:
             detected_format=fmt,
             repair_validated=True,
             repair_notes=f"Auto-selected: {fmt} column detected.",
+        )
+
+    if fmt in ("elapsed_seconds", "elapsed_milliseconds", "elapsed_minutes"):
+        return TimestampRepairPlan(
+            strategy=TimestampRepairStrategy.PARSE_ELAPSED_TIME,
+            detected_format=fmt,
+            elapsed_time_unit=fmt,
+            repair_validated=True,
+            repair_notes=f"Auto-selected: {fmt} duration column detected.",
         )
 
     if fmt is not None:
@@ -503,10 +524,32 @@ def _load_full_dataframe(
 
     if provider_type == "excel":
         sheet: str | int = profile.sheet_name if profile.sheet_name is not None else 0
-        return pd.read_excel(path, sheet_name=sheet, header=header_row)
+        df = pd.read_excel(path, sheet_name=sheet, header=header_row)
+        return _apply_profile_column_names(df, profile)
 
     delimiter = profile.delimiter or ","
-    return pd.read_csv(path, sep=delimiter, header=header_row)
+    df = pd.read_csv(path, sep=delimiter, header=header_row)
+    return _apply_profile_column_names(df, profile)
+
+
+def _apply_profile_column_names(
+    df: pd.DataFrame,
+    profile: FileProfileResult,
+) -> pd.DataFrame:
+    """Align full-load headers with profiler-normalized headers by position."""
+    names = list(profile.raw_preview.column_names)
+    if not names:
+        return df
+
+    aligned = df.copy()
+    if len(names) == len(aligned.columns):
+        aligned.columns = names
+    elif len(names) < len(aligned.columns):
+        aligned = aligned.iloc[:, :len(names)].copy()
+        aligned.columns = names
+    else:
+        aligned.columns = names[:len(aligned.columns)]
+    return aligned
 
 
 def _build_diagnostics(
@@ -593,7 +636,10 @@ def run_import_pipeline_with_plan(
 
     # ── Resolve the authoritative timestamp candidate ─────────────────────────
     candidate = session.best_timestamp_candidate()
-    if candidate is None:
+    generated_axis = repair_plan_is_generated(normalization_plan.timestamp_plan)
+    if generated_axis:
+        candidate = None
+    if candidate is None and not generated_axis:
         messages.append(ValidationMessage(
             severity=ValidationSeverity.ERROR,
             code="PIPELINE_NO_TIMESTAMP",
@@ -623,7 +669,7 @@ def run_import_pipeline_with_plan(
                 severity=ValidationSeverity.ERROR,
                 code="PLAN_INVALID_TIMESTAMP_FORMAT",
                 message="Timestamp repair plan is not validated; import execution is blocked.",
-                affected_column=candidate.column_name,
+                affected_column=candidate.column_name if candidate is not None else None,
             ))
         diag = _build_diagnostics(
             path, effective_provider, profile, candidate, None, None, messages,
@@ -652,7 +698,7 @@ def run_import_pipeline_with_plan(
             diag, False, messages,
         )
 
-    if candidate.column_name not in raw_df.columns:
+    if candidate is not None and candidate.column_name not in raw_df.columns:
         messages.append(ValidationMessage(
             severity=ValidationSeverity.ERROR,
             code="PIPELINE_TS_COLUMN_MISSING",
@@ -671,7 +717,12 @@ def run_import_pipeline_with_plan(
         )
 
     # ── Normalize timestamps using the authoritative repair plan ──────────────
-    norm_result = normalize_timestamps(raw_df[candidate.column_name], repair_plan)
+    if generated_axis:
+        axis_seed = pd.Series(range(len(raw_df)), index=raw_df.index, dtype="float64")
+    else:
+        assert candidate is not None
+        axis_seed = raw_df[candidate.column_name]
+    norm_result = normalize_timestamps(axis_seed, repair_plan)
     messages.extend(norm_result.validation_messages)
 
     # ── Assemble NormalizedDataset using the authoritative normalization plan ──

@@ -134,7 +134,7 @@ class FaultSummaryPanel(QWidget):
         lbl_key = QLabel(prefix)
         lbl_key.setStyleSheet("color: #888888; font-size: 10px; background: transparent;")
         lbl_val = QLabel(initial)
-        lbl_val.setStyleSheet("color: #CCCCCC; font-size: 11px; font-family: monospace; background: transparent;")
+        lbl_val.setStyleSheet("color: #CCCCCC; font-size: 11px; font-family: Menlo, Consolas, 'Courier New'; background: transparent;")
         lbl_val.setObjectName("seq_val")
         lay.addWidget(lbl_key)
         lay.addWidget(lbl_val)
@@ -194,10 +194,10 @@ class FaultSummaryPanel(QWidget):
         v2_color = "#FFAA33" if result.v2_pu > 0.05 else "#CCCCCC"
         v0_color = "#FF5555" if result.v0_pu > 0.08 else "#CCCCCC"
         self._seq_val(self._lbl_v2).setStyleSheet(
-            f"color: {v2_color}; font-size: 11px; font-family: monospace; background: transparent;"
+            f"color: {v2_color}; font-size: 11px; font-family: Menlo, Consolas, 'Courier New'; background: transparent;"
         )
         self._seq_val(self._lbl_v0).setStyleSheet(
-            f"color: {v0_color}; font-size: 11px; font-family: monospace; background: transparent;"
+            f"color: {v0_color}; font-size: 11px; font-family: Menlo, Consolas, 'Courier New'; background: transparent;"
         )
 
     def clear_fault(self) -> None:
@@ -214,5 +214,5 @@ class FaultSummaryPanel(QWidget):
         for w in (self._lbl_v1, self._lbl_v2, self._lbl_v0, self._lbl_unbal, self._lbl_depth):
             self._seq_val(w).setText("—")
             self._seq_val(w).setStyleSheet(
-                "color: #CCCCCC; font-size: 11px; font-family: monospace; background: transparent;"
+                "color: #CCCCCC; font-size: 11px; font-family: Menlo, Consolas, 'Courier New'; background: transparent;"
             )

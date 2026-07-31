@@ -43,7 +43,16 @@ def _is_mostly_numeric_values(cells: list[Any], threshold: float = 0.5) -> bool:
     non_empty = [c for c in cells if c != "" and c is not None]
     if not non_empty:
         return False
-    numeric = sum(1 for c in non_empty if isinstance(c, (int, float)))
+    numeric = 0
+    for cell in non_empty:
+        if isinstance(cell, (int, float)):
+            numeric += 1
+            continue
+        try:
+            float(str(cell).strip())
+            numeric += 1
+        except ValueError:
+            continue
     return (numeric / len(non_empty)) >= threshold
 
 
@@ -59,13 +68,30 @@ def _alpha_score_values(cells: list[Any]) -> float:
     return alpha / len(non_empty)
 
 
+def _looks_like_time_header(value: Any) -> bool:
+    text = str(value).strip().lower()
+    return text in {
+        "time",
+        "t",
+        "sec",
+        "secs",
+        "seconds",
+        "timestamp",
+        "datetime",
+        "elapsed",
+        "duration",
+    }
+
+
 def _find_header_row_index_excel(rows: list[list[Any]]) -> int:
     """Lookahead header detection for Excel rows (values, not strings)."""
     for i, row in enumerate(rows):
         non_empty = [c for c in row if c != "" and c is not None]
         if len(non_empty) < 2:
             continue
-        if _alpha_score_values(row) < 0.60:
+        alpha_score = _alpha_score_values(row)
+        has_time_header = any(_looks_like_time_header(c) for c in non_empty)
+        if alpha_score < 0.40 and not has_time_header:
             continue
         for j in range(i + 1, len(rows)):
             next_row = rows[j]
@@ -218,6 +244,16 @@ def profile_excel(
         elif len(row_vals) > expected_cols:
             row_vals = row_vals[:expected_cols]
         data_rows.append(row_vals)
+
+    while column_names and column_names[-1] == "Column" and all(
+        (len(row) <= len(column_names) - 1 or row[-1] in ("", None))
+        for row in data_rows
+    ):
+        column_names.pop()
+        column_names_raw.pop()
+        for row in data_rows:
+            if row:
+                row.pop()
 
     # Row count estimate: use ws.max_row minus header rows (may be None for read-only)
     try:

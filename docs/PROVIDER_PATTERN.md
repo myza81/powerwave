@@ -175,13 +175,43 @@ IC
 Avoid:
 
 provider-specific naming leakage
-Timestamp Structure
+Time Axis Structure
 
-All timestamps SHALL:
+All providers SHALL normalize source timing into:
 
-use unified formatting
+waveform_data["time"] as the authoritative X-axis.
+
+Providers SHALL support:
+
+absolute timestamp-based sources
+relative elapsed-time sources
+synthetic elapsed-time sources from sample rate or interval when requested by
+the import workflow
+sample-index sources for sequence-only plotting
+
+Absolute timestamp sources SHALL preserve real start/trigger timestamps in
+TimingInformation and derive waveform_data["time"] as seconds from start.
+
+Relative elapsed-time sources SHALL preserve the source duration axis after unit
+conversion to seconds. Synthetic datetime anchors MAY be used only for
+compatibility and SHALL NOT be treated as real recording time.
+
+Synthetic elapsed-time sources SHALL generate waveform_data["time"] from row
+order and an explicit positive sample rate or sample interval. Providers SHALL
+record that the timing is generated and not source-provided.
+
+Sample-index sources SHALL generate waveform_data["time"] from row order without
+sample-rate assumptions. Providers SHALL mark timing_reference as
+`sample_index` or equivalent metadata and set the axis unit to `sample` or
+`index`. Sample-index axes SHALL NOT be treated as seconds.
+
+Timing normalization SHALL:
+
+use unified internal representation
 support high-resolution precision
 support synchronized analysis
+avoid provider-specific time-axis leakage
+label non-time sample-index axes honestly
 Units
 
 All units SHALL remain explicit.
@@ -214,10 +244,13 @@ CSV PROVIDER REQUIREMENTS
 
 CSV provider shall support:
 
-configurable timestamp column
+configurable time-axis column
 configurable delimiter
 configurable encoding
 flexible channel mapping
+absolute timestamp and relative elapsed-time columns
+manual synthetic elapsed-time axes
+manual sample-index axes for sequence-only plotting
 
 The provider must tolerate:
 

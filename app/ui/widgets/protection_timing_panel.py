@@ -95,7 +95,7 @@ class ProtectionTimingPanel(QWidget):
             lbl_val = QLabel("—")
             lbl_val.setStyleSheet(
                 f"color: {_ROLE_COLOR.get(ProtectionRole(key) if key in ('pickup','trip','reclose') else ProtectionRole.CB, '#FFAA33')};"
-                "font-size: 11px; font-family: monospace; font-weight: bold;"
+                "font-size: 11px; font-family: Menlo, Consolas, 'Courier New'; font-weight: bold;"
             )
             pair = QWidget()
             pair.setStyleSheet("background: transparent;")

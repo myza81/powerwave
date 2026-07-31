@@ -20,6 +20,7 @@ import pyqtgraph as pg
 # Explicit axis display mode constants — use these rather than inferring from start_time.
 AXIS_MODE_RELATIVE = "relative_seconds"   # COMTRADE / high-rate: elapsed s
 AXIS_MODE_ABSOLUTE = "absolute_datetime"  # CSV / Excel trend data: wall-clock labels
+AXIS_MODE_SAMPLE_INDEX = "sample_index"   # row/sample ordinal, not a time axis
 
 
 class TimeDisplayMode(str, Enum):
@@ -27,6 +28,7 @@ class TimeDisplayMode(str, Enum):
 
     RELATIVE = AXIS_MODE_RELATIVE
     ABSOLUTE = AXIS_MODE_ABSOLUTE
+    SAMPLE_INDEX = AXIS_MODE_SAMPLE_INDEX
 
     @classmethod
     def coerce(cls, value: "TimeDisplayMode | str") -> "TimeDisplayMode":
@@ -36,6 +38,8 @@ class TimeDisplayMode(str, Enum):
             return cls.RELATIVE
         if value == AXIS_MODE_ABSOLUTE:
             return cls.ABSOLUTE
+        if value == AXIS_MODE_SAMPLE_INDEX:
+            return cls.SAMPLE_INDEX
         return cls(value)
 
 
@@ -72,13 +76,28 @@ class DatetimeAxisItem(pg.AxisItem):
         kwargs.setdefault("orientation", "bottom")
         super().__init__(*args, **kwargs)
         self._start_time: datetime | None = None
+        self._display_mode = TimeDisplayMode.RELATIVE
 
     def set_start_time(self, start_time: datetime | None) -> None:
         """Set the absolute reference time for label computation.
 
         Pass None to revert to elapsed-seconds labels.
         """
-        self._start_time = start_time
+        self.set_display_mode(
+            TimeDisplayMode.ABSOLUTE if start_time is not None else TimeDisplayMode.RELATIVE,
+            start_time=start_time,
+        )
+
+    def set_display_mode(
+        self,
+        mode: TimeDisplayMode | str,
+        *,
+        start_time: datetime | None = None,
+    ) -> None:
+        """Set how numeric x-axis coordinates are rendered."""
+        display_mode = TimeDisplayMode.coerce(mode)
+        self._display_mode = display_mode
+        self._start_time = start_time if display_mode == TimeDisplayMode.ABSOLUTE else None
         self.picture = None  # invalidate rendered-label cache
         try:
             self.update()
@@ -103,6 +122,9 @@ class DatetimeAxisItem(pg.AxisItem):
         """
         if not values:
             return []
+
+        if self._display_mode == TimeDisplayMode.SAMPLE_INDEX:
+            return [f"{v:.0f}" if float(v).is_integer() else f"{v:.3f}" for v in values]
 
         if self._start_time is None:
             return [f"{v:.3f} s" for v in values]

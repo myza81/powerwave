@@ -58,6 +58,35 @@ _SHARED_ROLE_TITLES = {
     "per_unit": "Per Unit",
 }
 
+_SIGNAL_TYPE_ALIASES = {
+    "mw": "active_power",
+    "activepower": "active_power",
+    "active_power": "active_power",
+    "mvar": "reactive_power",
+    "mvarr": "reactive_power",
+    "reactivepower": "reactive_power",
+    "reactive_power": "reactive_power",
+    "voltage": "voltage",
+    "current": "current",
+    "frequency": "frequency",
+    "rocof": "rocof",
+    "voltage_rms": "voltage_rms",
+    "current_rms": "current_rms",
+    "per_unit": "per_unit",
+    "pu": "per_unit",
+}
+
+
+def normalize_signal_type_hint(signal_type: str | None) -> str | None:
+    """Return an axis-policy role name for importer/session type hints."""
+    if signal_type is None:
+        return None
+    key = str(signal_type).strip().lower().replace("-", "_").replace(" ", "_")
+    if "." in key:
+        key = key.rsplit(".", 1)[-1]
+    compact = key.replace("_", "")
+    return _SIGNAL_TYPE_ALIASES.get(key) or _SIGNAL_TYPE_ALIASES.get(compact)
+
 
 def axis_group_for_signal(
     channel_name: str,
@@ -83,7 +112,7 @@ def axis_group_for_signal(
     if axis_mode == AxisDisplayMode.DEDICATED:
         return AxisGroup(key=f"dedicated:{channel_name}", label=label)
 
-    role = signal_type_hint or infer_signal_type(channel_name, unit)
+    role = normalize_signal_type_hint(signal_type_hint) or infer_signal_type(channel_name, unit)
     if role not in _SHARED_ROLE_TITLES:
         return AxisGroup(key=f"signal:{channel_name}", label=label)
 

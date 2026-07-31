@@ -5,6 +5,7 @@ import dataclasses
 import pyqtgraph as pg
 
 from app.visualization.engineering_display import EngineeringAxisLabel, format_axis_label
+from app.visualization.widgets.plot_style import apply_axis_style, set_axis_item_label
 
 
 @dataclasses.dataclass
@@ -74,11 +75,9 @@ class MultiAxisManager:
 
         # First parameter reuses the primary PlotItem's left axis
         if not self._axis_views and not self._pending_axis:
-            self._primary.setLabel("left", label.text, units=label.unit)
             left_ax: pg.AxisItem = self._primary.getAxis("left")
-            left_ax.enableAutoSIPrefix(False)
-            left_ax.setPen(pg.mkPen(color))
-            left_ax.setTextPen(pg.mkPen(color))
+            set_axis_item_label(left_ax, label.text, units=label.unit)
+            apply_axis_style(left_ax, text_color=color)
             vb = self._primary.getViewBox()
             self._axis_views[key] = (vb, left_ax)
             self._pending_axis[name] = (key, left_ax)
@@ -93,10 +92,8 @@ class MultiAxisManager:
         scene.addItem(vb)
 
         axis = pg.AxisItem(orientation="right")
-        axis.enableAutoSIPrefix(False)
-        axis.setLabel(label.text, units=label.unit)
-        axis.setPen(pg.mkPen(color))
-        axis.setTextPen(pg.mkPen(color))
+        set_axis_item_label(axis, label.text, units=label.unit)
+        apply_axis_style(axis, text_color=color)
         axis.linkToView(vb)
 
         self._layout.addItem(axis, row=0, col=self._right_col)

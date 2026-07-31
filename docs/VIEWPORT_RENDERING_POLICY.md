@@ -618,6 +618,38 @@ Users may reset the Y-range to auto with:
 Manual Y-range:
   vb.setYRange(y_min, y_max, padding=0)
 
+§16.6.1 Merged panel axis guardrails
+
+Panel merge is a visual layout operation. It SHALL combine waveform panels into
+one canvas with a shared X-axis, but it SHALL NOT collapse unrelated signals
+onto one Y-axis.
+
+Correct merge behavior:
+  - Validate that all selected panels have a compatible X-axis.
+  - Preserve every channel's unit, signal type, and display metadata.
+  - Rebuild the destination FlexiblePlotCanvas using the normal multi-axis
+    manager.
+  - Group axes by engineering meaning, at minimum by signal type + unit.
+  - Keep different units on independent Y-axes.
+  - Keep different signal types on independent Y-axes even when the unit string
+    happens to match, unless an explicit user override exists.
+
+Incorrect merge behavior:
+  - Concatenating channel values onto one shared Y-axis.
+  - Replacing channel units with a mixed or arbitrary unit to make the merge
+    fit one axis.
+  - Treating panel title as the axis grouping key.
+  - Merging panels with incompatible time/sample-index vectors without warning.
+
+Examples:
+  Power(MW) + Frequency(Hz) => one canvas, MW axis + Hz axis
+  Frequency(Hz) + ROCOF(Hz/s) => one canvas, Hz axis + Hz/s axis
+  Voltage(kV) + Current(A) => one canvas, kV axis + A axis
+
+UX guardrail:
+  If a merge would create many Y-axes, warn the user that the result may be hard
+  to read and offer cancel/continue.
+
 §16.7 Cursor and trigger line in N-Axis canvas
 
 InfiniteLine items added to primary_plot are automatically visible across the

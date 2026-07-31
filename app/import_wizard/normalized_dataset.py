@@ -91,6 +91,10 @@ class NormalizedDataset:
     source_path               Absolute path to the original source file.
     source_file_name          Basename of the source file.
     timestamp_repair_strategy Strategy label used to produce the time axis.
+    time_axis_mode           "absolute" or "relative_elapsed".
+    time_axis_unit           Source unit/format label used for the time axis.
+    time_axis_seconds        Authoritative elapsed seconds for relative elapsed
+                             records. None for absolute timestamp records.
     is_valid                  True when no ERROR messages, non-empty data, valid
                               timestamp column, and at least one data column.
     """
@@ -104,6 +108,9 @@ class NormalizedDataset:
     source_path: str | None = None
     source_file_name: str | None = None
     timestamp_repair_strategy: str = "unknown"
+    time_axis_mode: str = "absolute"
+    time_axis_unit: str | None = None
+    time_axis_seconds: pd.Series | None = None
     is_valid: bool = False
 
     # ------------------------------------------------------------------

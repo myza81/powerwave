@@ -51,6 +51,15 @@ _TIMESTAMP_NAME_FRAGMENTS: tuple[str, ...] = (
     "time", "timestamp", "date", "datetime", "ts", "t_stamp", "zeit", "fecha",
 )
 
+_ELAPSED_SECONDS_LABEL = "elapsed_seconds"
+_ELAPSED_MS_LABEL = "elapsed_milliseconds"
+_ELAPSED_MINUTES_LABEL = "elapsed_minutes"
+
+_ELAPSED_TIME_NAME_FRAGMENTS: tuple[str, ...] = (
+    "time", "elapsed", "duration", "second", "seconds", "sec", "minute",
+    "minutes", "min", "millisecond", "milliseconds", "msec", "ms",
+)
+
 
 def _try_strptime(value: str) -> str | None:
     """Return the first matching strptime format string, or None."""
@@ -78,6 +87,51 @@ def _detect_special_format(value: str) -> str | None:
     if _EXCEL_SERIAL_MIN <= fval <= _EXCEL_SERIAL_MAX and "." not in stripped:
         return "excel_serial"
     return None
+
+
+def _parse_for_duplicate_key(value: str, fmt: str | None) -> object | None:
+    """Return a normalized comparable value for duplicate timestamp checks."""
+    stripped = str(value).strip()
+    if not stripped:
+        return None
+    if fmt is None:
+        return stripped
+    if fmt in {
+        _ELAPSED_SECONDS_LABEL,
+        _ELAPSED_MS_LABEL,
+        _ELAPSED_MINUTES_LABEL,
+        "epoch_seconds",
+        "epoch_milliseconds",
+        "excel_serial",
+    }:
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    try:
+        return datetime.strptime(stripped, fmt)
+    except ValueError:
+        return None
+
+
+def _count_duplicate_parsed_values(sample_values: list[str], fmt: str | None) -> int:
+    """Count duplicate parsed timestamps in *sample_values*.
+
+    The first occurrence is not counted, matching pandas ``duplicated`` behavior.
+    Invalid or blank values are ignored because they are already tracked by
+    invalid_sample_count.
+    """
+    seen: set[object] = set()
+    duplicates = 0
+    for value in sample_values:
+        key = _parse_for_duplicate_key(value, fmt)
+        if key is None:
+            continue
+        if key in seen:
+            duplicates += 1
+        else:
+            seen.add(key)
+    return duplicates
 
 
 def infer_timestamp_format(sample_values: list[str]) -> tuple[str | None, int]:
@@ -115,6 +169,76 @@ def infer_timestamp_format(sample_values: list[str]) -> tuple[str | None, int]:
 def _name_suggests_timestamp(col_name: str) -> bool:
     lower = col_name.lower()
     return any(frag in lower for frag in _TIMESTAMP_NAME_FRAGMENTS)
+
+
+def _name_suggests_elapsed_time(col_name: str) -> bool:
+    """Return True when a column name suggests a relative duration axis."""
+    lower = col_name.lower().strip()
+    if lower in {"t", "time", "sec", "secs", "s", "ms", "msec"}:
+        return True
+    return any(frag in lower for frag in _ELAPSED_TIME_NAME_FRAGMENTS)
+
+
+def _elapsed_format_from_name(col_name: str) -> str:
+    """Infer elapsed-time unit from a column name; default to seconds."""
+    lower = col_name.lower().strip()
+    if lower in {"ms", "msec"} or lower.endswith(("_ms", " ms", "-ms")) or any(
+        frag in lower for frag in ("millisecond", "milliseconds", "msec")
+    ):
+        return _ELAPSED_MS_LABEL
+    if lower in {"min", "mins"} or any(
+        frag in lower for frag in ("minute", "minutes")
+    ):
+        return _ELAPSED_MINUTES_LABEL
+    return _ELAPSED_SECONDS_LABEL
+
+
+def _detect_elapsed_format(
+    sample_values: list[str],
+    col_name: str,
+) -> tuple[str | None, int]:
+    """Detect numeric relative elapsed-time columns.
+
+    Elapsed-time detection is intentionally name-gated because ordinary analog
+    channels may also be numeric and monotonic.  Values may start before zero
+    for pre-trigger records.
+    """
+    if not _name_suggests_elapsed_time(col_name):
+        return None, len(sample_values)
+
+    non_empty = [v for v in sample_values if str(v).strip()]
+    if len(non_empty) < 2:
+        return None, len(sample_values)
+
+    numeric: list[float] = []
+    invalid = 0
+    for val in non_empty:
+        try:
+            numeric.append(float(str(val).strip()))
+        except ValueError:
+            invalid += 1
+
+    if len(numeric) < 2:
+        return None, len(sample_values)
+
+    parse_rate = len(numeric) / len(non_empty)
+    if parse_rate < 0.8:
+        return None, len(sample_values) - len(numeric)
+
+    monotonic = all(b > a for a, b in zip(numeric, numeric[1:]))
+    if not monotonic:
+        return None, len(sample_values) - len(numeric)
+
+    # Exclude absolute numeric date encodings handled elsewhere.
+    abs_values = [abs(v) for v in numeric]
+    if any(_EPOCH_SECONDS_MIN <= v <= _EPOCH_SECONDS_MAX for v in abs_values):
+        return None, len(sample_values) - len(numeric)
+    if any(_EPOCH_MS_MIN <= v <= _EPOCH_MS_MAX for v in abs_values):
+        return None, len(sample_values) - len(numeric)
+    if all(_EXCEL_SERIAL_MIN <= v <= _EXCEL_SERIAL_MAX for v in numeric):
+        return None, len(sample_values) - len(numeric)
+
+    return _elapsed_format_from_name(col_name), len(sample_values) - len(numeric)
 
 
 def _extract_timezone(values: list[str]) -> str | None:
@@ -187,6 +311,8 @@ def detect_timestamp_candidates(
             continue
 
         fmt, invalid_count = infer_timestamp_format(samples)
+        if fmt is None:
+            fmt, invalid_count = _detect_elapsed_format(samples, col_name)
         if fmt is None and not _name_suggests_timestamp(col_name):
             continue
 
@@ -219,6 +345,7 @@ def detect_timestamp_candidates(
 
         example_vals = [v for v in col_samples[ci] if v.strip()][:5]
         tz = _extract_timezone(example_vals)
+        duplicate_count = _count_duplicate_parsed_values(col_samples[ci], fmt)
 
         candidates.append(
             TimestampCandidate(
@@ -228,6 +355,7 @@ def detect_timestamp_candidates(
                 detected_format=fmt,
                 example_values=example_vals,
                 invalid_sample_count=invalid_count,
+                duplicate_sample_count=duplicate_count,
                 timezone_detected=tz,
             )
         )

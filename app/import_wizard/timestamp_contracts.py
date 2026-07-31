@@ -18,6 +18,9 @@ RECONSTRUCT_HYBRID         Low-resolution timestamps used as 100 ms anchors; sub
                            Parameters: sampling_interval_seconds (or override_sample_rate_hz),
                            override_start_datetime (optional), date_column + time_column
                            (optional, when date/time are split across two columns).
+PARSE_ELAPSED_TIME         Column contains relative elapsed time; convert to seconds.
+GENERATE_SYNTHETIC_ELAPSED No usable column; generate elapsed seconds from interval.
+GENERATE_SAMPLE_INDEX      No timing metadata; use row order as sample index.
 """
 from __future__ import annotations
 
@@ -35,6 +38,9 @@ class TimestampRepairStrategy(enum.Enum):
     EXCEL_SERIAL_CONVERSION    = "excel_serial_conversion"
     TIMEZONE_ALIGNMENT         = "timezone_alignment"
     RECONSTRUCT_HYBRID         = "reconstruct_hybrid"
+    PARSE_ELAPSED_TIME         = "parse_elapsed_time"
+    GENERATE_SYNTHETIC_ELAPSED = "generate_synthetic_elapsed"
+    GENERATE_SAMPLE_INDEX      = "generate_sample_index"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +59,13 @@ class TimestampRepairPlan:
 
     # Used by RECONSTRUCT_FROM_INTERVAL and RECONSTRUCT_HYBRID
     sampling_interval_seconds: float | None = None
+
+    # Used by COMBINE_DATE_TIME_COLUMNS and RECONSTRUCT_HYBRID (split date+time)
+    # Used by GENERATE_SYNTHETIC_ELAPSED when the user supplies sample rate.
+    sample_rate_hz: float | None = None
+
+    # Used by PARSE_ELAPSED_TIME
+    elapsed_time_unit: str | None = None
 
     # Used by COMBINE_DATE_TIME_COLUMNS and RECONSTRUCT_HYBRID (split date+time)
     date_column: str | None = None

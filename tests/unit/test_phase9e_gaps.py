@@ -34,7 +34,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QScrollArea
 
 from app.sessions import EventAnalysisSession
 from app.ui.session.session_canvas_controller import (
@@ -181,6 +181,25 @@ def test_handle_split_by_source_creates_new_panel(qapp) -> None:
     ctrl._handle_split_by_source(volt_panel.panel_id)
     panels_after = len(session.list_panels())
     assert panels_after > panels_before
+
+
+def test_session_split_notifies_owner_with_new_splitter(qapp) -> None:
+    session = _build_session(n_sources=2, names=["VA"])
+    ctrl = SessionCanvasController()
+    rebuilt = []
+    ctrl.set_layout_rebuilt_callback(lambda splitter: rebuilt.append(splitter))
+    ctrl.rebuild_layout(session)
+    ctrl.refresh_all(session)
+
+    volt_panel = next((p for p in session.list_panels() if "voltage" in p.panel_id.lower()), None)
+    if volt_panel is None or len({r[0] for r in volt_panel.channel_refs}) < 2:
+        pytest.skip("Need multi-source voltage panel for split test")
+
+    ctrl._handle_split_by_source(volt_panel.panel_id)
+
+    assert rebuilt
+    assert isinstance(rebuilt[-1], QScrollArea)
+    assert rebuilt[-1].widget() is ctrl._splitter
 
 
 def test_handle_split_by_source_single_source_noop(qapp) -> None:
