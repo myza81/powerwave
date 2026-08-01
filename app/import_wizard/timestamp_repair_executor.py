@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from app.data.timestamp_disambiguation import detect_date_order_ambiguity
 from app.import_wizard.contracts import ValidationMessage, ValidationSeverity
 from app.import_wizard.interval_inference import infer_interval
 from app.import_wizard.repair_diagnostics import RepairDiagnostics
@@ -45,7 +46,11 @@ def _coerce_to_datetime(series: pd.Series, fmt: str | None = None) -> pd.Series:
     """Parse *series* to datetime64.  Returns NaT for unparseable cells.
 
     Uses format="mixed" when no explicit format is given so that pandas 3.x
-    still parses common non-ISO strings (e.g. "2024-01-01 00:00:00").
+    still parses common non-ISO strings (e.g. "2024-01-01 00:00:00").  When no
+    format is known, ambiguous D/M-vs-M/D dates are resolved day-first per
+    Powerwave's approved CSV/Excel timestamp policy (see
+    app.data.timestamp_disambiguation) — unambiguous values (day or month >12)
+    are unaffected.
     """
     if pd.api.types.is_datetime64_any_dtype(series):
         return series.copy()
@@ -56,8 +61,9 @@ def _coerce_to_datetime(series: pd.Series, fmt: str | None = None) -> pd.Series:
     if fmt:
         return pd.to_datetime(series, format=fmt, errors="coerce")
 
-    # No format: "mixed" lets pandas try each value independently (pandas ≥ 2.0)
-    return pd.to_datetime(series, format="mixed", errors="coerce")
+    # No format: "mixed" lets pandas try each value independently (pandas ≥ 2.0).
+    # dayfirst=True applies the day-first-default policy to ambiguous values.
+    return pd.to_datetime(series, format="mixed", dayfirst=True, errors="coerce")
 
 
 def _coerce_special(series: pd.Series, fmt: str) -> pd.Series:
@@ -193,6 +199,18 @@ def execute_parse_detected_format(
     normalized = _coerce_to_datetime(raw_series, fmt=fmt)
     was_string = not pd.api.types.is_datetime64_any_dtype(raw_series)
     repaired = int((~normalized.isna() & raw_series.astype(str).ne("")).sum()) if was_string else 0
+
+    ambiguity = detect_date_order_ambiguity(raw_series.dropna().astype(str).head(50).tolist())
+    if ambiguity.is_ambiguous:
+        msgs.append(ValidationMessage(
+            severity=ValidationSeverity.INFO,
+            code="TS_AMBIGUOUS_DATE_DEFAULT",
+            message=(
+                "Ambiguous date format detected. Powerwave applied DD/MM/YYYY by "
+                "default. You can change this under Timestamp Settings or "
+                "Advanced Timestamp Repair."
+            ),
+        ))
 
     diag = _build_diagnostics(plan.strategy, raw_series, normalized, repaired_rows=repaired)
     msgs += _messages_from_diagnostics(diag)
@@ -353,7 +371,8 @@ def execute_combine_date_time_columns(
     else:
         combined_str = date_s.astype(str).str.strip() + " " + time_s.astype(str).str.strip()
 
-    normalized = pd.to_datetime(combined_str, format="mixed", errors="coerce")
+    # dayfirst=True: same ambiguous-date-order policy as _coerce_to_datetime.
+    normalized = pd.to_datetime(combined_str, format="mixed", dayfirst=True, errors="coerce")
     repaired = int(normalized.notna().sum())
 
     if normalized.isna().all():
@@ -438,7 +457,8 @@ def execute_reconstruct_hybrid(
             combined = date_s.astype(str)
         else:
             combined = date_s.astype(str).str.strip() + " " + time_s.astype(str).str.strip()
-        anchors = pd.to_datetime(combined, format="mixed", errors="coerce")
+        # dayfirst=True: same ambiguous-date-order policy as _coerce_to_datetime.
+        anchors = pd.to_datetime(combined, format="mixed", dayfirst=True, errors="coerce")
     else:
         anchors = _coerce_to_datetime(raw_series, fmt=fmt)
 

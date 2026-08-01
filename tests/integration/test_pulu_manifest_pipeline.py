@@ -127,7 +127,9 @@ class TestComtradeLoad:
 
 class TestCsvLoad:
     def test_start_time(self, csv_rec) -> None:
-        expected = datetime(2026, 3, 6, 17, 25, 0)
+        # "3/6/2026" is an ambiguous D/M-vs-M/D date; Powerwave's approved
+        # policy resolves it day-first by default -> 3 June 2026 (not 6 March).
+        expected = datetime(2026, 6, 3, 17, 25, 0)
         assert csv_rec.timing_info.start_time == expected
 
     def test_waveform_columns(self, csv_rec) -> None:
@@ -185,27 +187,35 @@ class TestMultiSourceSession:
 
 
 class TestDisplayAlignment:
-    def test_reference_start_is_csv_start(self, session) -> None:
+    # NOTE: with the ambiguous-date fix, the CSV's "3/6/2026" now resolves to
+    # 3 June 2026 (day-first default) rather than 6 March 2026. COMTRADE's
+    # start time (6 March 2026, from its own authoritative, unchanged parser)
+    # is therefore now the earliest anchor of the two sources, so COMTRADE —
+    # not the CSV — is the display-alignment reference. This inversion is a
+    # direct, expected consequence of correcting the CSV date interpretation;
+    # COMTRADE's own parsing/values are unaffected (see TestComtradeLoad).
+
+    def test_reference_start_is_comtrade_start(self, session) -> None:
         from app.data.display_alignment import determine_reference_start
 
         ref = determine_reference_start(session.sources)
-        expected = datetime(2026, 3, 6, 17, 25, 0)
+        expected = datetime(2026, 3, 6, 18, 4, 8, 817733)
         assert ref == expected
 
-    def test_csv_offset_is_zero(self, session) -> None:
+    def test_comtrade_offset_is_zero(self, session) -> None:
         from app.data.display_alignment import compute_relative_offsets, determine_reference_start
 
         ref = determine_reference_start(session.sources)
         offsets = compute_relative_offsets(session.sources, ref)
-        assert offsets["csv_ops"] == pytest.approx(0.0)
+        assert offsets["comtrade_main"] == pytest.approx(0.0)
 
-    def test_comtrade_offset_is_correct(self, session) -> None:
+    def test_csv_offset_is_correct(self, session) -> None:
         from app.data.display_alignment import compute_relative_offsets, determine_reference_start
 
         ref = determine_reference_start(session.sources)
         offsets = compute_relative_offsets(session.sources, ref)
-        # COMTRADE 18:04:08.817733 − CSV 17:25:00 = 2348.817733 s
-        assert offsets["comtrade_main"] == pytest.approx(2348.817733, abs=1e-3)
+        # CSV 2026-06-03 17:25:00 − COMTRADE 2026-03-06 18:04:08.817733
+        assert offsets["csv_ops"] == pytest.approx(7687251.182267, abs=1e-3)
 
     def test_aligned_display_time_length(self, session) -> None:
         from app.data.display_alignment import build_aligned_display_time, determine_reference_start
@@ -221,8 +231,8 @@ class TestDisplayAlignment:
         ref = determine_reference_start(session.sources)
         ct_src = session.get_source("comtrade_main")
         t = build_aligned_display_time(ct_src, ref)
-        # First sample starts at offset ≈ 2348.817733 s
-        assert t[0] == pytest.approx(2348.817733, abs=1e-3)
+        # COMTRADE is now its own reference, so its first sample is at offset 0.
+        assert t[0] == pytest.approx(0.0, abs=1e-3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,13 +320,16 @@ class TestVisualizationGrouping:
         for canvas in created:
             _, kwargs = canvas.set_record.call_args
             assert kwargs["axis_mode"] == AXIS_MODE_ABSOLUTE
-            assert kwargs["axis_reference_time"] == datetime(2026, 3, 6, 17, 25, 0)
+            # Reference is now COMTRADE's start time — see TestDisplayAlignment note.
+            assert kwargs["axis_reference_time"] == datetime(2026, 3, 6, 18, 4, 8, 817733)
 
         comtrade_panel = next(
             canvas for key, canvas in panels.items() if key.startswith("comtrade_main/")
         )
         display_record = comtrade_panel.set_record.call_args[0][0]
+        # COMTRADE is now its own reference (see TestDisplayAlignment note), so
+        # its displayed time starts at 0 rather than an offset from the CSV.
         assert float(display_record.waveform_data["time"].iloc[0]) == pytest.approx(
-            2348.817733,
+            0.0,
             abs=1e-3,
         )

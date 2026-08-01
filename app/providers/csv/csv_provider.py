@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.providers.base.base_provider import BaseProvider
 from app.providers.base.exceptions import ProviderLoadError
+from app.data.timestamp_disambiguation import parse_ambiguous_dates
 from app.data.column_classifier import (
     classify_csv_column,
     numeric_column_disposition,
@@ -142,7 +143,16 @@ def _build_time_array(
     # Try datetime parsing when dtype is non-numeric
     if not pd.api.types.is_numeric_dtype(col):
         try:
-            dt_series: pd.Series = pd.to_datetime(col, utc=False)  # type: ignore[assignment]
+            # Ambiguous D/M-vs-M/D dates default to day-first (Powerwave policy);
+            # unambiguous values are parsed correctly regardless. CsvProvider has
+            # no user-override mechanism, so this is always the automatic default.
+            dt_series, ambiguity = parse_ambiguous_dates(col)  # type: ignore[assignment]
+            if ambiguity.is_ambiguous:
+                warnings.warn(
+                    f"Column '{time_col}' in '{path}' contains an ambiguous date "
+                    f"(e.g. '{ambiguity.sample_value}'); Powerwave assumed "
+                    "DD/MM/YYYY by default."
+                )
             t0_stamp = dt_series.iloc[0]
             time_array = (dt_series - t0_stamp).dt.total_seconds().to_numpy(
                 dtype=np.float64

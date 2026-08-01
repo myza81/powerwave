@@ -323,6 +323,52 @@ class TestLoadNumericTime:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TestAmbiguousDateOrder — Powerwave policy: day-first default for CSV/Excel
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestAmbiguousDateOrder:
+    def test_ambiguous_date_defaults_day_first(self, tmp_path: Path) -> None:
+        p = _make_xlsx(
+            tmp_path,
+            "ambiguous.xlsx",
+            [["time", "VA"], ["3/6/2026 17:25", 1.0], ["3/6/2026 17:26", 1.1]],
+        )
+        rec = ExcelProvider().load(p)
+        assert rec.timing_info.start_time == datetime(2026, 6, 3, 17, 25, 0)
+
+    def test_ambiguous_date_emits_warning(self, tmp_path: Path) -> None:
+        import warnings
+
+        p = _make_xlsx(
+            tmp_path,
+            "ambiguous.xlsx",
+            [["time", "VA"], ["3/6/2026 17:25", 1.0], ["3/6/2026 17:26", 1.1]],
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ExcelProvider().load(p)
+        text = "\n".join(str(w.message) for w in caught)
+        assert "ambiguous date" in text.lower()
+        assert "DD/MM/YYYY" in text
+
+    def test_unambiguous_day_over_twelve_no_warning(self, tmp_path: Path) -> None:
+        import warnings
+
+        p = _make_xlsx(
+            tmp_path,
+            "unambiguous.xlsx",
+            [["time", "VA"], ["13/6/2026 17:25", 1.0], ["13/6/2026 17:26", 1.1]],
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            rec = ExcelProvider().load(p)
+        text = "\n".join(str(w.message) for w in caught)
+        assert "ambiguous date" not in text.lower()
+        assert rec.timing_info.start_time == datetime(2026, 6, 13, 17, 25, 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TestLoadNoTimeColumn
 # ─────────────────────────────────────────────────────────────────────────────
 

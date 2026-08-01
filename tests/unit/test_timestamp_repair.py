@@ -134,6 +134,34 @@ class TestParseDetectedFormat:
         norm, diag, msgs = execute_parse_detected_format(series, plan)
         assert norm.notna().all()
 
+    def test_ambiguous_date_resolves_day_first_and_emits_diagnostic(self):
+        series = pd.Series(["3/6/2026 17:25", "3/6/2026 17:26"])
+        plan = _plan(TimestampRepairStrategy.PARSE_DETECTED_FORMAT,
+                     detected_format="%d/%m/%Y %H:%M")
+        norm, diag, msgs = execute_parse_detected_format(series, plan)
+        assert norm.iloc[0] == pd.Timestamp("2026-06-03 17:25:00")
+        codes = {m.code for m in msgs}
+        assert "TS_AMBIGUOUS_DATE_DEFAULT" in codes
+        ambiguous_msg = next(m for m in msgs if m.code == "TS_AMBIGUOUS_DATE_DEFAULT")
+        assert ambiguous_msg.severity == ValidationSeverity.INFO
+        assert "DD/MM/YYYY" in ambiguous_msg.message
+
+    def test_unambiguous_date_no_ambiguity_diagnostic(self):
+        series = pd.Series(["13/6/2026 17:25", "13/6/2026 17:26"])
+        plan = _plan(TimestampRepairStrategy.PARSE_DETECTED_FORMAT,
+                     detected_format="%d/%m/%Y %H:%M")
+        norm, diag, msgs = execute_parse_detected_format(series, plan)
+        codes = {m.code for m in msgs}
+        assert "TS_AMBIGUOUS_DATE_DEFAULT" not in codes
+
+    def test_iso_format_no_ambiguity_diagnostic(self):
+        series = _iso_series()
+        plan = _plan(TimestampRepairStrategy.PARSE_DETECTED_FORMAT,
+                     detected_format="%Y-%m-%d %H:%M:%S")
+        norm, diag, msgs = execute_parse_detected_format(series, plan)
+        codes = {m.code for m in msgs}
+        assert "TS_AMBIGUOUS_DATE_DEFAULT" not in codes
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PARSE_USER_FORMAT
@@ -148,6 +176,17 @@ class TestParseUserFormat:
         assert norm.notna().all()
         assert norm.iloc[0].day == 15
         assert norm.iloc[0].month == 1
+
+    def test_explicit_month_first_override_beats_day_first_default(self):
+        # "3/6/2026" is ambiguous and would default to day-first (3 June);
+        # an explicit user format must win and produce 6 March instead.
+        series = pd.Series(["3/6/2026 17:25"])
+        plan = _plan(TimestampRepairStrategy.PARSE_USER_FORMAT,
+                     user_format="%m/%d/%Y %H:%M")
+        norm, diag, msgs = execute_parse_user_format(series, plan)
+        assert norm.iloc[0] == pd.Timestamp("2026-03-06 17:25:00")
+        codes = {m.code for m in msgs}
+        assert "TS_AMBIGUOUS_DATE_DEFAULT" not in codes
 
     def test_format_mismatch_produces_error(self):
         series = pd.Series(["2024-01-15"])
@@ -322,6 +361,55 @@ class TestCombineDateTimeColumns:
                      date_column="D", time_column="T")
         norm, diag, msgs = execute_combine_date_time_columns(date_s, plan, {"D": date_s, "T": time_s})
         assert norm.isna().all()
+
+    def test_ambiguous_combined_date_resolves_day_first(self):
+        date_s = pd.Series(["3/6/2026", "3/6/2026"])
+        time_s = pd.Series(["17:25:00", "17:26:00"])
+        plan = _plan(TimestampRepairStrategy.COMBINE_DATE_TIME_COLUMNS,
+                     date_column="Date", time_column="Time")
+        norm, diag, msgs = execute_combine_date_time_columns(
+            date_s, plan, {"Date": date_s, "Time": time_s}
+        )
+        assert norm.iloc[0] == pd.Timestamp("2026-06-03 17:25:00")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECONSTRUCT_HYBRID — date-order policy on anchor parsing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestReconstructHybridDateOrder:
+    def test_ambiguous_anchor_resolves_day_first(self):
+        from app.import_wizard.timestamp_repair_executor import execute_reconstruct_hybrid
+
+        # Truncated-timestamp style input: repeated anchor, ambiguous date.
+        series = pd.Series(["3/6/2026 17:25"] * 4)
+        plan = _plan(
+            TimestampRepairStrategy.RECONSTRUCT_HYBRID,
+            override_sample_rate_hz=50.0,
+        )
+        norm, diag, msgs = execute_reconstruct_hybrid(series, plan)
+        assert norm.notna().all()
+        assert norm.iloc[0].to_pydatetime().replace(microsecond=0) == pd.Timestamp(
+            "2026-06-03 17:25:00"
+        ).to_pydatetime()
+
+    def test_ambiguous_anchor_with_separate_date_time_columns_resolves_day_first(self):
+        from app.import_wizard.timestamp_repair_executor import execute_reconstruct_hybrid
+
+        date_s = pd.Series(["3/6/2026"] * 4)
+        time_s = pd.Series(["17:25:00"] * 4)
+        plan = _plan(
+            TimestampRepairStrategy.RECONSTRUCT_HYBRID,
+            date_column="Date",
+            time_column="Time",
+            override_sample_rate_hz=50.0,
+        )
+        norm, diag, msgs = execute_reconstruct_hybrid(
+            date_s, plan, {"Date": date_s, "Time": time_s}
+        )
+        assert norm.iloc[0].to_pydatetime().replace(microsecond=0) == pd.Timestamp(
+            "2026-06-03 17:25:00"
+        ).to_pydatetime()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

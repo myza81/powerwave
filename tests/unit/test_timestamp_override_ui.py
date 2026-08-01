@@ -226,3 +226,101 @@ def test_override_change_invalidates_stale_plan(monkeypatch, qapp, local_tmp) ->
     finally:
         dlg.close()
         qapp.processEvents()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ambiguous-date override: user selection must be fully authoritative
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _ambiguous_dialog(local_tmp) -> ImportWizardDialog:
+    """A real (unmocked) profile of a genuinely ambiguous CSV, end to end."""
+    path = local_tmp / "ambiguous.csv"
+    path.write_text(
+        "Time,VA\n"
+        "3/6/2026 17:25,1.0\n"
+        "3/6/2026 17:26,1.1\n"
+        "3/6/2026 17:27,1.2\n",
+        encoding="utf-8",
+    )
+    dlg = ImportWizardDialog(thread_pool=ImmediateThreadPool())
+    dlg.set_source_path(str(path))
+    dlg.profile_selected_file()
+    assert dlg.session is not None
+    return dlg
+
+
+def test_automatic_default_resolves_day_first(local_tmp) -> None:
+    from datetime import datetime as dt
+
+    dlg = _ambiguous_dialog(local_tmp)
+    try:
+        result = dlg._rebuild_execution_plan()
+        assert result is not None and result.is_executable
+        dlg.run_import()
+        assert dlg.pipeline_result is not None and dlg.pipeline_result.success
+        assert dlg.pipeline_result.record.timing_info.start_time == dt(2026, 6, 3, 17, 25, 0)
+    finally:
+        dlg.close()
+
+
+def test_manual_month_first_override_rebuilds_full_axis(local_tmp) -> None:
+    from datetime import datetime as dt
+
+    dlg = _ambiguous_dialog(local_tmp)
+    try:
+        # Confirm the automatic (day-first) baseline first.
+        dlg._rebuild_execution_plan()
+        dlg.run_import()
+        assert dlg.pipeline_result.record.timing_info.start_time == dt(2026, 6, 3, 17, 25, 0)
+
+        # User overrides to an explicit month-first format.
+        dlg.timestamp_page.override_edit.setText("%m/%d/%Y %H:%M")
+        result = dlg._rebuild_execution_plan()
+        assert result is not None and result.is_executable
+        assert result.normalization_plan.timestamp_plan.strategy == TimestampRepairStrategy.PARSE_USER_FORMAT
+
+        dlg.run_import()
+
+        assert dlg.pipeline_result is not None and dlg.pipeline_result.success
+        record = dlg.pipeline_result.record
+        # The full axis must be rebuilt from the new anchor -- not a stale
+        # start_time left over from the earlier automatic interpretation.
+        assert record.timing_info.start_time == dt(2026, 3, 6, 17, 25, 0)
+        deltas = record.waveform_data["time"].tolist()
+        assert deltas == pytest.approx([0.0, 60.0, 120.0])
+    finally:
+        dlg.close()
+
+
+def test_navigating_steps_preserves_explicit_override(local_tmp) -> None:
+    from app.import_wizard.wizard_state import WizardStep
+
+    dlg = _ambiguous_dialog(local_tmp)
+    try:
+        dlg.timestamp_page.override_edit.setText("%m/%d/%Y %H:%M")
+        dlg._set_step(WizardStep.COLUMN_MAPPING)
+        dlg._set_step(WizardStep.TIMESTAMP_SELECT)
+
+        assert dlg.timestamp_page.override_edit.text() == "%m/%d/%Y %H:%M"
+        plan = dlg.session.timestamp_repair_plan
+        assert plan.strategy == TimestampRepairStrategy.PARSE_USER_FORMAT
+        assert plan.user_format == "%m/%d/%Y %H:%M"
+    finally:
+        dlg.close()
+
+
+def test_advanced_repair_still_respects_explicit_format(local_tmp) -> None:
+    """Advanced timestamp-repair controls (reconstruction) must not silently
+    re-detect an ambiguous date order once the user has set an explicit format.
+    """
+    dlg = _ambiguous_dialog(local_tmp)
+    try:
+        dlg.timestamp_page.override_edit.setText("%m/%d/%Y %H:%M")
+        result = dlg._rebuild_execution_plan()
+        assert result is not None and result.is_executable
+        plan = result.normalization_plan.timestamp_plan
+        assert plan.strategy == TimestampRepairStrategy.PARSE_USER_FORMAT
+        assert plan.user_format == "%m/%d/%Y %H:%M"
+    finally:
+        dlg.close()

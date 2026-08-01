@@ -385,6 +385,73 @@ class TestLoadTimestampColumn:
 
 
 # ---------------------------------------------------------------------------
+# load() — ambiguous date order (Powerwave policy: day-first default)
+# ---------------------------------------------------------------------------
+
+
+class TestAmbiguousDateOrder:
+    def test_ambiguous_date_defaults_day_first(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            3/6/2026 17:25,1.0
+            3/6/2026 17:26,1.1
+        """)
+        record = CsvProvider().load(p)
+        assert record.timing_info.start_time == datetime(2026, 6, 3, 17, 25, 0)
+
+    def test_ambiguous_date_emits_warning(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            3/6/2026 17:25,1.0
+            3/6/2026 17:26,1.1
+        """)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            CsvProvider().load(p)
+        text = "\n".join(str(w.message) for w in caught)
+        assert "ambiguous date" in text.lower()
+        assert "DD/MM/YYYY" in text
+
+    def test_unambiguous_day_over_twelve_no_warning(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            13/6/2026 17:25,1.0
+            13/6/2026 17:26,1.1
+        """)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            record = CsvProvider().load(p)
+        text = "\n".join(str(w.message) for w in caught)
+        assert "ambiguous date" not in text.lower()
+        assert record.timing_info.start_time == datetime(2026, 6, 13, 17, 25, 0)
+
+    def test_unambiguous_month_first_input_no_warning(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            6/13/2026 17:25,1.0
+            6/13/2026 17:26,1.1
+        """)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            record = CsvProvider().load(p)
+        text = "\n".join(str(w.message) for w in caught)
+        assert "ambiguous date" not in text.lower()
+        assert record.timing_info.start_time == datetime(2026, 6, 13, 17, 25, 0)
+
+    def test_iso_timestamp_not_flagged_ambiguous(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            2026-06-03 17:25:00,1.0
+            2026-06-03 17:25:01,1.1
+        """)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            CsvProvider().load(p)
+        text = "\n".join(str(w.message) for w in caught)
+        assert "ambiguous date" not in text.lower()
+
+
+# ---------------------------------------------------------------------------
 # load() — no time column
 # ---------------------------------------------------------------------------
 
