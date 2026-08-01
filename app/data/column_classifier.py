@@ -170,7 +170,24 @@ def _name_classify(
 def _value_classify(
     values: Sequence[float],
 ) -> tuple[str | None, str | None, str, float, str] | None:
-    """Return (signal_type, unit, display_group, confidence, inferred_from) or None."""
+    """Return (signal_type, unit, display_group, confidence, inferred_from) or None.
+
+    Numeric magnitude/statistics alone must not assign an electrical parameter
+    type: voltage, current, active power, reactive power, ROCOF, and per-unit
+    ranges all overlap in plausible magnitude with each other and with
+    arbitrary non-electrical process data, so no band exists here for those
+    types -- name-based evidence (_name_classify, tried first by
+    classify_csv_column) or explicit unit metadata is required instead.
+
+    The one retained exception is a narrow mains-frequency band (50/60 Hz
+    nominal, tight tolerance): frequency occupies a well-separated numeric
+    range that does not plausibly collide with voltage/current/power
+    magnitudes, and this exact band is exercised by existing tests
+    (TestValueProfileInference.test_near_50hz_detected,
+    TestValueProfileInference.test_near_60hz_detected). It mirrors the same
+    narrow exception retained in the Import Wizard's own
+    app.import_wizard.column_detector._classify_by_values.
+    """
     arr = np.asarray(values, dtype=np.float64)
     finite = arr[np.isfinite(arr)]
     if len(finite) < 5:
@@ -179,18 +196,11 @@ def _value_classify(
     mean_v = float(np.mean(finite))
     std_v = float(np.std(finite))
 
-    # Frequency-like: mean near 50 or 60 Hz, tight range
+    # Frequency-like: mean near 50 or 60 Hz, tight range (the one safe
+    # magnitude exception -- see docstring).
     for nominal in (50.0, 60.0):
         if abs(mean_v - nominal) < 2.0 and std_v < 2.0:
             return "frequency", "Hz", "frequency", 0.70, "value_profile"
-
-    # Per-unit voltage-like: mean near 1.0, very tight range
-    if 0.85 <= mean_v <= 1.15 and std_v < 0.15:
-        return "voltage_rms", "pu", "voltage_rms", 0.55, "value_profile"
-
-    # Power-like: large absolute values with meaningful spread
-    if abs(mean_v) > 50 and std_v > 5:
-        return "active_power", "MW", "power", 0.50, "value_profile"
 
     return None
 

@@ -268,6 +268,17 @@ class TestRelayStyleVoltageCurrent:
 
 
 class TestValueProfileInference:
+    """Value-profile inference is deliberately narrow: the only retained
+    magnitude-based signal is a tight mains-frequency band. Values alone must
+    never assign voltage, current, active/reactive power, ROCOF, or per-unit
+    types -- those magnitude ranges overlap with each other and with
+    arbitrary non-electrical data (see column_classifier._value_classify's
+    docstring). This class was deliberately narrowed per the approved
+    architecture review; TestValueProfileInference historically also
+    asserted per-unit-voltage and power-magnitude value fallbacks, which are
+    now removed rather than merely re-pointed.
+    """
+
     def _near_50_values(self) -> list[float]:
         rng = np.random.default_rng(42)
         return (50.0 + rng.normal(0, 0.05, 100)).tolist()
@@ -275,6 +286,16 @@ class TestValueProfileInference:
     def _near_60_values(self) -> list[float]:
         rng = np.random.default_rng(42)
         return (60.0 + rng.normal(0, 0.05, 100)).tolist()
+
+    def _near_1_pu_values(self) -> list[float]:
+        rng = np.random.default_rng(42)
+        return (1.0 + rng.normal(0, 0.02, 100)).tolist()
+
+    def _noisy_values_near(self, center: float, spread: float = 8.0) -> list[float]:
+        rng = np.random.default_rng(7)
+        return (center + rng.normal(0, spread, 30)).tolist()
+
+    # -- Frequency: the one retained, unchanged exception --------------------
 
     def test_values_near_50hz_suggest_frequency(self) -> None:
         cl = classify_csv_column("UnknownSignal", self._near_50_values())
@@ -290,29 +311,74 @@ class TestValueProfileInference:
         assert cl.confidence < CONFIRMATION_THRESHOLD
         assert cl.requires_user_confirmation is True
 
-    def test_per_unit_values_suggest_voltage(self) -> None:
-        rng = np.random.default_rng(42)
-        vals = (1.0 + rng.normal(0, 0.02, 100)).tolist()
-        cl = classify_csv_column("VoltageChannel", vals)
-        # name "voltage" keyword should win over value profile
-        assert cl.signal_type == "voltage_rms"
+    # -- Per-unit-voltage magnitude fallback: removed -------------------------
 
-    def test_per_unit_values_alone_low_confidence(self) -> None:
-        rng = np.random.default_rng(42)
-        vals = (1.0 + rng.normal(0, 0.02, 100)).tolist()
-        cl = classify_csv_column("Signal_ABC", vals)
+    def test_per_unit_values_alone_no_longer_classify(self) -> None:
+        # Previously suggested voltage_rms/pu at low confidence; magnitude
+        # alone must no longer assign any electrical type.
+        cl = classify_csv_column("Signal_ABC", self._near_1_pu_values())
+        assert cl.signal_type is None
+        assert cl.unit is None
         assert cl.requires_user_confirmation is True
 
+    def test_named_voltage_channel_still_classifies_via_name(self) -> None:
+        # Name evidence ("voltage" keyword) is unaffected by the removal of
+        # the per-unit value band.
+        cl = classify_csv_column("VoltageChannel", self._near_1_pu_values())
+        assert cl.signal_type == "voltage_rms"
+        assert cl.inferred_from == "name_keyword"
+
+    # -- Power-magnitude fallback: removed ------------------------------------
+
+    @pytest.mark.parametrize("center", [132.0, 275.0, 400.0, 1000.0, 18700.0])
+    def test_noisy_large_magnitudes_no_longer_suggest_active_power(self, center: float) -> None:
+        cl = classify_csv_column("Signal_ABC", self._noisy_values_near(center))
+        assert cl.signal_type is None
+        assert cl.unit is None
+
+    def test_positive_power_like_range_remains_unknown(self) -> None:
+        cl = classify_csv_column("Column 1", self._noisy_values_near(120.0))
+        assert cl.signal_type is None
+
+    def test_negative_power_like_range_remains_unknown(self) -> None:
+        rng = np.random.default_rng(7)
+        vals = (-120.0 + rng.normal(0, 8.0, 30)).tolist()
+        cl = classify_csv_column("Column 1", vals)
+        assert cl.signal_type is None
+
+    def test_named_active_power_channel_still_classifies_via_name(self) -> None:
+        cl = classify_csv_column("Active Power", self._noisy_values_near(120.0))
+        assert cl.signal_type == "active_power"
+        assert cl.inferred_from == "name_keyword"
+
+    # -- Name precedence over values (unchanged) ------------------------------
+
     def test_name_takes_precedence_over_values(self) -> None:
-        # Column named "Frequency" should get name_exact, not value_profile
-        rng = np.random.default_rng(42)
-        vals = (1.0 + rng.normal(0, 0.02, 100)).tolist()
-        cl = classify_csv_column("Frequency", vals)
+        # Column named "Frequency" should get name_exact, not value_profile,
+        # even when the values themselves no longer suggest anything.
+        cl = classify_csv_column("Frequency", self._near_1_pu_values())
         assert cl.inferred_from == "name_exact"
+        assert cl.signal_type == "frequency"
+
+    # -- Safety of edge-case inputs --------------------------------------------
 
     def test_too_few_values_no_value_classification(self) -> None:
         cl = classify_csv_column("X", [50.0, 50.1])
         # Only 2 values — value_profile won't trigger; should fall to unknown
+        assert cl.signal_type is None
+
+    def test_empty_values_list_stays_unknown(self) -> None:
+        cl = classify_csv_column("Column 1", [])
+        assert cl.signal_type is None
+        assert cl.confidence == 0.0
+        assert cl.requires_user_confirmation is True
+
+    def test_single_value_stays_unknown(self) -> None:
+        cl = classify_csv_column("Column 1", [42.0])
+        assert cl.signal_type is None
+
+    def test_none_values_stays_unknown(self) -> None:
+        cl = classify_csv_column("Column 1", None)
         assert cl.signal_type is None
 
 

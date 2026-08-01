@@ -9,10 +9,19 @@ correct parameter types (e.g. System Demand no longer tagged "voltage") land
 in the right panel/axis without any change to these modules.
 
 No production code in app/sessions or app/visualization was modified for
-this task; these tests exist to prove that was safe, not to change behaviour.
+this task, or for the follow-up task that removed the shared classifier's
+unsafe magnitude-only electrical fallbacks and gated provider unit
+assignment on confirmation status -- these tests exist to prove both changes
+were safe from the downstream panel/axis perspective, not to change
+behaviour there.
 """
 from __future__ import annotations
 
+import tempfile
+import warnings
+from pathlib import Path
+
+from app.providers.csv.csv_provider import CsvProvider
 from app.sessions.event_session import _infer_panel_for_channel
 from app.visualization.axis_management import (
     AxisDisplayMode,
@@ -78,3 +87,56 @@ class TestAxisGrouping:
             "Va", "V", mode=AxisDisplayMode.SHARED, signal_type_hint="voltage_rms"
         )
         assert group.key.startswith("voltage")
+
+
+class TestUnconfirmedMagnitudeNoLongerRoutesToElectricalPanel:
+    """End-to-end regression test: a neutral-header column whose values
+    previously triggered a magnitude-only electrical guess (removed in this
+    task) must no longer receive an electrical unit, and must therefore no
+    longer be routed to the Power or Voltage panel via the unit fallback in
+    _infer_panel_for_channel. _infer_panel_for_channel itself is unchanged;
+    only the provider-level input it receives has changed.
+    """
+
+    def _load_channel(self, tmp_path: Path, header: str, values: list[float]):
+        p = tmp_path / "t.csv"
+        lines = [f"time,{header}"] + [f"{i}.0,{v}" for i, v in enumerate(values)]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rec = CsvProvider().load(p)
+        return next(c for c in rec.analog_channels if c.name == header)
+
+    def test_neutral_near_1pu_no_longer_enters_voltage_panel(self, tmp_path: Path) -> None:
+        values = [0.98, 1.01, 0.99, 1.02, 1.00, 1.01, 0.99]
+        ch = self._load_channel(tmp_path, "Column 1", values)
+        assert ch.unit != "pu"
+        assert ch.unit == "unknown"
+        panel_id, _ = _infer_panel_for_channel("Column 1", unit=ch.unit, param_type=ch.parameter_type)
+        assert panel_id != "voltage"
+        assert panel_id == "other"
+
+    def test_neutral_noisy_large_magnitude_no_longer_enters_power_panel(self, tmp_path: Path) -> None:
+        values = [18700.0, 18712.0, 18705.0, 18730.0, 18711.0, 18698.0, 18720.0]
+        ch = self._load_channel(tmp_path, "Column 1", values)
+        assert ch.unit != "MW"
+        assert ch.unit == "unknown"
+        panel_id, _ = _infer_panel_for_channel("Column 1", unit=ch.unit, param_type=ch.parameter_type)
+        assert panel_id != "power"
+        assert panel_id == "other"
+
+    def test_neutral_negative_mw_like_no_longer_enters_power_panel(self, tmp_path: Path) -> None:
+        values = [-120.0, -140.0, -118.0, -145.0, -121.0, -110.0, -133.0]
+        ch = self._load_channel(tmp_path, "Column 1", values)
+        assert ch.unit == "unknown"
+        panel_id, _ = _infer_panel_for_channel("Column 1", unit=ch.unit, param_type=ch.parameter_type)
+        assert panel_id == "other"
+
+    def test_named_electrical_channel_still_routes_correctly(self, tmp_path: Path) -> None:
+        # Contrast case: confirms this test class isn't just observing
+        # everything landing in "other" regardless of input.
+        values = [18700.0, 18712.0, 18705.0, 18730.0, 18711.0]
+        ch = self._load_channel(tmp_path, "System Demand", values)
+        assert ch.unit == "MW"
+        panel_id, _ = _infer_panel_for_channel("System Demand", unit=ch.unit, param_type=ch.parameter_type)
+        assert panel_id == "power"

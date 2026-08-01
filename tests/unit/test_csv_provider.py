@@ -554,19 +554,26 @@ class TestParameterTypeInference:
         assert ch.unit == "MW"
         assert ch.parameter_type == "active_power"
 
-    def test_low_confidence_tie_line_leaves_parameter_type_none(self, tmp_path: Path) -> None:
+    def test_low_confidence_tie_line_leaves_unit_and_parameter_type_unset(self, tmp_path: Path) -> None:
+        # "Tie-Line" is name-derived (not value-derived) but below the
+        # confirmation threshold (0.70 < 0.80). The same confidence
+        # discipline that already gated parameter_type now also gates unit:
+        # an unconfirmed classification must not populate either field, even
+        # when the low-confidence guess came from a name keyword rather than
+        # a value profile.
         rows = [f"{i}.0,{80.0 + i}" for i in range(5)]
         r = self._load_rows(tmp_path, "time,Tie-Line", rows)
         ch = next(c for c in r.analog_channels if c.name == "Tie-Line")
         assert ch.name == "Tie-Line"
-        assert ch.unit == "MW"  # unit still reasonably inferred
-        assert ch.parameter_type is None  # confidence below threshold
+        assert ch.unit == "unknown"
+        assert ch.parameter_type is None
 
     def test_confident_frequency_column_populates_parameter_type(self, tmp_path: Path) -> None:
         rows = [f"{i}.0,{50.0 + i * 0.01}" for i in range(5)]
         r = self._load_rows(tmp_path, "time,Frequency", rows)
         ch = next(c for c in r.analog_channels if c.name == "Frequency")
         assert ch.parameter_type == "frequency"
+        assert ch.unit == "Hz"
 
     def test_relay_voltage_column_populates_parameter_type(self, tmp_path: Path) -> None:
         rows = [f"{i}.0,{230.0 + i}" for i in range(5)]
@@ -579,6 +586,41 @@ class TestParameterTypeInference:
         rows = [f"{i}.0,{1500 + i}" for i in range(5)]
         r = self._load_rows(tmp_path, "time,RPM", rows)
         ch = next(c for c in r.analog_channels if c.name == "RPM")
+        assert ch.parameter_type is None
+
+    # -- Value-only magnitude fallback: unit and parameter_type both gated ---
+
+    def test_neutral_header_near_1pu_does_not_populate_unit_or_type(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        rng = np.random.default_rng(42)
+        vals = (1.0 + rng.normal(0, 0.02, 30)).tolist()
+        rows = [f"{i}.0,{v}" for i, v in enumerate(vals)]
+        r = self._load_rows(tmp_path, "time,Column 1", rows)
+        ch = next(c for c in r.analog_channels if c.name == "Column 1")
+        assert ch.unit == "unknown"
+        assert ch.parameter_type is None
+
+    def test_neutral_header_noisy_large_magnitude_does_not_populate_unit_or_type(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        rng = np.random.default_rng(7)
+        vals = (18700.0 + rng.normal(0, 15.0, 30)).tolist()
+        rows = [f"{i}.0,{v}" for i, v in enumerate(vals)]
+        r = self._load_rows(tmp_path, "time,Column 1", rows)
+        ch = next(c for c in r.analog_channels if c.name == "Column 1")
+        assert ch.unit == "unknown"
+        assert ch.parameter_type is None
+
+    def test_neutral_header_negative_power_like_does_not_populate_unit_or_type(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        rng = np.random.default_rng(7)
+        vals = (-120.0 + rng.normal(0, 8.0, 30)).tolist()
+        rows = [f"{i}.0,{v}" for i, v in enumerate(vals)]
+        r = self._load_rows(tmp_path, "time,Column 1", rows)
+        ch = next(c for c in r.analog_channels if c.name == "Column 1")
+        assert ch.unit == "unknown"
         assert ch.parameter_type is None
 
 

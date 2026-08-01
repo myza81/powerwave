@@ -353,8 +353,13 @@ class ExcelProvider(BaseProvider):
                     continue
                 vals = numeric.to_numpy(dtype=np.float64)
 
-                # Unit fallback if intelligence couldn't infer it
-                unit = cls.unit if cls.unit else _infer_unit(col_name)
+                # An unconfirmed classification (confidence below the shared
+                # threshold) must not populate the engineering unit either --
+                # the same confidence discipline already applied to
+                # parameter_type below. Fall back to name-only inference (or
+                # its own "unknown" default) instead of a low-confidence
+                # value-profile-derived unit.
+                unit = cls.unit if (cls.unit and not cls.requires_user_confirmation) else _infer_unit(col_name)
 
                 # Populate parameter_type only when the shared classifier's
                 # result is confident enough not to require user confirmation

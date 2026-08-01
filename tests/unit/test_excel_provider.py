@@ -458,14 +458,17 @@ class TestParameterTypeInference:
         assert ch.unit == "MW"
         assert ch.parameter_type == "active_power"
 
-    def test_low_confidence_tie_line_leaves_parameter_type_none(self, tmp_path: Path) -> None:
+    def test_low_confidence_tie_line_leaves_unit_and_parameter_type_unset(self, tmp_path: Path) -> None:
+        # Same confidence discipline now applies to unit as already applied
+        # to parameter_type -- "Tie-Line" is name-derived but below the
+        # confirmation threshold, so neither field is populated.
         p = _make_xlsx(
             tmp_path, "d.xlsx",
             [["time", "Tie-Line"]] + [[i * 0.02, 80.0 + i] for i in range(5)],
         )
         rec = ExcelProvider().load(p)
         ch = next(c for c in rec.analog_channels if c.name == "Tie-Line")
-        assert ch.unit == "MW"
+        assert ch.unit == "unknown"
         assert ch.parameter_type is None
 
     def test_unrecognised_column_leaves_parameter_type_none(self, tmp_path: Path) -> None:
@@ -475,6 +478,50 @@ class TestParameterTypeInference:
         )
         rec = ExcelProvider().load(p)
         assert rec.analog_channels[0].parameter_type is None
+
+    # -- Value-only magnitude fallback: unit and parameter_type both gated ---
+
+    def test_neutral_header_near_1pu_does_not_populate_unit_or_type(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        rng = np.random.default_rng(42)
+        vals = (1.0 + rng.normal(0, 0.02, 30)).tolist()
+        p = _make_xlsx(
+            tmp_path, "n.xlsx",
+            [["time", "Column 1"]] + [[i * 0.02, v] for i, v in enumerate(vals)],
+        )
+        rec = ExcelProvider().load(p)
+        ch = next(c for c in rec.analog_channels if c.name == "Column 1")
+        assert ch.unit == "unknown"
+        assert ch.parameter_type is None
+
+    def test_neutral_header_noisy_large_magnitude_does_not_populate_unit_or_type(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        rng = np.random.default_rng(7)
+        vals = (18700.0 + rng.normal(0, 15.0, 30)).tolist()
+        p = _make_xlsx(
+            tmp_path, "n.xlsx",
+            [["time", "Column 1"]] + [[i * 0.02, v] for i, v in enumerate(vals)],
+        )
+        rec = ExcelProvider().load(p)
+        ch = next(c for c in rec.analog_channels if c.name == "Column 1")
+        assert ch.unit == "unknown"
+        assert ch.parameter_type is None
+
+    def test_neutral_header_negative_power_like_does_not_populate_unit_or_type(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        rng = np.random.default_rng(7)
+        vals = (-120.0 + rng.normal(0, 8.0, 30)).tolist()
+        p = _make_xlsx(
+            tmp_path, "n.xlsx",
+            [["time", "Column 1"]] + [[i * 0.02, v] for i, v in enumerate(vals)],
+        )
+        rec = ExcelProvider().load(p)
+        ch = next(c for c in rec.analog_channels if c.name == "Column 1")
+        assert ch.unit == "unknown"
+        assert ch.parameter_type is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
