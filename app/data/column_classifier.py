@@ -78,6 +78,26 @@ _EXACT: dict[str, tuple[str, str, str, float]] = {
     "q":          ("reactive_power", "MVAr", "power",        0.72),
     "f":          ("frequency",      "Hz",   "frequency",    0.72),
     "a":          ("current_rms",    "A",    "current_rms",  0.60),
+    # Relay-style phase voltage/current — unambiguous power-system naming
+    # convention (IEC 61850 / protection-relay style). Name-based only; never
+    # inferred from value magnitude.
+    "va":         ("voltage_rms",    "V",    "voltage_rms",  0.85),
+    "vb":         ("voltage_rms",    "V",    "voltage_rms",  0.85),
+    "vc":         ("voltage_rms",    "V",    "voltage_rms",  0.85),
+    "vab":        ("voltage_rms",    "V",    "voltage_rms",  0.85),
+    "vbc":        ("voltage_rms",    "V",    "voltage_rms",  0.85),
+    "vca":        ("voltage_rms",    "V",    "voltage_rms",  0.85),
+    "ia":         ("current_rms",    "A",    "current_rms",  0.85),
+    "ib":         ("current_rms",    "A",    "current_rms",  0.85),
+    "ic":         ("current_rms",    "A",    "current_rms",  0.85),
+    "in":         ("current_rms",    "A",    "current_rms",  0.82),
+    # Symmetrical-component notation (zero/positive/negative sequence)
+    "v0":         ("voltage_rms",    "V",    "voltage_rms",  0.82),
+    "v1":         ("voltage_rms",    "V",    "voltage_rms",  0.82),
+    "v2":         ("voltage_rms",    "V",    "voltage_rms",  0.82),
+    "i0":         ("current_rms",    "A",    "current_rms",  0.82),
+    "i1":         ("current_rms",    "A",    "current_rms",  0.82),
+    "i2":         ("current_rms",    "A",    "current_rms",  0.82),
 }
 
 # Ordered keyword rules: first match wins.
@@ -103,6 +123,11 @@ _KEYWORD: list[tuple[tuple[str, ...], str, str, str, float]] = [
     # Standalone "demand", "load", etc. — above threshold but still general
     (("demand", "load", "generation", "output"),
      "active_power",   "MW",   "power",        0.78),
+    # "P Total" / "Q Total" — common relay/meter total-power designators
+    (("p total", "p_total", "ptotal"),
+     "active_power",   "MW",   "power",        0.75),
+    (("q total", "q_total", "qtotal"),
+     "reactive_power", "MVAr", "power",        0.75),
     # Tie-line / interchange — likely MW but ambiguous enough for confirmation
     (("tie-line", "tieline", "tie line", "interchange", "export", "import"),
      "active_power",   "MW",   "power",        0.70),

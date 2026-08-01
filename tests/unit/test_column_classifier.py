@@ -163,6 +163,106 @@ class TestKeywordClassification:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Additional active/reactive-power terminology (generic, not PULU-specific —
+# these headers do not appear in any repository fixture and must resolve
+# purely from the name rules below).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestActivePowerTerminology:
+    def test_grid_demand_is_active_power_and_flagged(self) -> None:
+        cl = classify_csv_column("Grid Demand")
+        assert cl.signal_type == "active_power"
+        assert cl.unit == "MW"
+        assert cl.requires_user_confirmation is True
+
+    def test_net_generation_is_active_power(self) -> None:
+        cl = classify_csv_column("Net Generation")
+        assert cl.signal_type == "active_power"
+
+    def test_plant_output_is_active_power(self) -> None:
+        cl = classify_csv_column("Plant Output")
+        assert cl.signal_type == "active_power"
+
+    def test_import_power_is_active_power_and_flagged(self) -> None:
+        cl = classify_csv_column("Import Power")
+        assert cl.signal_type == "active_power"
+        assert cl.requires_user_confirmation is True
+
+    def test_export_power_is_active_power_and_flagged(self) -> None:
+        cl = classify_csv_column("Export Power")
+        assert cl.signal_type == "active_power"
+        assert cl.requires_user_confirmation is True
+
+    def test_real_power_is_active_power(self) -> None:
+        cl = classify_csv_column("Real Power")
+        assert cl.signal_type == "active_power"
+        assert cl.confidence >= 0.88
+
+    def test_p_total_is_active_power_and_conservative(self) -> None:
+        cl = classify_csv_column("P Total")
+        assert cl.signal_type == "active_power"
+        assert cl.unit == "MW"
+        assert cl.requires_user_confirmation is True
+
+    def test_p_total_underscore_variant(self) -> None:
+        cl = classify_csv_column("P_TOTAL")
+        assert cl.signal_type == "active_power"
+
+    def test_q_total_is_reactive_power_and_conservative(self) -> None:
+        cl = classify_csv_column("Q Total")
+        assert cl.signal_type == "reactive_power"
+        assert cl.unit == "MVAr"
+        assert cl.requires_user_confirmation is True
+
+    def test_mvar_capital_r_variant(self) -> None:
+        cl = classify_csv_column("MVAr")
+        assert cl.signal_type == "reactive_power"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Relay-style phase voltage/current names (name-based only — never inferred
+# from magnitude).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestRelayStyleVoltageCurrent:
+    @pytest.mark.parametrize("name", ["Va", "Vb", "Vc", "Vab", "Vbc", "Vca"])
+    def test_phase_voltage_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "voltage_rms"
+        assert cl.unit == "V"
+        assert cl.requires_user_confirmation is False
+
+    @pytest.mark.parametrize("name", ["Ia", "Ib", "Ic"])
+    def test_phase_current_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "current_rms"
+        assert cl.unit == "A"
+        assert cl.requires_user_confirmation is False
+
+    def test_neutral_current(self) -> None:
+        cl = classify_csv_column("In")
+        assert cl.signal_type == "current_rms"
+
+    @pytest.mark.parametrize("name,expected", [
+        ("V0", "voltage_rms"), ("V1", "voltage_rms"), ("V2", "voltage_rms"),
+        ("I0", "current_rms"), ("I1", "current_rms"), ("I2", "current_rms"),
+    ])
+    def test_sequence_component_names(self, name: str, expected: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == expected
+        assert cl.requires_user_confirmation is False
+
+    def test_relay_names_not_influenced_by_magnitude(self) -> None:
+        # Values are power-magnitude-like (tens of thousands); the relay name
+        # must still win on its own, and the result must not depend on values.
+        cl_no_values = classify_csv_column("Va")
+        cl_with_values = classify_csv_column("Va", [18738.85, 18751.21, 18739.43])
+        assert cl_no_values.signal_type == cl_with_values.signal_type == "voltage_rms"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Value-profile inference
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -120,14 +120,22 @@ class TestScadaAliasPromotion:
         assert cls.confidence == pytest.approx(1.0)
         assert cls.requires_user_confirmation is False
 
-    def test_p_total_without_rules_is_unknown(self) -> None:
+    def test_p_total_without_rules_is_active_power_but_low_confidence(self) -> None:
+        # "P_TOTAL" is now a built-in active-power keyword in column_classifier
+        # (a generic power-terminology term, not a SCADA-specific alias), so it
+        # no longer needs a learned rule to be recognised at all -- it is still
+        # below the confirmation threshold on its own, which the persisted
+        # SCADA rule below promotes to full confidence.
         cls = classify_csv_column("P_TOTAL")
-        assert cls.signal_type is None
+        assert cls.signal_type == "active_power"
+        assert cls.confidence < CONFIRMATION_THRESHOLD
+        assert cls.requires_user_confirmation is True
 
     def test_p_total_with_rules_is_active_power(self, mgr: IntelligenceManager) -> None:
         cls, _ = mgr.classify_column("P_TOTAL")
         assert cls.signal_type == "active_power"
         assert cls.confidence == pytest.approx(1.0)
+        assert cls.requires_user_confirmation is False
 
     def test_grid_hz_with_rules_is_frequency(self, mgr: IntelligenceManager) -> None:
         cls, _ = mgr.classify_column("GRID_HZ")

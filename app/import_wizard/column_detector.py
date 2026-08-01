@@ -1,14 +1,38 @@
 """Column classification — map raw column names to ParameterType + unit.
 
 Stateless functions only.  No Qt, pandas, or numpy.
+
+Classification consults the shared, UI-independent semantic classifier in
+app.data.column_classifier (the canonical name-based classifier for CSV/Excel
+analog quantities, e.g. "System Demand" -> active_power/MW) whenever the
+Wizard's own name rules (_NAME_RULES, below) don't recognise a column. The
+Wizard's own rules are tried first because they cover things the shared
+classifier does not (digital/status and timestamp keywords) and are already
+well-tested for the cases they handle; the shared classifier fills in
+terminology the Wizard's own rules miss (demand, tie-line, real power, etc.)
+without duplicating that keyword knowledge here. See _SHARED_TO_PARAMETER_TYPE
+for the small boundary mapping between the two taxonomies.
 """
 from __future__ import annotations
 
 import re
 from typing import Any
 
+from app.data.column_classifier import classify_csv_column
 from app.import_wizard.column_mapping import ParameterType
 from app.import_wizard.models import ColumnMappingCandidate
+
+# Boundary mapping: app.data.column_classifier's signal_type vocabulary ->
+# this module's ParameterType enum. Deliberately small and explicit per
+# integration-boundary policy -- not a repository-wide taxonomy migration.
+_SHARED_TO_PARAMETER_TYPE: dict[str, ParameterType] = {
+    "active_power":   ParameterType.MW,
+    "reactive_power": ParameterType.MVAR,
+    "voltage_rms":    ParameterType.VOLTAGE,
+    "current_rms":    ParameterType.CURRENT,
+    "frequency":      ParameterType.FREQUENCY,
+    "rocof":          ParameterType.ROCOF,
+}
 
 # ---------------------------------------------------------------------------
 # Name-fragment → (ParameterType, unit) lookup
@@ -86,6 +110,25 @@ def _classify_by_values(
 ) -> tuple[ParameterType | None, float]:
     """Heuristic value-based classification.
 
+    Numeric magnitude alone must not authoritatively assign an engineering
+    semantic type (voltage, current, MW, MVAr, or ROCOF): a demand channel
+    reading in the tens of thousands, a current channel reading in the low
+    hundreds, and an actual kV-range voltage channel are numerically
+    indistinguishable, so no magnitude band exists here for those types --
+    name-based evidence (this module's _NAME_RULES, or the shared semantic
+    classifier consulted by detect_column_mappings) is required instead.
+
+    Two exceptions remain, both materially different from a generic magnitude
+    guess:
+      * Binary/status values ({0, 1}) are a structurally distinct pattern,
+        not a magnitude coincidence -- kept as DIGITAL evidence.
+      * A tight 45-65 Hz band is kept as FREQUENCY evidence: mains frequency
+        occupies a narrow, well-separated numeric range that does not
+        plausibly collide with voltage/current/power magnitudes, and this
+        exact band is exercised by existing tests
+        (TestClassifyByValues.test_frequency_range,
+        TestDetectColumnMappings.test_frequency_detected_by_value).
+
     Returns (type_hint, confidence_boost) or (None, 0.0) when inconclusive.
     """
     non_empty = [v for v in samples if v is not None and str(v).strip() != ""]
@@ -108,20 +151,9 @@ def _classify_by_values(
     if len(floats) < 3:
         return None, 0.0
 
-    avg = sum(floats) / len(floats)
-    mx = max(abs(f) for f in floats)
-
-    # Voltage range: 0.8–1.2 pu or 100–500 kV or 1–500 kV absolute
-    if 80 <= mx <= 550_000 and avg > 0:
-        return ParameterType.VOLTAGE, 0.10
-
-    # Frequency: 45–65 Hz
+    # Frequency: 45–65 Hz (see docstring — the one safe magnitude exception)
     if all(45 <= f <= 65 for f in floats):
         return ParameterType.FREQUENCY, 0.20
-
-    # ROCOF: small absolute values near zero
-    if all(abs(f) <= 5 for f in floats) and avg != 0:
-        return ParameterType.ROCOF, 0.10
 
     return None, 0.0
 
@@ -197,7 +229,25 @@ def detect_column_mappings(
 
         ptype, unit, confidence, reason = classify_by_name(col_name)
 
-        # Value boost
+        # Shared semantic classifier: consulted when the Wizard's own name
+        # rules don't recognise the column (e.g. demand/tie-line/real-power
+        # terminology). A low-confidence shared result is still adopted here
+        # (it replaces an otherwise-UNKNOWN type with a semantically safer
+        # guess) but keeps its own sub-threshold confidence so it is not
+        # treated as authoritative — confidence stays visible to the caller
+        # and the user can still override it.
+        if ptype == ParameterType.UNKNOWN:
+            shared = classify_csv_column(col_name)
+            mapped_type = _SHARED_TO_PARAMETER_TYPE.get(shared.signal_type or "")
+            if mapped_type is not None:
+                ptype = mapped_type
+                unit = shared.unit or unit
+                confidence = shared.confidence
+                reason = f"shared classifier: {shared.inferred_from}"
+
+        # Value boost — digital/status and a narrow frequency band only
+        # (see _classify_by_values docstring); never independently assigns
+        # voltage, current, MW, MVAr, or ROCOF from magnitude alone.
         type_hint, boost = _classify_by_values(col_samples[ci])
         if type_hint is not None:
             if ptype == ParameterType.UNKNOWN:

@@ -297,15 +297,21 @@ class CsvProvider(BaseProvider):
                     )
                     continue
                 vals = numeric.to_numpy(dtype=np.float64)
-                
+
                 # Unit fallback if intelligence couldn't infer it
                 unit = cls.unit if cls.unit else _infer_unit(col_name)
-                
+
+                # Populate parameter_type only when the shared classifier's
+                # result is confident enough not to require user confirmation
+                # (existing CONFIRMATION_THRESHOLD, not a new duplicate one).
+                parameter_type = cls.signal_type if not cls.requires_user_confirmation else None
+
                 analog_channels.append(
                     AnalogChannel(
                         name=col_name,
                         unit=unit,
                         index=analog_idx,
+                        parameter_type=parameter_type,
                     )
                 )
                 col_data[col_name] = vals

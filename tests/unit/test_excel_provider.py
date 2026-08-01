@@ -442,6 +442,42 @@ class TestUnitInference:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TestParameterTypeInference — shared semantic classifier integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestParameterTypeInference:
+    def test_confident_demand_column_populates_active_power(self, tmp_path: Path) -> None:
+        p = _make_xlsx(
+            tmp_path, "d.xlsx",
+            [["time", "System Demand"]] + [[i * 0.02, 18700.0 + i] for i in range(5)],
+        )
+        rec = ExcelProvider().load(p)
+        ch = next(c for c in rec.analog_channels if c.name == "System Demand")
+        assert ch.name == "System Demand"
+        assert ch.unit == "MW"
+        assert ch.parameter_type == "active_power"
+
+    def test_low_confidence_tie_line_leaves_parameter_type_none(self, tmp_path: Path) -> None:
+        p = _make_xlsx(
+            tmp_path, "d.xlsx",
+            [["time", "Tie-Line"]] + [[i * 0.02, 80.0 + i] for i in range(5)],
+        )
+        rec = ExcelProvider().load(p)
+        ch = next(c for c in rec.analog_channels if c.name == "Tie-Line")
+        assert ch.unit == "MW"
+        assert ch.parameter_type is None
+
+    def test_unrecognised_column_leaves_parameter_type_none(self, tmp_path: Path) -> None:
+        p = _make_xlsx(
+            tmp_path, "u.xlsx",
+            [["time", "channel_x"], [0.0, 1.0], [0.02, 2.0]],
+        )
+        rec = ExcelProvider().load(p)
+        assert rec.analog_channels[0].parameter_type is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TestDigitalInference
 # ─────────────────────────────────────────────────────────────────────────────
 

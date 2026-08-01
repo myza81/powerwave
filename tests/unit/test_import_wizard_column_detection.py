@@ -12,6 +12,11 @@ from app.import_wizard.column_detector import (
 from app.import_wizard.column_mapping import ParameterType
 
 
+def _mapping_for(name: str, values: list):
+    rows = [[str(v)] for v in values]
+    return detect_column_mappings([name], rows)[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # classify_by_name
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,11 +103,14 @@ class TestClassifyByValues:
         assert ptype is None
         assert boost == 0.0
 
-    def test_voltage_range(self):
-        # ~230 V nominal
+    def test_magnitude_alone_no_longer_authoritative_for_voltage(self):
+        # ~230 V nominal values with no name evidence must NOT be assigned an
+        # authoritative type from magnitude alone (policy: numeric magnitude
+        # must not independently assign voltage/current/MW/MVAr/ROCOF).
         samples = [229.8, 230.0, 230.1, 230.2, 229.9]
         ptype, boost = _classify_by_values(samples)
-        assert ptype == ParameterType.VOLTAGE
+        assert ptype is None
+        assert boost == 0.0
 
     def test_non_numeric_returns_none(self):
         samples = ["abc", "def", "ghi", "jkl"]
@@ -222,3 +230,115 @@ class TestDetectColumnMappings:
         rows = [[10.5 + i] for i in range(5)]
         mappings = detect_column_mappings(cols, rows)
         assert mappings[0].parameter_type == ParameterType.MVAR
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared semantic classifier integration — demand/power terminology the
+# Wizard's own name rules do not cover on their own. Generic headers; none of
+# these are tied to any specific fixture's exact values.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestSharedClassifierIntegration:
+    @pytest.mark.parametrize("name", [
+        "System Demand", "Total Demand", "Tie-Line", "Real Power",
+        "Net Generation", "Plant Output", "Import Power", "Export Power",
+    ])
+    def test_demand_and_power_terms_resolve_to_mw(self, name):
+        m = _mapping_for(name, [123.4, 125.1, 124.0, 126.7])
+        assert m.parameter_type == ParameterType.MW
+        assert m.unit == "MW"
+        assert "voltage" not in m.suggested_name
+
+    def test_grid_demand_low_confidence_still_mw_not_voltage(self):
+        m = _mapping_for("Grid Demand", [18738.85, 18751.21, 18739.43, 18771.59])
+        assert m.parameter_type == ParameterType.MW
+        assert m.confidence < 0.80
+
+    def test_tie_line_confidence_reflects_shared_classifier_uncertainty(self):
+        # The shared classifier marks "Tie-Line" uncertain (0.70); the Wizard
+        # must retain that uncertainty rather than forcing high confidence.
+        m = _mapping_for("Tie-Line", [108.16, 80.64, 80.32, 57.28])
+        assert m.parameter_type == ParameterType.MW
+        assert m.confidence == pytest.approx(0.70)
+
+    def test_reactive_power_terms_resolve_to_mvar(self):
+        m = _mapping_for("Reactive Power", [45.2, 44.8, 46.1, 45.5])
+        assert m.parameter_type == ParameterType.MVAR
+        assert m.unit == "Mvar" or m.unit == "MVAr"
+
+    @pytest.mark.parametrize("name", ["Va", "Vb", "Vc", "Vab", "Vbc", "Vca"])
+    def test_relay_voltage_names_via_shared_classifier(self, name):
+        # These names are already handled by the Wizard's own _NAME_RULES;
+        # confirm the shared-classifier integration doesn't regress them.
+        m = _mapping_for(name, [230.1, 230.4, 229.8, 230.0])
+        assert m.parameter_type == ParameterType.VOLTAGE
+
+    def test_sequence_component_names_not_previously_covered_by_wizard(self):
+        # V1 (positive-sequence voltage) is not matched by the Wizard's own
+        # _NAME_RULES regex; this must now resolve via the shared classifier.
+        assert classify_by_name("V1")[0] == ParameterType.UNKNOWN
+        m = _mapping_for("V1", [230.1, 230.4, 229.8, 230.0])
+        assert m.parameter_type == ParameterType.VOLTAGE
+
+    def test_p_total_resolves_to_mw_with_low_confidence(self):
+        m = _mapping_for("P Total", [123.4, 125.1, 124.0, 126.7])
+        assert m.parameter_type == ParameterType.MW
+        assert m.confidence < 0.80
+
+    def test_user_override_still_wins_over_shared_classifier(self):
+        cols = ["System Demand"]
+        rows = [[str(v)] for v in [18738.85, 18751.21, 18739.43, 18771.59]]
+        mapping = detect_column_mappings(cols, rows)[0]
+        assert mapping.parameter_type == ParameterType.MW  # automatic result
+        mapping.user_type_override = ParameterType.VOLTAGE
+        mapping.user_unit_override = "kV"
+        assert mapping.effective_type == ParameterType.VOLTAGE
+        assert mapping.effective_unit == "kV"
+        # The automatic classification itself is left untouched by the override.
+        assert mapping.parameter_type == ParameterType.MW
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unsafe magnitude fallback removed — numeric-only evidence with a neutral
+# header must not authoritatively become voltage/current/MW/MVAr/ROCOF.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestMagnitudeIsNotAuthoritative:
+    @pytest.mark.parametrize("values", [
+        [1.0, 1.01, 0.99, 1.02],            # per-unit-like
+        [132.0, 131.8, 132.2, 132.1],       # transmission-voltage-like
+        [275.0, 274.5, 275.3, 275.1],       # transmission-voltage-like
+        [400.0, 401.5, 398.2, 399.0],       # current-like
+        [18738.85, 18751.21, 18739.43, 18771.59],  # demand-like
+    ])
+    def test_neutral_header_stays_unknown(self, values):
+        m = _mapping_for("Channel_1", values)
+        assert m.parameter_type == ParameterType.UNKNOWN
+
+    def test_per_unit_like_does_not_become_rocof(self):
+        m = _mapping_for("Channel_1", [0.98, 1.01, 0.99, 1.02])
+        assert m.parameter_type != ParameterType.ROCOF
+
+    def test_large_magnitude_does_not_become_voltage(self):
+        m = _mapping_for("Channel_1", [132.0, 131.8, 132.2, 132.1])
+        assert m.parameter_type != ParameterType.VOLTAGE
+
+    def test_current_like_magnitude_does_not_become_voltage(self):
+        m = _mapping_for("Channel_1", [400.0, 401.5, 398.2, 399.0])
+        assert m.parameter_type != ParameterType.VOLTAGE
+
+    def test_demand_like_magnitude_does_not_become_voltage(self):
+        m = _mapping_for("Channel_1", [18738.85, 18751.21, 18739.43, 18771.59])
+        assert m.parameter_type != ParameterType.VOLTAGE
+
+    def test_frequency_near_50_remains_a_safe_narrow_exception(self):
+        # Frequency is the one retained magnitude exception (narrow 45-65 Hz
+        # band, existing-test-justified) -- confirm it still works.
+        m = _mapping_for("Channel_1", [50.0, 50.02, 49.98, 50.01])
+        assert m.parameter_type == ParameterType.FREQUENCY
+
+    def test_digital_binary_detection_unaffected(self):
+        m = _mapping_for("Channel_1", [0, 1, 0, 0, 1, 0, 1, 0, 0, 1])
+        assert m.parameter_type == ParameterType.DIGITAL

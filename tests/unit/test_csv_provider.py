@@ -495,10 +495,14 @@ class TestUnitInference:
         p = _write_csv(tmp_path, "t.csv", f"{header}\n{row}\n")
         return CsvProvider().load(p)
 
-    def test_va_unit_kv(self, tmp_path: Path) -> None:
+    def test_va_unit_v(self, tmp_path: Path) -> None:
+        # "VA" is the standard relay/protection naming convention for phase-A
+        # voltage (instrument/secondary level, volts) -- matches the Import
+        # Wizard's existing convention for the same pattern (column_detector's
+        # _NAME_RULES), not a magnitude-based guess.
         r = self._load(tmp_path, "time,VA", "0.0,275.0")
         ch = next(c for c in r.analog_channels if c.name == "VA")
-        assert ch.unit == "kV"
+        assert ch.unit == "V"
 
     def test_ia_unit_a(self, tmp_path: Path) -> None:
         r = self._load(tmp_path, "time,IA", "0.0,100.0")
@@ -524,6 +528,58 @@ class TestUnitInference:
         r = self._load(tmp_path, "time,RPM", "0.0,1500.0")
         ch = next(c for c in r.analog_channels if c.name == "RPM")
         assert ch.unit == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# parameter_type population (shared semantic classifier integration)
+# ---------------------------------------------------------------------------
+
+
+class TestParameterTypeInference:
+    """AnalogChannel.parameter_type must be populated only when the shared
+    classifier's result is confident enough not to require user confirmation;
+    the original source header must never be renamed.
+    """
+
+    def _load_rows(self, tmp_path: Path, header: str, rows: list[str]) -> DisturbanceRecord:
+        body = "\n".join(rows)
+        p = _write_csv(tmp_path, "t.csv", f"{header}\n{body}\n")
+        return CsvProvider().load(p)
+
+    def test_confident_demand_column_populates_active_power(self, tmp_path: Path) -> None:
+        rows = [f"{i}.0,{18700.0 + i}" for i in range(5)]
+        r = self._load_rows(tmp_path, "time,System Demand", rows)
+        ch = next(c for c in r.analog_channels if c.name == "System Demand")
+        assert ch.name == "System Demand"  # original header preserved verbatim
+        assert ch.unit == "MW"
+        assert ch.parameter_type == "active_power"
+
+    def test_low_confidence_tie_line_leaves_parameter_type_none(self, tmp_path: Path) -> None:
+        rows = [f"{i}.0,{80.0 + i}" for i in range(5)]
+        r = self._load_rows(tmp_path, "time,Tie-Line", rows)
+        ch = next(c for c in r.analog_channels if c.name == "Tie-Line")
+        assert ch.name == "Tie-Line"
+        assert ch.unit == "MW"  # unit still reasonably inferred
+        assert ch.parameter_type is None  # confidence below threshold
+
+    def test_confident_frequency_column_populates_parameter_type(self, tmp_path: Path) -> None:
+        rows = [f"{i}.0,{50.0 + i * 0.01}" for i in range(5)]
+        r = self._load_rows(tmp_path, "time,Frequency", rows)
+        ch = next(c for c in r.analog_channels if c.name == "Frequency")
+        assert ch.parameter_type == "frequency"
+
+    def test_relay_voltage_column_populates_parameter_type(self, tmp_path: Path) -> None:
+        rows = [f"{i}.0,{230.0 + i}" for i in range(5)]
+        r = self._load_rows(tmp_path, "time,Va", rows)
+        ch = next(c for c in r.analog_channels if c.name == "Va")
+        assert ch.parameter_type == "voltage_rms"
+        assert ch.unit == "V"
+
+    def test_unrecognised_column_leaves_parameter_type_none(self, tmp_path: Path) -> None:
+        rows = [f"{i}.0,{1500 + i}" for i in range(5)]
+        r = self._load_rows(tmp_path, "time,RPM", rows)
+        ch = next(c for c in r.analog_channels if c.name == "RPM")
+        assert ch.parameter_type is None
 
 
 # ---------------------------------------------------------------------------
