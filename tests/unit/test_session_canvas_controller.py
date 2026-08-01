@@ -159,6 +159,23 @@ def test_rebuild_layout_returns_splitter(qapp) -> None:
     assert isinstance(result, QScrollArea)
 
 
+def test_canvas_theme_applied_to_newly_created_panels(qapp) -> None:
+    """A theme chosen before any canvas exists (e.g. the user set Light before
+    opening a session, or a panel is split/merged after the theme was
+    switched) must be applied to canvases as they are created, not just to
+    canvases that already existed at the time set_canvas_theme() was called.
+    """
+    session = _build_session(n_sources=1)
+    ctrl = SessionCanvasController()
+    ctrl.set_canvas_theme("light")  # no canvases exist yet
+
+    ctrl.rebuild_layout(session)
+
+    assert ctrl._canvases
+    for canvas in ctrl._canvases.values():
+        assert canvas._canvas_theme == "light"
+
+
 # ---------------------------------------------------------------------------
 # 4. refresh_all populates curves from build_aligned_data
 # ---------------------------------------------------------------------------
@@ -634,6 +651,65 @@ def test_session_controller_merge_keeps_curves_from_both_panels(qapp) -> None:
     }
     assert merged_canvas._curves[(source_id, "Original")].isVisible()
     assert merged_canvas._curves[(source_id, "Imported")].isVisible()
+
+
+def test_crosshair_snap_propagates_across_panels_without_feedback_loop(qapp) -> None:
+    """Crosshair-snap only changes what value _on_scene_mouse_moved computes on
+    the source panel; the resulting crosshair_moved(t) must propagate to other
+    panels verbatim (set_crosshair_pos, which does not re-emit) so every panel
+    shows the same master time and the source panel never re-triggers itself.
+    """
+    from app.models.channels import AnalogChannel
+    from app.models.disturbance_record import DisturbanceRecord
+    from app.models.metadata import RecordingMetadata
+    from app.models.timing import SamplingInformation, TimingInformation
+
+    time = np.array([0.0, 1.0, 2.0])
+    record = DisturbanceRecord(
+        metadata=RecordingMetadata("TEST", "REC", "snap.csv", "csv", 50.0),
+        waveform_data=pd.DataFrame({
+            "time": time,
+            "ChA": np.array([1.0, 2.0, 3.0]),
+            "ChB": np.array([4.0, 5.0, 6.0]),
+        }),
+        analog_channels=[
+            AnalogChannel(name="ChA", unit="V", index=0, parameter_type="voltage"),
+            AnalogChannel(name="ChB", unit="V", index=1, parameter_type="voltage"),
+        ],
+        digital_channels=[],
+        sampling_info=SamplingInformation([1.0], [len(time)]),
+        timing_info=TimingInformation(datetime(2024, 1, 1), datetime(2024, 1, 1)),
+        disturbance_info=None,
+    )
+    session = EventAnalysisSession()
+    source_id = session.add_source(record, "Source", "csv")
+    panel_a = session.add_panel("PanelA")
+    panel_b = session.add_panel("PanelB")
+    session.set_channel_panel(source_id, "ChA", panel_a)
+    session.set_channel_panel(source_id, "ChB", panel_b)
+
+    ctrl = SessionCanvasController()
+    ctrl.rebuild_layout(session)
+    ctrl.refresh_all(session)
+    ctrl.set_crosshair_snap_enabled(True)
+
+    canvas_a = ctrl._canvases[panel_a]
+    canvas_b = ctrl._canvases[panel_b]
+    assert canvas_a._crosshair_snap_enabled is True
+    assert canvas_b._crosshair_snap_enabled is True
+
+    rebroadcasts: list[float] = []
+    canvas_a.crosshair_moved.connect(rebroadcasts.append)
+
+    # Simulate the (already-snapped) hover position panel A would emit.
+    canvas_a.crosshair_moved.emit(1.5)
+    qapp.processEvents()
+
+    assert canvas_b._hover_cursor is not None
+    assert canvas_b._hover_cursor.value() == pytest.approx(1.5)
+    # set_crosshair_pos() must not re-emit crosshair_moved on the receiver,
+    # and the source panel must not re-trigger itself either.
+    assert rebroadcasts == [1.5]
 
 
 def test_session_canvas_renders_secondary_axis_curve(qapp) -> None:

@@ -1,6 +1,8 @@
 """Tests for Phase 8.55B: timestamp_detector.py."""
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from app.import_wizard.timestamp_detector import (
@@ -39,6 +41,36 @@ class TestTryStrptime:
     def test_time_only(self):
         fmt = _try_strptime("13:30:00")
         assert fmt is not None
+
+    def test_12_hour_time_only(self):
+        assert _try_strptime("12:33 PM") == "%I:%M %p"
+
+    def test_noon_is_12_00_hundred_hours(self):
+        fmt = _try_strptime("12:00 PM")
+        assert fmt is not None
+        assert datetime.strptime("12:00 PM", fmt).hour == 12
+
+    def test_midnight_is_00_00_hundred_hours(self):
+        fmt = _try_strptime("12:00 AM")
+        assert fmt is not None
+        assert datetime.strptime("12:00 AM", fmt).hour == 0
+
+    def test_noon_with_seconds(self):
+        fmt = _try_strptime("12:00:00 PM")
+        assert fmt is not None
+        assert datetime.strptime("12:00:00 PM", fmt).hour == 12
+
+    def test_midnight_with_seconds(self):
+        fmt = _try_strptime("12:00:00 AM")
+        assert fmt is not None
+        assert datetime.strptime("12:00:00 AM", fmt).hour == 0
+
+    def test_24_hour_format_still_matches_first(self):
+        # Existing 24-hour formats must not regress now that 12-hour formats
+        # were inserted earlier in the probe order.
+        assert _try_strptime("00:00:00") == "%H:%M:%S"
+        assert _try_strptime("23:59:59") == "%H:%M:%S"
+        assert _try_strptime("14:30") == "%H:%M"
 
     def test_garbage_returns_none(self):
         assert _try_strptime("not_a_date") is None
@@ -320,4 +352,37 @@ class TestDetectTimestampCandidates:
         ]
         candidates = detect_timestamp_candidates(cols, rows)
         candidate_names = {c.column_name for c in candidates}
-        assert len(candidate_names) >= 1
+        assert {"Date", "Time"} <= candidate_names
+
+    def test_full_timestamp_and_time_of_day_columns_both_detected(self):
+        cols = ["Time", "Column", "Trace Name", "Value", "Quality"]
+        rows = [
+            ["7/18/2026 12:33", "12:33 PM", "", "29.67", ""],
+            ["7/18/2026 12:34", "12:34 PM", "", "29.67", ""],
+            ["7/18/2026 12:35", "12:35 PM", "SIG", "29.67", "Normal"],
+            ["7/18/2026 12:39", "12:39 PM", "SIG", "53.63", "Normal"],
+        ]
+        candidates = detect_timestamp_candidates(cols, rows)
+        by_name = {c.column_name: c for c in candidates}
+        assert {"Time", "Column"} <= set(by_name)
+        assert by_name["Time"].detected_format == "%m/%d/%Y %H:%M"
+        assert by_name["Column"].detected_format == "%I:%M %p"
+        assert candidates[0].column_name == "Time"
+
+    def test_time_only_column_still_selected_when_no_full_datetime_present(self):
+        # The confidence penalty on time-only formats must only de-prioritise
+        # them relative to a better full-datetime candidate — it must not
+        # exclude them outright when they are the only timestamp-like column.
+        cols = ["Time", "Voltage"]
+        rows = [
+            ["12:00 AM", "230.0"],
+            ["12:15 AM", "231.0"],
+            ["12:30 AM", "232.0"],
+            ["12:45 AM", "233.0"],
+        ]
+        candidates = detect_timestamp_candidates(cols, rows)
+        names = {c.column_name for c in candidates}
+        assert "Time" in names
+        by_name = {c.column_name: c for c in candidates}
+        assert by_name["Time"].detected_format == "%I:%M %p"
+        assert candidates[0].column_name == "Time"

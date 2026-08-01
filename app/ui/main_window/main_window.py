@@ -45,7 +45,7 @@ from app.visualization.axis.datetime_axis import TimeDisplayMode
 from app.visualization.managers.synchronization_manager import SynchronizationManager
 from app.visualization.overlays.overlay_colors import sequence_curve_label
 from app.visualization.performance import timed_section
-from app.ui.import_wizard import ImportWizardDialog
+from app.ui.import_wizard import ImportWizardWidget
 from app.ui.session import SessionCanvasController, SessionPanel
 from app.ui.widgets.measurement_panel import MeasurementPanel
 from app.ui.widgets.event_list_panel import EventListPanel
@@ -352,6 +352,9 @@ class PowerwaveMainWindow(QMainWindow):
         self._session_canvas_controller: SessionCanvasController | None = None
         self._session_canvas_active: bool = False
         self._session_navigator = None                           # WaveformNavigatorStrip | None
+        self._embedded_import_wizard: ImportWizardWidget | None = None
+        self._canvas_theme: str = "dark"
+        self._crosshair_snap_enabled: bool = False
 
         # Measurement panel (Phase 1 Enhancement)
         self._measurement_dock = self._build_measurement_dock()
@@ -956,6 +959,37 @@ class PowerwaveMainWindow(QMainWindow):
             "Show or hide the per-panel channel legend in the session canvas"
         )
         self._show_legend_action.triggered.connect(self._on_toggle_legend)
+
+        view_menu.addSeparator()
+        theme_menu = view_menu.addMenu("&Canvas Theme")
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        dark_theme = theme_menu.addAction("&Dark")
+        dark_theme.setCheckable(True)
+        dark_theme.setChecked(True)
+        dark_theme.triggered.connect(lambda: self._on_canvas_theme_changed("dark"))
+        theme_group.addAction(dark_theme)
+        light_theme = theme_menu.addAction("&Light")
+        light_theme.setCheckable(True)
+        light_theme.triggered.connect(lambda: self._on_canvas_theme_changed("light"))
+        theme_group.addAction(light_theme)
+
+        crosshair_menu = view_menu.addMenu("&Crosshair Mode")
+        crosshair_group = QActionGroup(self)
+        crosshair_group.setExclusive(True)
+        free_crosshair = crosshair_menu.addAction("&Free")
+        free_crosshair.setCheckable(True)
+        free_crosshair.setChecked(True)
+        free_crosshair.triggered.connect(
+            lambda: self._on_crosshair_snap_changed(False)
+        )
+        crosshair_group.addAction(free_crosshair)
+        snap_crosshair = crosshair_menu.addAction("&Snap to Waveform")
+        snap_crosshair.setCheckable(True)
+        snap_crosshair.triggered.connect(
+            lambda: self._on_crosshair_snap_changed(True)
+        )
+        crosshair_group.addAction(snap_crosshair)
 
         view_menu.addSeparator()
         time_axis_menu = view_menu.addMenu("&Time Axis Mode")
@@ -1569,6 +1603,10 @@ class PowerwaveMainWindow(QMainWindow):
         self._session_canvas_controller.set_time_axis_mode(
             self._time_display_mode, self._active_session
         )
+        self._session_canvas_controller.set_canvas_theme(self._canvas_theme)
+        self._session_canvas_controller.set_crosshair_snap_enabled(
+            self._crosshair_snap_enabled
+        )
         self._session_canvas_controller.refresh_all(self._active_session)
         self._sync_session_panel_colours()
         # Normalize all panels to the same X range after auto-range settles
@@ -1625,12 +1663,7 @@ class PowerwaveMainWindow(QMainWindow):
             return
         path = Path(path_str)
         if path.suffix.lower() in _CSV_EXCEL_SUFFIXES:
-            dlg = ImportWizardDialog(self)
-            dlg.load_page.set_path(path_str)
-            # Trigger profiling once the dialog is visible so Next is enabled immediately.
-            QTimer.singleShot(0, dlg.profile_selected_file)
-            dlg.import_completed.connect(self._on_session_import_record_ready)
-            dlg.exec()
+            self._show_embedded_import_wizard(path_str)
         else:
             self.statusBar().showMessage(f"Loading {path.name}…")
             try:
@@ -1638,6 +1671,44 @@ class PowerwaveMainWindow(QMainWindow):
                 self._on_session_import_record_ready(record)
             except Exception as exc:  # noqa: BLE001
                 self._on_load_error(str(exc))
+
+    def _show_embedded_import_wizard(self, path_str: str) -> None:
+        """Host the CSV/Excel Import Wizard in the main workspace.
+
+        If a wizard is already embedded (e.g. the user triggers File > Open or
+        Session Panel > Add Source again before finishing the current one),
+        confirm discard through the wizard's own risk check instead of silently
+        replacing it — the wizard is non-modal, so this is reachable in a way
+        the old exec()-based dialog never allowed.
+        """
+        if self._embedded_import_wizard is not None:
+            self._embedded_import_wizard.request_close()
+            if self._embedded_import_wizard is not None:
+                return  # user declined to discard the in-progress wizard
+
+        self._clear_sync_before_layout_switch()
+        self._session_canvas_active = False
+        self._session_canvas_action.setChecked(False)
+
+        wizard = ImportWizardWidget(self)
+        self._embedded_import_wizard = wizard
+        wizard.set_source_path(path_str)
+        wizard.import_completed.connect(self._on_session_import_record_ready)
+        wizard.finished.connect(self._clear_embedded_import_wizard_reference)
+        wizard.close_requested.connect(self._on_embedded_import_wizard_closed)
+        self.setCentralWidget(wizard)
+        self.statusBar().showMessage(f"Import wizard: {Path(path_str).name}")
+        QTimer.singleShot(0, wizard.profile_selected_file)
+
+    def _clear_embedded_import_wizard_reference(self) -> None:
+        self._embedded_import_wizard = None
+
+    def _on_embedded_import_wizard_closed(self) -> None:
+        self._embedded_import_wizard = None
+        if self._active_session is not None and self._active_session.list_sources():
+            self._activate_session_canvas()
+        else:
+            self._deactivate_session_canvas()
 
     # -------------------------------------------------------------------------
     # Single-record → session loader (replaces FlexiblePlotCanvas paths)
@@ -2117,6 +2188,22 @@ class PowerwaveMainWindow(QMainWindow):
     def _on_toggle_legend(self, checked: bool) -> None:
         if self._session_canvas_controller is not None:
             self._session_canvas_controller.set_legend_visible(checked)
+
+    def _on_canvas_theme_changed(self, theme: str) -> None:
+        self._canvas_theme = "light" if str(theme).lower() == "light" else "dark"
+        if self._session_canvas_controller is not None:
+            self._session_canvas_controller.set_canvas_theme(self._canvas_theme)
+        label = "Light" if self._canvas_theme == "light" else "Dark"
+        self.statusBar().showMessage(f"Canvas theme: {label}.")
+
+    def _on_crosshair_snap_changed(self, enabled: bool) -> None:
+        self._crosshair_snap_enabled = bool(enabled)
+        if self._session_canvas_controller is not None:
+            self._session_canvas_controller.set_crosshair_snap_enabled(
+                self._crosshair_snap_enabled
+            )
+        label = "snap to waveform" if self._crosshair_snap_enabled else "free movement"
+        self.statusBar().showMessage(f"Crosshair mode: {label}.")
 
     def _on_session_channel_panel(
         self, source_id: str, channel_name: str, panel_id: str

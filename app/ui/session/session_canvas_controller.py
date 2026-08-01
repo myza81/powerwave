@@ -152,6 +152,8 @@ class SessionCanvasController:
         self._needs_digital_resize: bool = False         # trigger one resize after rebuild
         self._scroll_area: QScrollArea | None = None
         self._crosshair_readout_cb: object = None        # callable(t, values) for live readout
+        self._crosshair_snap_enabled: bool = False
+        self._canvas_theme: str = "dark"
         self._navigator = None                           # WaveformNavigatorStrip | None
         self._channel_panel_changed_cb: object = None   # callable(source_id, ch_name, panel_id)
         self._layout_rebuilt_callback: object = None
@@ -202,6 +204,8 @@ class SessionCanvasController:
                 canvas.set_panel_title(panel.title)
             canvas.setMinimumHeight(200)
             canvas.set_legend_visible(self._legend_visible)
+            canvas.set_crosshair_snap_enabled(self._crosshair_snap_enabled)
+            canvas.set_canvas_theme(self._canvas_theme)
             if self._measurement_mode:  # S6: propagate measurement state to (re-)created canvases
                 canvas.set_measurement_mode(True)
             splitter.addWidget(canvas)
@@ -252,6 +256,7 @@ class SessionCanvasController:
                 canvas, panel, session, all_channels, active_sids,
                 sources_by_id, t_start, t_end,
             )
+            canvas.set_canvas_theme(self._canvas_theme)
 
         self._apply_time_reference(session)
         self._refresh_zero_lines(session)
@@ -278,6 +283,7 @@ class SessionCanvasController:
             canvas, panel, session, all_channels, active_sids,
             sources_by_id, t_start, t_end,
         )
+        canvas.set_canvas_theme(self._canvas_theme)
         self._refresh_zero_lines(session)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -488,6 +494,18 @@ class SessionCanvasController:
         self._legend_visible = visible
         for canvas in self._canvases.values():
             canvas.set_legend_visible(visible)
+
+    def set_crosshair_snap_enabled(self, enabled: bool) -> None:
+        self._crosshair_snap_enabled = bool(enabled)
+        for canvas in self._canvases.values():
+            if not sip.isdeleted(canvas):
+                canvas.set_crosshair_snap_enabled(self._crosshair_snap_enabled)
+
+    def set_canvas_theme(self, theme: str) -> None:
+        self._canvas_theme = "light" if str(theme).lower() == "light" else "dark"
+        for canvas in self._canvases.values():
+            if not sip.isdeleted(canvas):
+                canvas.set_canvas_theme(self._canvas_theme)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Synchronization

@@ -273,7 +273,7 @@ class SessionPanel(QDockWidget):
 
         self._time_lbl = QLabel("t = —")
         self._time_lbl.setStyleSheet(
-            "color: #888888; font-family: monospace; font-size: 11px;"
+            "color: #888888; font-family: Menlo, Consolas, 'Courier New'; font-size: 11px;"
         )
         self._time_lbl.setToolTip("Current crosshair time")
         toolbar.addWidget(self._time_lbl)

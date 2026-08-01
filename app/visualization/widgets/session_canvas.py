@@ -119,6 +119,32 @@ class _PanelHeader(QWidget):
     def set_title(self, title: str) -> None:
         self._lbl.setText(title)
 
+    def set_canvas_theme(self, theme: str) -> None:
+        if theme == "light":
+            self.setStyleSheet("background: #F3F4F6;")
+            self._collapse_btn.setStyleSheet(
+                "color: #4B5563; font-size: 9px; background: transparent;"
+            )
+            self._lbl.setStyleSheet(
+                "font-weight: bold; font-size: 11px; color: #1F2937; "
+                "background: transparent;"
+            )
+            self._drop_hint.setStyleSheet(
+                "color: #6B7280; font-size: 9px; background: transparent;"
+            )
+            return
+        self.setStyleSheet("background: #252525;")
+        self._collapse_btn.setStyleSheet(
+            "color: #888; font-size: 9px; background: transparent;"
+        )
+        self._lbl.setStyleSheet(
+            "font-weight: bold; font-size: 11px; color: #ccc; "
+            "background: transparent;"
+        )
+        self._drop_hint.setStyleSheet(
+            "color: #555; font-size: 9px; background: transparent;"
+        )
+
     def _start_rename(self) -> None:
         current = self._lbl.text()
         new_title, ok = QInputDialog.getText(
@@ -401,6 +427,8 @@ class SessionCanvasWidget(QWidget):
         self._last_right_click_x: float = 0.0
         self._hover_cursor: pg.InfiniteLine | None = None   # synchronized hover crosshair
         self._hover_proxy: pg.SignalProxy | None = None     # rate-limited mouse-move relay
+        self._crosshair_snap_enabled: bool = False
+        self._canvas_theme: str = "dark"
 
         self._build_ui()
 
@@ -484,6 +512,7 @@ class SessionCanvasWidget(QWidget):
         layout.addWidget(self.legend, stretch=0)
 
         self._install_keyboard_shortcuts()
+        self.set_canvas_theme(self._canvas_theme)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Keyboard shortcuts (zoom / pan)
@@ -691,6 +720,67 @@ class SessionCanvasWidget(QWidget):
         """Resync overlaid axes after layout, theme, or viewport changes."""
         self._right_mgr.sync()
         self._refresh_y_ranges()
+
+    def set_crosshair_snap_enabled(self, enabled: bool) -> None:
+        """Choose whether hover crosshair values follow the mouse or snap to waveform points."""
+        self._crosshair_snap_enabled = bool(enabled)
+
+    def set_canvas_theme(self, theme: str) -> None:
+        """Apply a light or dark plotting theme without rebuilding waveform items."""
+        normalized = "light" if str(theme).lower() == "light" else "dark"
+        self._canvas_theme = normalized
+        if normalized == "light":
+            colors = {
+                "background": "#FFFFFF",
+                "plot": "#FFFFFF",
+                "foreground": "#111827",
+                "axis": "#374151",
+                "grid_alpha": 0.28,
+                "hover": "#11182788",
+                "scroll": (
+                    "QScrollBar:vertical { background: #F3F4F6; width: 12px; }"
+                    "QScrollBar::handle:vertical { background: #9CA3AF; min-height: 20px; border-radius: 4px; }"
+                    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+                ),
+            }
+        else:
+            colors = {
+                "background": "#1E1E1E",
+                "plot": "#1E1E1E",
+                "foreground": "#E5E7EB",
+                "axis": "#9CA3AF",
+                "grid_alpha": 0.2,
+                "hover": "#FFFFFF55",
+                "scroll": (
+                    "QScrollBar:vertical { background: #1E1E1E; width: 12px; }"
+                    "QScrollBar::handle:vertical { background: #555; min-height: 20px; border-radius: 4px; }"
+                    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+                ),
+            }
+
+        if self._header is not None:
+            self._header.set_canvas_theme(normalized)
+        self._glw.setBackground(colors["background"])
+        self._primary_plot.getViewBox().setBackgroundColor(colors["plot"])
+        self._primary_plot.showGrid(x=True, y=True, alpha=float(colors["grid_alpha"]))
+        axis_pen = pg.mkPen(colors["axis"])
+        text_pen = pg.mkPen(colors["foreground"])
+        for axis_name in ("left", "bottom", "right"):
+            axis = self._primary_plot.getAxis(axis_name)
+            if axis is not None:
+                axis.setPen(axis_pen)
+                axis.setTextPen(text_pen)
+        self._primary_plot.setLabel(
+            "bottom",
+            "Time" if self._time_axis_mode != TimeDisplayMode.SAMPLE_INDEX else "Sample Index",
+            **{"color": colors["foreground"]},
+        )
+        left_label = getattr(self._left_axis, "labelText", "") or "Value"
+        self._left_axis.setLabel(left_label, **{"color": colors["foreground"]})
+        if self._hover_cursor is not None:
+            self._hover_cursor.setPen(pg.mkPen(colors["hover"], width=1))
+        self._y_scrollbar.setStyleSheet(str(colors["scroll"]))
+        self.refresh_render_state()
 
     # ─────────────────────────────────────────────────────────────────────────
     # ViewBox resolution helpers (S1)
@@ -1473,6 +1563,10 @@ class SessionCanvasWidget(QWidget):
             return
         mouse_pt = vb.mapSceneToView(pos)
         t = float(mouse_pt.x())
+        if self._crosshair_snap_enabled:
+            snapped = self._nearest_waveform_point(pos, t)
+            if snapped is not None:
+                t = snapped[1]
         if self._hover_cursor is not None:
             self._hover_cursor.setValue(t)
             self._hover_cursor.setVisible(True)
@@ -1514,6 +1608,56 @@ class SessionCanvasWidget(QWidget):
 
         if values:
             self.crosshair_values_changed.emit(t, values)
+
+    def _nearest_waveform_point(
+        self,
+        scene_pos: QPointF,
+        mouse_x: float,
+    ) -> tuple[str, float, float, str, str] | None:
+        """Return the closest visible plotted data point to the mouse in screen space."""
+        best: tuple[float, str, float, float, str, str] | None = None
+        for key, curve in self._curves.items():
+            meta = self._metadata.get(key)
+            if meta is None or not meta.visible or not curve.isVisible():
+                continue
+            x_data, y_data = curve.getData()
+            if x_data is None or y_data is None or len(x_data) == 0 or len(y_data) == 0:
+                continue
+            x_arr = np.asarray(x_data, dtype=np.float64)
+            y_arr = np.asarray(y_data, dtype=np.float64)
+            if len(x_arr) != len(y_arr):
+                continue
+            idx = int(np.searchsorted(x_arr, mouse_x, side="left"))
+            candidate_indices = {
+                max(0, min(idx, len(x_arr) - 1)),
+                max(0, min(idx - 1, len(x_arr) - 1)),
+            }
+            viewbox = curve.getViewBox() or self._primary_plot.getViewBox()
+            for candidate_idx in candidate_indices:
+                x_val = float(x_arr[candidate_idx])
+                y_val = float(y_arr[candidate_idx])
+                if not np.isfinite(x_val) or not np.isfinite(y_val):
+                    continue
+                point = viewbox.mapViewToScene(pg.Point(x_val, y_val))
+                dx = float(point.x() - scene_pos.x())
+                dy = float(point.y() - scene_pos.y())
+                distance_sq = dx * dx + dy * dy
+                name = meta.display_name or meta.channel_name
+                if meta.source_badge:
+                    name = f"{meta.source_badge}/{name}"
+                if best is None or distance_sq < best[0]:
+                    best = (
+                        distance_sq,
+                        name,
+                        x_val,
+                        y_val,
+                        meta.unit or "",
+                        meta.colour,
+                    )
+        if best is None:
+            return None
+        _distance, name, x_val, y_val, unit, color = best
+        return name, x_val, y_val, unit, color
 
     def set_crosshair_pos(self, t: float) -> None:
         """Move the hover crosshair to t without emitting crosshair_moved."""
@@ -1682,6 +1826,9 @@ class SessionCanvasWidget(QWidget):
         if isinstance(bottom, DatetimeAxisItem):
             self._datetime_axis = bottom
             bottom.set_display_mode(display_mode, start_time=axis_reference_time)
+        bottom_label = "Sample Index" if display_mode == TimeDisplayMode.SAMPLE_INDEX else "Time"
+        label_color = "#111827" if self._canvas_theme == "light" else "#E5E7EB"
+        self._primary_plot.setLabel("bottom", bottom_label, **{"color": label_color})
 
     def set_panel_title(self, title: str) -> None:
         self._panel_title = title

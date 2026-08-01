@@ -7,6 +7,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QPlainTextEdit,
     QProgressBar,
     QSizePolicy,
@@ -148,18 +150,55 @@ class TimestampSelectPage(QWidget):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.table, 1)
+        self.table.setMinimumHeight(92)
+        self.table.setMaximumHeight(150)
+        layout.addWidget(self.table)
 
         mode_group = QGroupBox("Time Axis Mode")
         mode_layout = QGridLayout(mode_group)
+        mode_layout.setContentsMargins(14, 12, 14, 12)
         mode_layout.setHorizontalSpacing(12)
-        mode_layout.setVerticalSpacing(6)
-        self.time_axis_mode_combo = QComboBox()
+        mode_layout.setVerticalSpacing(10)
+        self.time_axis_mode_combo = QComboBox(self)
         self.time_axis_mode_combo.addItem("Auto-detect", "auto")
         self.time_axis_mode_combo.addItem("Absolute timestamp", "absolute")
         self.time_axis_mode_combo.addItem("Elapsed time values", "elapsed")
         self.time_axis_mode_combo.addItem("Synthetic time from sample rate", "synthetic_elapsed")
         self.time_axis_mode_combo.addItem("Sample index", "sample_index")
+        self.time_axis_mode_combo.setVisible(False)
+        self._mode_radios: dict[str, QRadioButton] = {}
+        self._mode_button_group = QButtonGroup(self)
+        self._mode_button_group.setExclusive(True)
+        mode_cards = [
+            (
+                "auto",
+                "Auto-detect",
+                "Use the app's recommended timestamp interpretation.",
+            ),
+            (
+                "absolute",
+                "Absolute timestamp",
+                "Calendar/date-time values from a timestamp column.",
+            ),
+            (
+                "elapsed",
+                "Elapsed time",
+                "Duration values such as seconds, milliseconds, or minutes.",
+            ),
+            (
+                "synthetic_elapsed",
+                "Synthetic elapsed time",
+                "Generate elapsed time from sample rate or interval.",
+            ),
+            (
+                "sample_index",
+                "Sample index",
+                "Ignore time metadata and plot by row sequence.",
+            ),
+        ]
+        for index, (mode_key, title, description) in enumerate(mode_cards):
+            card = self._build_mode_card(mode_key, title, description)
+            mode_layout.addWidget(card, index // 2, index % 2)
         self.elapsed_unit_combo = QComboBox()
         self.elapsed_unit_combo.addItem("Seconds", "elapsed_seconds")
         self.elapsed_unit_combo.addItem("Milliseconds", "elapsed_milliseconds")
@@ -168,27 +207,37 @@ class TimestampSelectPage(QWidget):
         self.synthetic_basis_combo.addItem("Sample rate (Hz)", "sample_rate")
         self.synthetic_basis_combo.addItem("Sample interval (seconds)", "sample_interval")
         self.synthetic_value_edit = QLineEdit()
-        self.synthetic_value_edit.setPlaceholderText("e.g. 100")
+        self.synthetic_value_edit.setPlaceholderText("Sample rate, e.g. 100")
         self.elapsed_unit_label = QLabel("Elapsed unit")
         self.synthetic_basis_label = QLabel("Synthetic basis")
-        mode_layout.addWidget(QLabel("Mode"), 0, 0)
-        mode_layout.addWidget(self.time_axis_mode_combo, 0, 1)
-        mode_layout.addWidget(self.elapsed_unit_label, 1, 0)
-        mode_layout.addWidget(self.elapsed_unit_combo, 1, 1)
-        mode_layout.addWidget(self.synthetic_basis_label, 2, 0)
-        mode_layout.addWidget(self.synthetic_basis_combo, 2, 1)
-        mode_layout.addWidget(self.synthetic_value_edit, 2, 2)
+        self._mode_settings_widget = QWidget()
+        mode_settings_layout = QGridLayout(self._mode_settings_widget)
+        mode_settings_layout.setContentsMargins(0, 8, 0, 0)
+        mode_settings_layout.setHorizontalSpacing(12)
+        mode_settings_layout.setVerticalSpacing(8)
+        self.elapsed_unit_label.setMinimumWidth(110)
+        self.synthetic_basis_label.setMinimumWidth(110)
+        mode_settings_layout.addWidget(self.elapsed_unit_label, 0, 0)
+        mode_settings_layout.addWidget(self.elapsed_unit_combo, 0, 1, 1, 2)
+        mode_settings_layout.addWidget(self.synthetic_basis_label, 1, 0)
+        mode_settings_layout.addWidget(self.synthetic_basis_combo, 1, 1)
+        mode_settings_layout.addWidget(self.synthetic_value_edit, 1, 2)
+        mode_settings_layout.setColumnStretch(1, 1)
+        mode_settings_layout.setColumnStretch(2, 1)
+        mode_layout.addWidget(self._mode_settings_widget, 3, 0, 1, 2)
+        mode_layout.setColumnStretch(0, 1)
         mode_layout.setColumnStretch(1, 1)
         layout.addWidget(mode_group)
 
         self.override_group = QGroupBox("Format Override")
         override_layout = QVBoxLayout(self.override_group)
+        override_layout.setContentsMargins(14, 12, 14, 12)
         override_layout.setSpacing(8)
         details = QWidget()
         details_layout = QGridLayout(details)
         details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.setHorizontalSpacing(12)
-        details_layout.setVerticalSpacing(6)
+        details_layout.setHorizontalSpacing(18)
+        details_layout.setVerticalSpacing(8)
         self.selected_column_caption = QLabel("Selected column")
         self.detected_format_caption = QLabel("Detected format")
         self.format_source_caption = QLabel("Format source")
@@ -200,6 +249,14 @@ class TimestampSelectPage(QWidget):
         self.override_edit.setPlaceholderText("%Y-%m-%d %H:%M:%S")
         self.override_edit.setMinimumWidth(320)
         self.reset_button = QPushButton("Reset to detected")
+        self.reset_button.setMinimumWidth(138)
+        for caption in (
+            self.selected_column_caption,
+            self.detected_format_caption,
+            self.format_source_caption,
+            self.manual_format_caption,
+        ):
+            caption.setMinimumWidth(96)
         details_layout.addWidget(self.selected_column_caption, 0, 0)
         details_layout.addWidget(self.selected_column_label, 0, 1)
         details_layout.addWidget(self.detected_format_caption, 1, 0)
@@ -214,12 +271,29 @@ class TimestampSelectPage(QWidget):
         layout.addWidget(self.override_group)
 
         # ── Timestamp Reconstruction ──────────────────────────────────────
-        self._recon_group = QGroupBox("Timestamp Reconstruction")
-        recon_form = QFormLayout(self._recon_group)
+        self._recon_group = QGroupBox("Advanced Timestamp Repair")
+        recon_root_layout = QVBoxLayout(self._recon_group)
+        recon_root_layout.setContentsMargins(14, 12, 14, 12)
+        recon_root_layout.setSpacing(8)
+        self.recon_advanced_check = QCheckBox("Show timestamp reconstruction tools")
+        self.recon_advanced_check.setToolTip(
+            "Use this only when timestamp values are truncated or repeated and need repair."
+        )
+        recon_root_layout.addWidget(self.recon_advanced_check)
+        self._recon_body = QWidget()
+        recon_layout = QGridLayout(self._recon_body)
+        recon_layout.setContentsMargins(14, 12, 14, 12)
+        recon_layout.setHorizontalSpacing(18)
+        recon_layout.setVerticalSpacing(10)
 
         self.recon_status_label = QLabel("No truncation detected.")
         self.recon_status_label.setWordWrap(True)
-        recon_form.addRow("Detection", self.recon_status_label)
+        self.recon_status_label.setMinimumHeight(34)
+        self.recon_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        recon_detection_label = QLabel("Detection")
+        recon_detection_label.setMinimumWidth(96)
+        recon_layout.addWidget(recon_detection_label, 0, 0, Qt.AlignmentFlag.AlignTop)
+        recon_layout.addWidget(self.recon_status_label, 0, 1, 1, 3)
 
         self.recon_enable_check = QCheckBox("Enable anchor-based sub-interval reconstruction")
         self.recon_enable_check.setChecked(False)
@@ -227,12 +301,13 @@ class TimestampSelectPage(QWidget):
             "When enabled, duplicate timestamps are treated as 100 ms anchor windows and "
             "sub-interval times are interpolated using the sample rate below."
         )
-        recon_form.addRow("", self.recon_enable_check)
+        recon_layout.addWidget(self.recon_enable_check, 1, 1, 1, 3)
 
         self.recon_start_edit = QLineEdit()
         self.recon_start_edit.setPlaceholderText("YYYY-MM-DD HH:MM:SS.sss  (leave blank to use file's first timestamp)")
         self.recon_start_edit.setEnabled(False)
-        recon_form.addRow("Start date/time", self.recon_start_edit)
+        recon_layout.addWidget(QLabel("Start date/time"), 2, 0)
+        recon_layout.addWidget(self.recon_start_edit, 2, 1, 1, 3)
 
         self.recon_rate_spin = QDoubleSpinBox()
         self.recon_rate_spin.setRange(0.001, 100_000.0)
@@ -241,28 +316,91 @@ class TimestampSelectPage(QWidget):
         self.recon_rate_spin.setSpecialValueText("auto")
         self.recon_rate_spin.setValue(0.001)  # sentinel = auto
         self.recon_rate_spin.setEnabled(False)
-        recon_form.addRow("Sample rate", self.recon_rate_spin)
+        self.recon_rate_spin.setMinimumWidth(150)
+        recon_layout.addWidget(QLabel("Sample rate"), 3, 0)
+        recon_layout.addWidget(self.recon_rate_spin, 3, 1)
 
         self.recon_dt_label = QLabel("")
-        recon_form.addRow("Interval", self.recon_dt_label)
+        self.recon_dt_label.setWordWrap(True)
+        recon_layout.addWidget(QLabel("Interval"), 3, 2)
+        recon_layout.addWidget(self.recon_dt_label, 3, 3)
 
         self.recon_sample_label = QLabel("")
         self.recon_sample_label.setWordWrap(True)
-        self.recon_sample_label.setStyleSheet("font-family: monospace; color: #888888;")
-        recon_form.addRow("Preview", self.recon_sample_label)
+        self.recon_sample_label.setStyleSheet(
+            "font-family: Menlo, Consolas, 'Courier New'; color: #888888;"
+        )
+        self.recon_sample_label.setMinimumHeight(26)
+        recon_layout.addWidget(QLabel("Preview"), 4, 0, Qt.AlignmentFlag.AlignTop)
+        recon_layout.addWidget(self.recon_sample_label, 4, 1, 1, 3)
+        recon_layout.setColumnStretch(1, 2)
+        recon_layout.setColumnStretch(3, 2)
+        recon_root_layout.addWidget(self._recon_body)
+        self._recon_body.setVisible(False)
 
         self.recon_enable_check.toggled.connect(self._on_recon_toggled)
         self.recon_rate_spin.valueChanged.connect(self._on_recon_rate_changed)
+        self.recon_advanced_check.toggled.connect(self._recon_body.setVisible)
 
         layout.addWidget(self._recon_group)
 
+        self.plan_group = QGroupBox("Current Plan")
+        plan_layout = QVBoxLayout(self.plan_group)
+        plan_layout.setContentsMargins(8, 8, 8, 8)
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
         self._configure_feedback_text_block(self.message_label, min_height=54)
-        layout.addWidget(self.message_label)
+        plan_layout.addWidget(self.message_label)
+        layout.addWidget(self.plan_group)
         self.time_axis_mode_combo.currentIndexChanged.connect(self._refresh_mode_visibility)
+        self.time_axis_mode_combo.currentIndexChanged.connect(self._sync_mode_cards_from_combo)
         self.elapsed_unit_combo.currentIndexChanged.connect(self._refresh_mode_visibility)
+        self.synthetic_basis_combo.currentIndexChanged.connect(self._refresh_mode_visibility)
+        self.synthetic_value_edit.textChanged.connect(self._refresh_mode_visibility)
+        self.override_edit.textChanged.connect(self._refresh_mode_visibility)
+        self._sync_mode_cards_from_combo()
         self._refresh_mode_visibility()
+
+    def _build_mode_card(self, mode_key: str, title: str, description: str) -> QFrame:
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.setStyleSheet(
+            "QFrame { border-radius: 6px; }"
+            "QLabel { background: transparent; }"
+            "QRadioButton { background: transparent; font-weight: 600; }"
+        )
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(10, 8, 10, 8)
+        card_layout.setSpacing(3)
+        radio = QRadioButton(title)
+        radio.toggled.connect(
+            lambda checked, key=mode_key: self._on_mode_card_toggled(key, checked)
+        )
+        description_label = QLabel(description)
+        description_label.setWordWrap(True)
+        description_label.setStyleSheet("color: #888888; font-size: 11px;")
+        card_layout.addWidget(radio)
+        card_layout.addWidget(description_label)
+        self._mode_radios[mode_key] = radio
+        self._mode_button_group.addButton(radio)
+        card.mousePressEvent = lambda _event, btn=radio: btn.setChecked(True)
+        return card
+
+    def _on_mode_card_toggled(self, mode_key: str, checked: bool) -> None:
+        if not checked:
+            return
+        index = self.time_axis_mode_combo.findData(mode_key)
+        if index >= 0 and index != self.time_axis_mode_combo.currentIndex():
+            self.time_axis_mode_combo.setCurrentIndex(index)
+
+    def _sync_mode_cards_from_combo(self) -> None:
+        mode = self.selected_time_axis_mode()
+        radio = self._mode_radios.get(mode)
+        if radio is not None and not radio.isChecked():
+            radio.blockSignals(True)
+            radio.setChecked(True)
+            radio.blockSignals(False)
 
     def _configure_feedback_text_block(self, label: QLabel, *, min_height: int) -> None:
         label.setWordWrap(True)
@@ -291,6 +429,7 @@ class TimestampSelectPage(QWidget):
         """Populate the reconstruction panel from a TruncationAnalysis result."""
         self.recon_status_label.setText(analysis.notes or "—")
         if analysis.is_truncated:
+            self.recon_advanced_check.setChecked(True)
             self.recon_enable_check.setChecked(True)
             hz = analysis.inferred_sample_rate_hz
             if hz and hz > 0.001:
@@ -363,14 +502,14 @@ class TimestampSelectPage(QWidget):
         self.synthetic_basis_label.setVisible(show_synthetic)
         self.synthetic_basis_combo.setVisible(show_synthetic)
         self.synthetic_value_edit.setVisible(show_synthetic)
-        uses_manual_format = mode in {"auto", "absolute"}
-        self.manual_format_caption.setVisible(uses_manual_format)
-        self.override_edit.setVisible(uses_manual_format)
-        self.reset_button.setVisible(uses_manual_format)
-        self.override_edit.setEnabled(uses_manual_format)
+        self._mode_settings_widget.setVisible(show_elapsed or show_synthetic)
+        if self.synthetic_timing_basis() == "sample_interval":
+            self.synthetic_value_edit.setPlaceholderText("Sample interval, e.g. 0.01")
+        else:
+            self.synthetic_value_edit.setPlaceholderText("Sample rate, e.g. 100")
         self._refresh_time_axis_details(
             self.selected_column_label.text() if self.selected_column_label.text() != "Not used" else None,
-            self.detected_format_label.text() if uses_manual_format else None,
+            self.detected_format_label.text(),
         )
 
     def _refresh_time_axis_details(
@@ -379,37 +518,49 @@ class TimestampSelectPage(QWidget):
         detected_format: str | None,
     ) -> None:
         mode = self.selected_time_axis_mode()
+        elapsed_formats = {"elapsed_seconds", "elapsed_milliseconds", "elapsed_minutes"}
         if mode == "sample_index":
-            self.override_group.setTitle("Time Axis Details")
+            self.override_group.setTitle("Sample Index Settings")
             self.selected_column_caption.setText("Selected column")
             self.selected_column_label.setText("Not used")
             self.detected_format_caption.setText("Axis basis")
             self.detected_format_label.setText("Sample index")
             self.format_source_caption.setText("Source")
             self.override_status_label.setText("User-selected mode")
+            self.manual_format_caption.setVisible(False)
+            self.override_edit.setVisible(False)
+            self.reset_button.setVisible(False)
             return
 
         if mode == "synthetic_elapsed":
-            self.override_group.setTitle("Time Axis Details")
+            self.override_group.setTitle("Synthetic Time Settings")
             self.selected_column_caption.setText("Selected column")
             self.selected_column_label.setText("Not used")
             self.detected_format_caption.setText("Axis basis")
             self.detected_format_label.setText("Synthetic elapsed time")
             self.format_source_caption.setText("Source")
             self.override_status_label.setText("User-selected mode")
+            self.manual_format_caption.setVisible(False)
+            self.override_edit.setVisible(False)
+            self.reset_button.setVisible(False)
             return
 
         if mode == "elapsed":
-            self.override_group.setTitle("Time Axis Details")
+            self.override_group.setTitle("Elapsed Time Settings")
             self.selected_column_caption.setText("Selected column")
             self.selected_column_label.setText(column_name or "None")
             self.detected_format_caption.setText("Elapsed unit")
             self.detected_format_label.setText(self.elapsed_unit_combo.currentText())
             self.format_source_caption.setText("Source")
             self.override_status_label.setText("User-selected mode")
+            self.manual_format_caption.setVisible(False)
+            self.override_edit.setVisible(False)
+            self.reset_button.setVisible(False)
             return
 
-        self.override_group.setTitle("Format Override")
+        self.override_group.setTitle(
+            "Timestamp Format" if mode == "absolute" else "Detected Timestamp Details"
+        )
         self.selected_column_caption.setText("Selected column")
         self.selected_column_label.setText(column_name or "None")
         self.detected_format_caption.setText("Detected format")
@@ -417,6 +568,13 @@ class TimestampSelectPage(QWidget):
         self.format_source_caption.setText("Format source")
         has_override = bool(self.override_edit.text().strip())
         self.override_status_label.setText("User Override" if has_override else "Auto-detected")
+        show_manual_format = mode == "absolute" or (
+            mode == "auto" and (detected_format or "") not in elapsed_formats
+        )
+        self.manual_format_caption.setVisible(show_manual_format)
+        self.override_edit.setVisible(show_manual_format)
+        self.reset_button.setVisible(show_manual_format)
+        self.override_edit.setEnabled(show_manual_format)
 
 
 class ColumnMappingPage(QWidget):
@@ -431,7 +589,6 @@ class ColumnMappingPage(QWidget):
         self.time_axis_label.setWordWrap(True)
         layout.addWidget(self.time_axis_label)
         self.table = QTableView()
-        self.table.setMinimumWidth(860)
         self.table.setModel(model)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)

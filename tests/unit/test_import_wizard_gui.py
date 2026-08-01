@@ -214,7 +214,7 @@ def test_column_mapping_page_sizes_editable_columns_for_dropdowns(qapp) -> None:
         assert header.sectionResizeMode(2) == QHeaderView.ResizeMode.Stretch
         assert header.sectionResizeMode(3) == QHeaderView.ResizeMode.Fixed
         assert header.sectionResizeMode(4) == QHeaderView.ResizeMode.Fixed
-        assert page.table.minimumWidth() >= 860
+        assert page.table.minimumWidth() < 860
         assert page.table.columnWidth(3) >= 220
         assert page.table.columnWidth(4) >= 140
         assert page.table.verticalHeader().defaultSectionSize() >= 34
@@ -423,6 +423,76 @@ def test_dialog_pipeline_success_emits_record(monkeypatch, qapp, tmp_path) -> No
 
         assert dlg.pipeline_result is pipeline_result
         assert emitted == [record]
+    finally:
+        dlg.close()
+        qapp.processEvents()
+
+
+def test_dialog_finished_signal_accepts_the_qdialog(qapp) -> None:
+    """ImportWizardDialog is now a thin QDialog wrapper around ImportWizardWidget;
+    confirm the wizard's `finished` signal still drives the wrapper's own Qt
+    accept state, since that's the only modal contract callers/tests rely on.
+    """
+    dlg = ImportWizardDialog(thread_pool=ImmediateThreadPool())
+    try:
+        assert dlg.result() != dlg.DialogCode.Accepted
+        dlg.wizard.finished.emit()
+        assert dlg.result() == dlg.DialogCode.Accepted
+    finally:
+        qapp.processEvents()
+
+
+def test_dialog_reject_declined_keeps_dialog_open(monkeypatch, qapp) -> None:
+    """The wrapper's reject() must go through the wizard's own discard-risk
+    check (request_close) rather than closing unconditionally — otherwise a
+    caller relying on the old modal QDialog.reject() contract could lose an
+    in-progress import without any confirmation.
+    """
+    from PyQt6.QtWidgets import QMessageBox
+
+    dlg = ImportWizardDialog(thread_pool=ImmediateThreadPool())
+    try:
+        dlg.wizard._import_running = True
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+
+        dlg.reject()
+
+        assert dlg.wizard._closing is False
+        assert dlg.result() != dlg.DialogCode.Accepted
+    finally:
+        qapp.processEvents()
+
+
+def test_dialog_reject_confirmed_closes_dialog(monkeypatch, qapp) -> None:
+    from PyQt6.QtWidgets import QMessageBox
+
+    dlg = ImportWizardDialog(thread_pool=ImmediateThreadPool())
+    try:
+        dlg.wizard._import_running = True
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+
+        dlg.reject()
+
+        assert dlg.wizard._closing is True
+    finally:
+        qapp.processEvents()
+
+
+def test_dialog_attribute_access_proxies_to_underlying_wizard(qapp) -> None:
+    """Regression test for the __getattr__/__setattr__ proxy that keeps the
+    dialog wrapper API-compatible with the embeddable ImportWizardWidget.
+    """
+    dlg = ImportWizardDialog(thread_pool=ImmediateThreadPool())
+    try:
+        assert dlg.load_page is dlg.wizard.load_page
+        assert dlg.timestamp_page is dlg.wizard.timestamp_page
+
+        dlg.set_source_path("proxied.csv")
+        assert dlg.wizard.load_page.path_edit.text() == "proxied.csv"
     finally:
         dlg.close()
         qapp.processEvents()

@@ -33,8 +33,11 @@ _STRPTIME_FORMATS: tuple[str, ...] = (
     "%Y-%m-%d",
     "%d/%m/%Y",
     "%m/%d/%Y",
+    "%I:%M:%S %p",
+    "%I:%M %p",
     "%H:%M:%S.%f",
     "%H:%M:%S",
+    "%H:%M",
 )
 
 # Epoch ranges
@@ -59,6 +62,14 @@ _ELAPSED_TIME_NAME_FRAGMENTS: tuple[str, ...] = (
     "time", "elapsed", "duration", "second", "seconds", "sec", "minute",
     "minutes", "min", "millisecond", "milliseconds", "msec", "ms",
 )
+
+_TIME_ONLY_FORMATS = frozenset({
+    "%I:%M:%S %p",
+    "%I:%M %p",
+    "%H:%M:%S.%f",
+    "%H:%M:%S",
+    "%H:%M",
+})
 
 
 def _try_strptime(value: str) -> str | None:
@@ -332,6 +343,8 @@ def detect_timestamp_candidates(
 
         if _name_suggests_timestamp(col_name):
             confidence += 0.15
+        elif fmt in _TIME_ONLY_FORMATS:
+            confidence -= 0.15
 
         # Monotonic check on raw values
         if _is_monotonic_increasing(col_raw[ci]):

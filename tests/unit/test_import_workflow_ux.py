@@ -150,7 +150,7 @@ def test_sample_index_mode_shows_axis_details_not_format_override(qapp, tmp_path
         dlg.timestamp_page.time_axis_mode_combo.setCurrentIndex(idx)
         qapp.processEvents()
 
-        assert dlg.timestamp_page.override_group.title() == "Time Axis Details"
+        assert dlg.timestamp_page.override_group.title() == "Sample Index Settings"
         assert dlg.timestamp_page.selected_column_label.text() == "Not used"
         assert dlg.timestamp_page.detected_format_caption.text() == "Axis basis"
         assert dlg.timestamp_page.detected_format_label.text() == "Sample index"
@@ -172,7 +172,7 @@ def test_elapsed_mode_shows_user_selected_unit_details(qapp, tmp_path) -> None:
         dlg.timestamp_page.elapsed_unit_combo.setCurrentIndex(unit_idx)
         qapp.processEvents()
 
-        assert dlg.timestamp_page.override_group.title() == "Time Axis Details"
+        assert dlg.timestamp_page.override_group.title() == "Elapsed Time Settings"
         assert dlg.timestamp_page.selected_column_label.text() == "Time"
         assert dlg.timestamp_page.detected_format_caption.text() == "Elapsed unit"
         assert dlg.timestamp_page.detected_format_label.text() == "Milliseconds"
@@ -405,6 +405,38 @@ def test_user_override_visibility_in_mapping_model(qapp, tmp_path) -> None:
         tooltip = dlg.column_model.data(unit_index, Qt.ItemDataRole.ToolTipRole)
         assert "Engineering unit is a user override" in tooltip
         assert "excluded" in tooltip
+    finally:
+        dlg.close()
+        qapp.processEvents()
+
+
+def test_mode_card_click_selects_exactly_one_radio_and_updates_model(qapp, tmp_path) -> None:
+    """The Time Axis Mode combo was replaced by a card/radio-button grid.
+    Drive it the way a real user would (a radio click), not by setting the
+    (now-hidden) combo box index directly, so a bug confined to the
+    card -> combo sync path would actually be caught.
+    """
+    dlg = _profiled_dialog(qapp, tmp_path)
+    try:
+        page = dlg.timestamp_page
+        assert page.selected_time_axis_mode() == "auto"
+        assert page._mode_radios["auto"].isChecked()
+
+        page._mode_radios["sample_index"].click()
+        qapp.processEvents()
+
+        assert page.selected_time_axis_mode() == "sample_index"
+        assert page._mode_radios["sample_index"].isChecked()
+        # QButtonGroup exclusivity: exactly one radio may be checked.
+        checked = [key for key, r in page._mode_radios.items() if r.isChecked()]
+        assert checked == ["sample_index"]
+
+        page._mode_radios["absolute"].click()
+        qapp.processEvents()
+
+        assert page.selected_time_axis_mode() == "absolute"
+        checked = [key for key, r in page._mode_radios.items() if r.isChecked()]
+        assert checked == ["absolute"]
     finally:
         dlg.close()
         qapp.processEvents()

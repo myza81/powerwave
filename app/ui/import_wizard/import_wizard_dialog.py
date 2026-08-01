@@ -22,16 +22,20 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from app.import_wizard import (
@@ -198,15 +202,16 @@ _STEP_LABELS: dict[WizardStep, str] = {
 }
 
 
-class ImportWizardDialog(QDialog):
-    """Operational CSV/Excel import wizard with plan-aware authoritative execution."""
+class ImportWizardWidget(QWidget):
+    """Operational CSV/Excel import wizard that can be embedded or dialog-hosted."""
 
     import_completed = pyqtSignal(object)  # DisturbanceRecord
+    close_requested = pyqtSignal()
+    finished = pyqtSignal()
 
     def __init__(self, parent=None, *, thread_pool=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import Wizard")
-        self.resize(1120, 720)
         # Accept any object with a .start(worker) interface so tests can inject
         # an ImmediateThreadPool without inheriting from QThreadPool.
         self._thread_pool = thread_pool if thread_pool is not None else QThreadPool.globalInstance()
@@ -284,7 +289,13 @@ class ImportWizardDialog(QDialog):
             self.complete_page,
         ):
             self.stack.addWidget(page)
-        body.addWidget(self.stack, 1)
+        self.page_scroll = QScrollArea()
+        self.page_scroll.setWidgetResizable(True)
+        self.page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.page_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.page_scroll.setWidget(self.stack)
+        body.addWidget(self.page_scroll, 1)
         root.addLayout(body, 1)
 
         nav = QHBoxLayout()
@@ -328,6 +339,21 @@ class ImportWizardDialog(QDialog):
         self.workflow_status_label = QLabel("")
         self.workflow_status_label.setWordWrap(True)
         root.addWidget(self.workflow_status_label)
+
+    def _apply_screen_aware_size(self) -> None:
+        """Open within the current screen so laptop displays keep all controls reachable."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.setMinimumSize(820, 560)
+            self.resize(1120, 720)
+            return
+        available = screen.availableGeometry()
+        min_width = min(820, max(640, int(available.width() * 0.9)))
+        min_height = min(560, max(480, int(available.height() * 0.9)))
+        self.setMinimumSize(min_width, min_height)
+        width = min(1120, max(min_width, int(available.width() * 0.9)))
+        height = min(760, max(min_height, int(available.height() * 0.9)))
+        self.resize(width, height)
 
     def _browse_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -494,11 +520,14 @@ class ImportWizardDialog(QDialog):
     def _reset_reconstruction_ui(self) -> None:
         """Reset reconstruction panel to default state without emitting signals."""
         for w in (
+            self.timestamp_page.recon_advanced_check,
             self.timestamp_page.recon_enable_check,
             self.timestamp_page.recon_rate_spin,
         ):
             w.blockSignals(True)
         self.timestamp_page.recon_start_edit.blockSignals(True)
+        self.timestamp_page.recon_advanced_check.setChecked(False)
+        self.timestamp_page._recon_body.setVisible(False)
         self.timestamp_page.recon_enable_check.setChecked(False)
         self.timestamp_page.recon_start_edit.clear()
         self.timestamp_page.recon_rate_spin.setValue(0.001)
@@ -506,6 +535,7 @@ class ImportWizardDialog(QDialog):
         self.timestamp_page.recon_dt_label.setText("")
         self.timestamp_page.recon_sample_label.setText("")
         for w in (
+            self.timestamp_page.recon_advanced_check,
             self.timestamp_page.recon_enable_check,
             self.timestamp_page.recon_rate_spin,
         ):
@@ -828,7 +858,7 @@ class ImportWizardDialog(QDialog):
             )
             return
         self.import_completed.emit(result.record)
-        self.accept()
+        self.finished.emit()
 
     def _apply_timestamp_selection(self) -> None:
         """Sync the GUI's selected timestamp candidate into the session."""
@@ -1168,13 +1198,67 @@ class ImportWizardDialog(QDialog):
     def request_close(self) -> None:
         if self._confirm_discard_current_session():
             self._closing = True
-            super().reject()
+            self.close_requested.emit()
 
     def reject(self) -> None:
         if self._closing or self._confirm_discard_current_session():
             self._closing = True
-            super().reject()
+            self.close_requested.emit()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._closing = True
         event.accept()
+
+
+class ImportWizardDialog(QDialog):
+    """Dialog wrapper retained for tests and callers that still need modal import."""
+
+    import_completed = pyqtSignal(object)  # DisturbanceRecord
+
+    def __init__(self, parent=None, *, thread_pool=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Import Wizard")
+        self.wizard = ImportWizardWidget(self, thread_pool=thread_pool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.wizard)
+
+        self.wizard.import_completed.connect(self.import_completed.emit)
+        self.wizard.finished.connect(self.accept)
+        self.wizard.close_requested.connect(self._reject_from_child)
+        self._apply_screen_aware_size()
+
+    def __getattr__(self, name: str):
+        wizard = self.__dict__.get("wizard")
+        if wizard is not None:
+            return getattr(wizard, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value) -> None:
+        wizard = self.__dict__.get("wizard")
+        if wizard is not None and name != "wizard" and hasattr(wizard, name):
+            setattr(wizard, name, value)
+            return
+        super().__setattr__(name, value)
+
+    def _apply_screen_aware_size(self) -> None:
+        """Open within the current screen so laptop displays keep all controls reachable."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.setMinimumSize(820, 560)
+            self.resize(1120, 720)
+            return
+        available = screen.availableGeometry()
+        min_width = min(820, max(640, int(available.width() * 0.9)))
+        min_height = min(560, max(480, int(available.height() * 0.9)))
+        self.setMinimumSize(min_width, min_height)
+        width = min(1120, max(min_width, int(available.width() * 0.9)))
+        height = min(760, max(min_height, int(available.height() * 0.9)))
+        self.resize(width, height)
+
+    def reject(self) -> None:
+        self.wizard.request_close()
+
+    def _reject_from_child(self) -> None:
+        QDialog.reject(self)

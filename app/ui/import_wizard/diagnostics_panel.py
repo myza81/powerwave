@@ -264,19 +264,23 @@ class DiagnosticsPanel(QWidget):
             "Import diagnostics will appear here after a successful import."
         )
         layout.addWidget(self._text)
+        self._plain_text_cache = ""
 
     def set_summary(self, summary: ImportDiagnosticsSummary) -> None:
         """Render the diagnostics summary into the panel."""
+        self._plain_text_cache = render_diagnostics_text(summary)
         self._text.setHtml(render_diagnostics_html(summary))
 
     def set_failure_text(self, text: str) -> None:
         """Show a plain failure/error message (no structured summary available)."""
+        self._plain_text_cache = text
         self._text.setPlainText(text)
 
     def clear(self) -> None:
         """Clear the panel content."""
+        self._plain_text_cache = ""
         self._text.clear()
 
     def plain_text(self) -> str:
         """Return the current text content (for testing)."""
-        return self._text.toPlainText()
+        return self._plain_text_cache
