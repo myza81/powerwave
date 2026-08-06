@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.data.channel_name_matching import has_status_qualifier
 from app.data.column_classifier import classify_csv_column
 from app.import_wizard.column_mapping import ParameterType
 from app.import_wizard.models import ColumnMappingCandidate
@@ -38,19 +39,41 @@ _SHARED_TO_PARAMETER_TYPE: dict[str, ParameterType] = {
 # Name-fragment → (ParameterType, unit) lookup
 # ---------------------------------------------------------------------------
 
-_NAME_RULES: list[tuple[re.Pattern[str], ParameterType, str | None]] = [
+# Analog-measurement name rules. Checked only when the name has no
+# status/control qualifier (see classify_by_name) -- a name like
+# "Voltage Status" or "Current State" must not be assigned the VOLTAGE/
+# CURRENT type from these patterns just because the measurement word is
+# present; the qualifier word is what makes the name describe a
+# status/control signal about the measurement rather than the measurement
+# itself. "curr" requires a leading word boundary so it does not match
+# inside unrelated words such as "Occurrence".
+_MEASUREMENT_NAME_RULES: list[tuple[re.Pattern[str], ParameterType, str | None]] = [
     # Voltage
     (re.compile(r"\bv\b|\bv[abc]\b|volt|voltage|vln|vll|kv|pu_v", re.IGNORECASE), ParameterType.VOLTAGE, "V"),
     # Current
-    (re.compile(r"\bi\b|curr|\bamps?\b|\bampere\b|\bi[abc]\b", re.IGNORECASE), ParameterType.CURRENT, "A"),
+    (re.compile(r"\bi\b|\bcurr|\bamps?\b|\bampere\b|\bi[abc]\b", re.IGNORECASE), ParameterType.CURRENT, "A"),
     # Reactive power — must come before active power to avoid "active" matching in "reactive"
     (re.compile(r"\bmvar|reactive.?power|q_mvar|\bkvar\b", re.IGNORECASE), ParameterType.MVAR, "Mvar"),
     # Active power
-    (re.compile(r"\bmw|\bactive.?power|p_mw|\bkw\b|megawatt", re.IGNORECASE), ParameterType.MW, "MW"),
+    #
+    # "mw"/"hz" use a trailing negative lookahead rather than \b: \b treats
+    # "_" as a word character (no boundary), which would otherwise still
+    # reject legitimate delimited forms like "MW_Total"/"Hz_1"; (?![a-z])
+    # (case-folded by IGNORECASE) rejects only a directly-attached lowercase
+    # continuation such as "MWStatus"/"HzStatus", which is the actual
+    # unsafe case -- a compact word with no delimiter at all.
+    (re.compile(r"\bmw(?![a-z])|\bactive.?power|p_mw|\bkw\b|megawatt", re.IGNORECASE), ParameterType.MW, "MW"),
     # Frequency
-    (re.compile(r"\bfreq\b|frequency|\bhz|f_hz", re.IGNORECASE), ParameterType.FREQUENCY, "Hz"),
+    (re.compile(r"\bfreq\b|frequency|\bhz(?![a-z])|f_hz", re.IGNORECASE), ParameterType.FREQUENCY, "Hz"),
     # ROCOF
     (re.compile(r"rocof|df.?dt|rate.of.change.of.freq", re.IGNORECASE), ParameterType.ROCOF, "Hz/s"),
+]
+
+# Digital and timestamp rules are unaffected by qualifier suppression --
+# qualifier words such as "status"/"alarm"/"trip" are themselves part of
+# what makes a name look like digital/status evidence, and this module's
+# existing digital ontology is not being changed in this task.
+_NON_MEASUREMENT_NAME_RULES: list[tuple[re.Pattern[str], ParameterType, str | None]] = [
     # Digital
     (re.compile(r"\bdig\b|digital|status|flag|bool|binary|trip|alarm|cb\b", re.IGNORECASE), ParameterType.DIGITAL, None),
     # Timestamp
@@ -94,12 +117,22 @@ def _clean_name(name: str) -> str:
 def classify_by_name(col_name: str) -> tuple[ParameterType, str | None, float, str]:
     """Classify a column by its name alone.
 
+    Measurement-type rules (voltage/current/mvar/mw/frequency/rocof) are
+    skipped when the name carries a status/control qualifier (e.g.
+    "Voltage Status", "Current State") -- digital/timestamp evidence is
+    still checked normally, since qualifier words are themselves part of
+    the existing digital pattern and this task does not change that.
+
     Returns
     -------
     (parameter_type, unit, confidence, reason)
     """
     clean = _clean_name(col_name)
-    for pattern, ptype, unit in _NAME_RULES:
+    if not has_status_qualifier(col_name):
+        for pattern, ptype, unit in _MEASUREMENT_NAME_RULES:
+            if pattern.search(clean):
+                return ptype, unit, 0.75, f"name matches pattern for {ptype.value}"
+    for pattern, ptype, unit in _NON_MEASUREMENT_NAME_RULES:
         if pattern.search(clean):
             return ptype, unit, 0.75, f"name matches pattern for {ptype.value}"
     return ParameterType.UNKNOWN, None, 0.10, "no name pattern matched"

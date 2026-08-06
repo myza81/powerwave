@@ -29,6 +29,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
+from app.data.channel_name_matching import has_status_qualifier
 from app.data.column_classifier import ColumnClassification, classify_csv_column
 from app.data.intelligence.fingerprints import (
     build_fingerprint_from_columns,
@@ -103,9 +104,19 @@ class IntelligenceManager:
           6. Unknown — requires operator review
 
         The built-in classifier always runs first. If a matching persistent rule
-        exists, it overrides the classification and returns a ConfidencePromotion.
+        exists, it overrides the classification and returns a ConfidencePromotion
+        -- persistent rules are operator-confirmed evidence and always take
+        precedence, including over a column name that carries a status/control
+        qualifier (see below).
+
         If no persistent rule matches and the base classifier yields no result,
-        the synonym library is consulted as a fallback.
+        the synonym library is consulted as a fallback -- unless the column name
+        carries a status/control qualifier (e.g. "Voltage Status", "MW Status").
+        classify_csv_column already withholds a measurement type for such names
+        (see column_classifier._name_classify), but the synonym library's own
+        matching is a separate, independent regex not aware of that suppression;
+        without this check a status-qualified name that also contains a bare
+        synonym word (e.g. "voltage", "mw") would be silently re-promoted here.
 
         Returns:
             (classification, promotion_audit):
@@ -118,7 +129,7 @@ class IntelligenceManager:
             return promoted, audit
 
         # Synonym/variant fallback (Phase D4.3)
-        if base.signal_type is None or base.confidence < 0.50:
+        if (base.signal_type is None or base.confidence < 0.50) and not has_status_qualifier(column_name):
             syn = classify_by_synonym(column_name)
             if syn is not None:
                 st, unit, dg, conf = syn

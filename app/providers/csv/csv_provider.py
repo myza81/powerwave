@@ -18,6 +18,12 @@ from app.models import (
 from app.providers.base.base_provider import BaseProvider
 from app.providers.base.exceptions import ProviderLoadError
 from app.data.timestamp_disambiguation import parse_ambiguous_dates
+from app.data.channel_name_matching import (
+    has_exact_token,
+    has_status_qualifier,
+    has_token_prefix,
+    tokenize_channel_name,
+)
 from app.data.column_classifier import (
     classify_csv_column,
     numeric_column_disposition,
@@ -65,21 +71,32 @@ def _is_time_like_column(col_name: str) -> bool:
 
 
 def _infer_unit(col_name: str) -> str:
-    """Infer a best-guess engineering unit from a column name."""
-    n = col_name.lower()
-    if any(kw in n for kw in ("volt", "kv")) or n in (
-        "v", "va", "vb", "vc", "vr", "vy", "vab", "vbc", "vca", "vn",
+    """Infer a best-guess engineering unit from a column name.
+
+    Boundary-aware (see app.data.channel_name_matching): matches whole
+    tokens or the leading characters of a token, not an arbitrary
+    substring, so e.g. "curr"/"amp" no longer match inside unrelated words
+    such as "Occurrence"/"Example". Also withholds a unit entirely when the
+    name carries a status/control qualifier (e.g. "Voltage Status") -- a
+    unit inferred from a measurement word in that context would describe
+    the wrong thing, a status/control signal, not the measurement itself.
+    """
+    tokens = tokenize_channel_name(col_name)
+    if has_status_qualifier(tokens):
+        return "unknown"
+    if has_token_prefix(tokens, ("volt",)) or has_exact_token(
+        tokens, ("kv", "v", "va", "vb", "vc", "vr", "vy", "vab", "vbc", "vca", "vn"),
     ):
         return "kV"
-    if any(kw in n for kw in ("curr", "amp")) or n in (
-        "ia", "ib", "ic", "ir", "iy", "in",
+    if has_token_prefix(tokens, ("curr", "amp")) or has_exact_token(
+        tokens, ("ia", "ib", "ic", "ir", "iy", "in"),
     ):
         return "A"
-    if any(kw in n for kw in ("freq", "hz")):
+    if has_token_prefix(tokens, ("freq",)) or has_exact_token(tokens, ("hz",)):
         return "Hz"
-    if "mvar" in n:
+    if has_exact_token(tokens, ("mvar",)):
         return "MVar"
-    if "mw" in n:
+    if has_exact_token(tokens, ("mw",)):
         return "MW"
     return "unknown"
 

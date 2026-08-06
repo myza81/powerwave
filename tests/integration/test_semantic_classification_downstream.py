@@ -35,6 +35,20 @@ TestPanelTypeAliases, TestPanelNameFallbackHardening, and
 TestNumericalSafetyAfterHardening below cover that fix. See also
 tests/unit/test_engineering_display.py for the infer_signal_type-specific
 coverage.
+
+A later Phase B1 task hardened the *upstream* classifiers that feed these
+panel/axis functions -- app/data/column_classifier.py, app/data/intelligence/
+intelligence_manager.py, app/import_wizard/column_detector.py, and both
+providers' _infer_unit() -- using a new shared helper
+(app.data.channel_name_matching) for boundary-aware token matching and
+status/control qualifier suppression (e.g. "Voltage Status" no longer
+classifies as voltage_rms upstream, so it never reaches these panel/axis
+functions with a false unit/parameter_type in the first place).
+TestGenericProductionFixtureNoLongerMisclassifies and
+TestPuluRegressionFixture below prove that end-to-end, through the real
+provider/Wizard pipelines, on both a generic temporary fixture and the PULU
+sample (used only as one additional regression fixture, never as a source
+of any production rule).
 """
 from __future__ import annotations
 
@@ -42,15 +56,20 @@ import tempfile
 import warnings
 from pathlib import Path
 
+import pytest
+
 from app.analytics.scaling.engineering_scaling import compute_scaling_factor
 from app.analytics.scaling.scaling_models import EngineeringScalingMode, GlobalScalingConfig
+from app.import_wizard.import_pipeline import run_import_pipeline
 from app.providers.csv.csv_provider import CsvProvider
+from app.providers.excel.excel_provider import ExcelProvider
 from app.sessions.event_session import _infer_panel_for_channel, _infer_panel_for_type
 from app.visualization.axis_management import (
     AxisDisplayMode,
     axis_group_for_signal,
     normalize_signal_type_hint,
 )
+from app.visualization.engineering_display import infer_signal_type
 
 
 class TestSessionPanelPlacement:
@@ -276,3 +295,170 @@ class TestNumericalSafetyAfterHardening:
         result = compute_scaling_factor("Va", "kV", EngineeringScalingMode.PER_UNIT, cfg)
         assert result.configured is True
         assert result.display_unit == "pu"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase B1 -- generic production-path fixture, end to end
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GENERIC_HEADERS = [
+    "Bus Voltage", "Phase Current", "System Demand", "System Frequency",
+    "Voltage Status", "Current State", "CB Open", "Occurrence",
+]
+# Deliberately generic, unrelated-to-PULU sample values.
+_GENERIC_ROWS = [
+    [132.1 + i * 0.05, 450.0 + i, 15000.0 + i * 3, 50.0 + i * 0.005, i % 2, (i + 1) % 2, i % 3 == 0, 3 + i]
+    for i in range(8)
+]
+
+
+def _write_generic_csv(tmp_path: Path) -> Path:
+    p = tmp_path / "generic_substation_export.csv"
+    lines = ["Timestamp," + ",".join(_GENERIC_HEADERS)]
+    for i, row in enumerate(_GENERIC_ROWS):
+        lines.append(f"2026-01-01 00:00:{i:02d}," + ",".join(str(v) for v in row))
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def _write_generic_xlsx(tmp_path: Path) -> Path:
+    from openpyxl import Workbook
+
+    p = tmp_path / "generic_substation_export.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Timestamp"] + _GENERIC_HEADERS)
+    for i, row in enumerate(_GENERIC_ROWS):
+        ws.append([f"2026-01-01 00:00:{i:02d}"] + list(row))
+    wb.save(p)
+    return p
+
+
+class TestGenericProductionFixtureNoLongerMisclassifies:
+    """End-to-end proof, on a fixture containing no PULU-derived content,
+    that the Phase B1 upstream hardening reaches the final AnalogChannel/
+    DigitalChannel records produced by both the direct providers and the
+    Import Wizard, and that Phase A's downstream panel/axis logic (already
+    verified above) receives correct inputs as a result.
+    """
+
+    def _channel_by_name(self, channels, needle: str):
+        return next(c for c in channels if needle.lower() in c.name.lower())
+
+    def test_csv_provider_final_record(self, tmp_path: Path) -> None:
+        p = _write_generic_csv(tmp_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rec = CsvProvider().load(p)
+
+        voltage = self._channel_by_name(rec.analog_channels, "Bus Voltage")
+        assert voltage.parameter_type == "voltage_rms"
+        panel, _ = _infer_panel_for_channel(voltage.name, unit=voltage.unit, param_type=voltage.parameter_type)
+        assert panel == "voltage"
+
+        current = self._channel_by_name(rec.analog_channels, "Phase Current")
+        assert current.parameter_type == "current_rms"
+
+        demand = self._channel_by_name(rec.analog_channels, "System Demand")
+        assert demand.parameter_type == "active_power"
+        panel, _ = _infer_panel_for_channel(demand.name, unit=demand.unit, param_type=demand.parameter_type)
+        assert panel == "power"
+
+        freq = self._channel_by_name(rec.analog_channels, "System Frequency")
+        assert freq.parameter_type == "frequency"
+
+        occurrence = self._channel_by_name(rec.analog_channels, "Occurrence")
+        assert occurrence.parameter_type is None
+        assert occurrence.unit == "unknown"
+        panel, _ = _infer_panel_for_channel(occurrence.name, unit=occurrence.unit, param_type=occurrence.parameter_type)
+        assert panel == "other"
+        assert infer_signal_type(occurrence.name, occurrence.unit) is None
+
+        analog_names_lower = {c.name.lower() for c in rec.analog_channels}
+        assert "voltage status" not in analog_names_lower
+        assert "current state" not in analog_names_lower
+        digital_names_lower = {c.name.lower() for c in rec.digital_channels}
+        assert "voltage status" in digital_names_lower
+        assert "current state" in digital_names_lower
+        assert "cb open" in digital_names_lower
+
+    def test_excel_provider_matches_csv_provider(self, tmp_path: Path) -> None:
+        xlsx_path = _write_generic_xlsx(tmp_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rec = ExcelProvider().load(xlsx_path)
+
+        demand = self._channel_by_name(rec.analog_channels, "System Demand")
+        assert demand.parameter_type == "active_power"
+        assert demand.unit == "MW"
+
+        occurrence = self._channel_by_name(rec.analog_channels, "Occurrence")
+        assert occurrence.parameter_type is None
+        assert occurrence.unit == "unknown"
+
+        digital_names_lower = {c.name.lower() for c in rec.digital_channels}
+        assert "voltage status" in digital_names_lower
+        assert "current state" in digital_names_lower
+
+    def test_wizard_final_record(self, tmp_path: Path) -> None:
+        p = _write_generic_csv(tmp_path)
+        result = run_import_pipeline(str(p))
+        assert result.success
+
+        voltage = self._channel_by_name(result.record.analog_channels, "bus_voltage")
+        assert voltage.parameter_type == "voltage"
+        panel, _ = _infer_panel_for_channel(voltage.name, unit=voltage.unit, param_type=voltage.parameter_type)
+        assert panel == "voltage"
+
+        demand = self._channel_by_name(result.record.analog_channels, "system_demand")
+        assert demand.parameter_type == "mw"
+
+        analog_names_lower = {c.name.lower() for c in result.record.analog_channels}
+        assert not any("voltage" in n and "status" in n for n in analog_names_lower)
+        assert not any("current" in n and "state" in n for n in analog_names_lower)
+
+        digital_names_lower = {c.name.lower() for c in result.record.digital_channels}
+        assert any("voltage_status" in n or "voltage status" in n for n in digital_names_lower)
+        assert any("cb_open" in n or "cb open" in n for n in digital_names_lower)
+
+        occurrence = self._channel_by_name(result.record.analog_channels, "occurrence")
+        assert occurrence.parameter_type in (None, "unknown")
+        panel, _ = _infer_panel_for_channel(occurrence.name, unit=occurrence.unit, param_type=occurrence.parameter_type)
+        assert panel == "other"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PULU fixture -- one additional real-world regression check, not a source
+# of any production rule (see module docstring and the "Core principle"
+# constraint this task was implemented under: no PULU-specific logic).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PULU_CSV_PATH = Path("samples/csv/pulu_20260306.csv")
+
+
+@pytest.mark.skipif(not _PULU_CSV_PATH.exists(), reason="sample fixture not present")
+class TestPuluRegressionFixture:
+    def test_system_demand_and_frequency_unaffected(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rec = CsvProvider().load(_PULU_CSV_PATH)
+
+        demand = next(c for c in rec.analog_channels if c.name == "System Demand")
+        assert demand.parameter_type == "active_power"
+        assert demand.unit == "MW"
+
+        freq = next(c for c in rec.analog_channels if c.name == "Frequency")
+        assert freq.parameter_type == "frequency"
+        assert freq.unit == "Hz"
+
+        # Tie-Line's documented divergence (provider withholds, Wizard
+        # suggests) is unaffected by Phase B1 -- confirmed unchanged here.
+        tie_line = next(c for c in rec.analog_channels if c.name == "Tie-Line")
+        assert tie_line.parameter_type is None
+        assert tie_line.unit == "unknown"
+
+    def test_wizard_still_succeeds_on_pulu(self) -> None:
+        result = run_import_pipeline(str(_PULU_CSV_PATH))
+        assert result.success
+        demand = next(c for c in result.record.analog_channels if "system_demand" in c.name.lower())
+        assert demand.parameter_type == "mw"

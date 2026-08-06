@@ -29,6 +29,8 @@ from typing import Sequence
 
 import numpy as np
 
+from app.data.channel_name_matching import has_status_qualifier, has_token_phrase
+
 # Columns below this threshold are flagged requires_user_confirmation=True.
 CONFIRMATION_THRESHOLD = 0.80
 
@@ -101,8 +103,14 @@ _EXACT: dict[str, tuple[str, str, str, float]] = {
 }
 
 # Ordered keyword rules: first match wins.
-# Each entry: (substrings_to_search, signal_type, unit, display_group, confidence)
-# All substring searches are case-insensitive (normalised name is already lowercased).
+# Each entry: (phrases_to_search, signal_type, unit, display_group, confidence)
+# Matching is boundary-aware (see app.data.channel_name_matching) -- a phrase
+# must appear as its own token or contiguous run of tokens, not as an
+# arbitrary substring, so e.g. "curr" no longer matches inside "Occurrence"
+# and "voltage" no longer matches inside "Voltage Status" (the latter is
+# additionally blocked by the qualifier check in _name_classify below,
+# regardless of phrase boundaries, since "status" indicates the name
+# describes a status/control signal rather than the measurement itself).
 _KEYWORD: list[tuple[tuple[str, ...], str, str, str, float]] = [
     # Most specific patterns first
     (("system frequency",),
@@ -147,16 +155,36 @@ def _normalize(name: str) -> str:
 def _name_classify(
     name: str,
 ) -> tuple[str | None, str | None, str, float, str] | None:
-    """Return (signal_type, unit, display_group, confidence, inferred_from) or None."""
+    """Return (signal_type, unit, display_group, confidence, inferred_from) or None.
+
+    Exact matches (_EXACT) are checked first and are unaffected by qualifier
+    suppression below: they require the whole normalised name to equal a
+    known relay/unit token exactly (e.g. "va", "mw"), so a status/control
+    qualifier word can never be part of an exact match in the first place.
+
+    Keyword matches (_KEYWORD) are boundary-aware phrase matches, gated by
+    a status/control qualifier check: if the name contains a qualifier word
+    (see has_status_qualifier), no keyword phrase is considered a match --
+    a name like "Voltage Status" or "Current State" describes a
+    status/control signal *about* the measurement, not the measurement
+    itself, and must not be assigned that measurement's type from name
+    evidence alone. This does not affect learned/persistent mapping rules
+    (applied by IntelligenceManager on top of this function's result, per
+    the module docstring's priority order) -- an operator-confirmed rule
+    still overrides whatever this function returns, including None.
+    """
     norm = _normalize(name)
 
     if norm in _EXACT:
         st, unit, dg, conf = _EXACT[norm]
         return st, unit, dg, conf, "name_exact"
 
+    if has_status_qualifier(name):
+        return None
+
     for keywords, st, unit, dg, conf in _KEYWORD:
         for kw in keywords:
-            if kw in norm:
+            if has_token_phrase(name, kw):
                 return st, unit, dg, conf, "name_keyword"
 
     return None

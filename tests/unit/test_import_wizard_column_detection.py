@@ -342,3 +342,112 @@ class TestMagnitudeIsNotAuthoritative:
     def test_digital_binary_detection_unaffected(self):
         m = _mapping_for("Channel_1", [0, 1, 0, 0, 1, 0, 1, 0, 0, 1])
         assert m.parameter_type == ParameterType.DIGITAL
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase B1 -- boundary-aware matching and status/control qualifier suppression
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestValidAnalogNamesStillClassify:
+    """Regression guard for genuine analog measurement names."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("Voltage", ParameterType.VOLTAGE),
+        ("Bus Voltage", ParameterType.VOLTAGE),
+        ("Va", ParameterType.VOLTAGE),
+        ("Vab", ParameterType.VOLTAGE),
+        ("Current", ParameterType.CURRENT),
+        ("Phase Current", ParameterType.CURRENT),
+        ("Ia", ParameterType.CURRENT),
+        ("Active Power", ParameterType.MW),
+        ("System Demand", ParameterType.MW),
+        ("Reactive Power", ParameterType.MVAR),
+        ("Frequency", ParameterType.FREQUENCY),
+        ("ROCOF", ParameterType.ROCOF),
+    ])
+    def test_valid_names(self, name: str, expected: ParameterType) -> None:
+        m = _mapping_for(name, [100.0, 105.0, 98.0, 102.0, 99.0])
+        assert m.parameter_type == expected
+
+
+class TestStatusControlSuppression:
+    """Names combining a measurement word with a status/control qualifier
+    must not become that analog measurement -- see
+    app.data.channel_name_matching.has_status_qualifier. The existing
+    digital pattern (unchanged in this task) may still classify them as
+    DIGITAL when it already would (e.g. "status"/"alarm" are pre-existing
+    digital keywords); otherwise the safe result is UNKNOWN.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "Voltage Status", "VoltageStatus", "Voltage Alarm",
+        "Current State", "CurrentState",
+        "Frequency Alarm", "MW Status", "MWStatus",
+        "Active Power Alarm", "Reactive Power Status",
+    ])
+    def test_not_an_analog_measurement(self, name: str) -> None:
+        m = _mapping_for(name, [100.0, 105.0, 98.0, 102.0, 99.0])
+        assert m.parameter_type not in (
+            ParameterType.VOLTAGE, ParameterType.CURRENT, ParameterType.MW,
+            ParameterType.MVAR, ParameterType.FREQUENCY, ParameterType.ROCOF,
+        )
+
+    def test_status_qualified_names_may_fall_back_to_existing_digital_pattern(self) -> None:
+        # "status"/"alarm" are pre-existing digital keywords (unchanged by
+        # this task) -- once the analog measurement match is suppressed,
+        # these fall through to the same digital rule that already
+        # classifies "Breaker Status"/"Trip"/"CB Open".
+        m = _mapping_for("Voltage Status", [100.0, 105.0, 98.0, 102.0, 99.0])
+        assert m.parameter_type == ParameterType.DIGITAL
+
+    def test_state_qualified_name_has_no_pre_existing_digital_keyword(self) -> None:
+        # "state" (unlike "status") was never one of the existing digital
+        # keywords, and this task does not add one -- the safe result here
+        # is UNKNOWN, not a forced/new digital classification.
+        m = _mapping_for("Current State", [100.0, 105.0, 98.0, 102.0, 99.0])
+        assert m.parameter_type == ParameterType.UNKNOWN
+
+
+class TestExistingDigitalNamesUnaffected:
+    @pytest.mark.parametrize("name", ["Breaker Status", "Trip", "CB Open"])
+    def test_still_digital(self, name: str) -> None:
+        m = _mapping_for(name, [0, 1, 0, 1, 0])
+        assert m.parameter_type == ParameterType.DIGITAL
+
+
+class TestSubstringCollisionsNoLongerClassify:
+    @pytest.mark.parametrize("name", [
+        "Occurrence", "Example", "Input", "Index", "Interval", "Info",
+        "Variable", "Pump", "Impulse",
+    ])
+    def test_unrelated_words_stay_unknown(self, name: str) -> None:
+        m = _mapping_for(name, [100.0, 105.0, 98.0, 102.0, 99.0])
+        assert m.parameter_type == ParameterType.UNKNOWN
+
+
+class TestUserOverrideStillWins:
+    """A qualifier-suppressed or collision-suppressed suggestion must still
+    be fully overridable by the user, exactly like any other suggestion --
+    this task does not change override precedence.
+    """
+
+    def test_user_can_override_a_suppressed_suggestion(self) -> None:
+        from app.import_wizard.models import ColumnMappingCandidate
+
+        m = _mapping_for("Voltage Status", [100.0, 105.0, 98.0, 102.0, 99.0])
+        candidate = ColumnMappingCandidate(
+            source_name=m.source_name,
+            source_index=m.source_index,
+            suggested_name=m.suggested_name,
+            parameter_type=m.parameter_type,
+            unit=m.unit,
+            confidence=m.confidence,
+            classification_reason=m.classification_reason,
+        )
+        candidate.user_type_override = ParameterType.VOLTAGE
+        candidate.user_unit_override = "kV"
+
+        assert candidate.effective_type == ParameterType.VOLTAGE
+        assert candidate.effective_unit == "kV"
+        assert candidate.has_user_override is True

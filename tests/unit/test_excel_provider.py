@@ -152,6 +152,24 @@ class TestInferUnit:
     def test_unknown(self) -> None:
         assert _infer_unit("Channel_42") == "unknown"
 
+    # -- Phase B1: boundary-aware matching, no raw substring collisions --
+
+    @pytest.mark.parametrize("name", ["Occurrence", "Example", "MWStatus", "CurrentState", "VoltageStatus"])
+    def test_substring_and_qualifier_collisions_return_unknown(self, name: str) -> None:
+        assert _infer_unit(name) == "unknown"
+
+    def test_valid_voltage_names_unaffected(self) -> None:
+        assert _infer_unit("Voltage") == "kV"
+        assert _infer_unit("Bus Voltage") == "kV"
+
+    def test_valid_current_name_unaffected(self) -> None:
+        assert _infer_unit("Current") == "A"
+
+    def test_status_qualified_name_does_not_leak_a_unit(self) -> None:
+        assert _infer_unit("Voltage Status") == "unknown"
+        assert _infer_unit("Current State") == "unknown"
+        assert _infer_unit("MW Status") == "unknown"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestIsDigitalColumn

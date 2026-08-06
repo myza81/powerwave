@@ -1,6 +1,8 @@
 """Unit tests for app.data.column_classifier."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -482,3 +484,167 @@ class TestClassifyDataFrame:
         assert result["System Demand"].requires_user_confirmation is False
         assert result["Tie-Line"].requires_user_confirmation is True
         assert result["Time.1"].signal_type is None   # unrecognised artifact
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase B1 -- boundary-aware matching and status/control qualifier suppression
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestValidMeasurementNamesStillClassify:
+    """Regression guard: none of the boundary/qualifier hardening below may
+    change the outcome for genuine analog measurement names.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "Voltage", "Bus Voltage", "Phase Voltage", "Va", "Vb", "Vc",
+        "Vab", "Vbc", "Vca", "V0", "V1", "V2",
+    ])
+    def test_voltage_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "voltage_rms"
+
+    @pytest.mark.parametrize("name", [
+        "Current", "Phase Current", "Ia", "Ib", "Ic", "In", "I0", "I1", "I2",
+    ])
+    def test_current_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "current_rms"
+
+    @pytest.mark.parametrize("name", [
+        "Active Power", "Real Power", "System Demand", "Total Demand", "MW",
+        "P", "P Total", "P_TOTAL",
+    ])
+    def test_active_power_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "active_power"
+
+    @pytest.mark.parametrize("name", ["Reactive Power", "MVar", "MVAr", "Q", "Q Total"])
+    def test_reactive_power_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "reactive_power"
+
+    @pytest.mark.parametrize("name", ["Frequency", "System Frequency", "Freq"])
+    def test_frequency_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "frequency"
+
+    @pytest.mark.parametrize("name", ["ROCOF", "df/dt"])
+    def test_rocof_names(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type == "rocof"
+
+
+class TestStatusControlQualifierSuppression:
+    """A name that mentions a measurement word but also carries a
+    status/control qualifier (status, state, alarm, control, ...) must not
+    be classified as that measurement -- see
+    app.data.channel_name_matching.has_status_qualifier.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "Voltage Status", "Voltage Alarm", "Voltage State", "Voltage Control",
+        "VoltageStatus",
+    ])
+    def test_voltage_qualified_names_not_voltage(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type != "voltage_rms"
+        assert cl.signal_type is None
+
+    @pytest.mark.parametrize("name", [
+        "Current Status", "Current State", "Current Alarm", "CurrentStatus",
+    ])
+    def test_current_qualified_names_not_current(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type != "current_rms"
+        assert cl.signal_type is None
+
+    @pytest.mark.parametrize("name", ["Frequency Alarm", "Frequency Status"])
+    def test_frequency_qualified_names_not_frequency(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type != "frequency"
+        assert cl.signal_type is None
+
+    @pytest.mark.parametrize("name", ["MW Status", "Active Power Alarm"])
+    def test_active_power_qualified_names_not_active_power(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type != "active_power"
+        assert cl.signal_type is None
+
+    def test_reactive_power_qualified_name_not_reactive_power(self) -> None:
+        cl = classify_csv_column("Reactive Power Status")
+        assert cl.signal_type != "reactive_power"
+        assert cl.signal_type is None
+
+    def test_mwstatus_compact_form_not_active_power(self) -> None:
+        # "MWStatus" has no delimiter and doesn't tokenize into "mw"+"status"
+        # (see test_channel_name_matching.py) -- it is safe by simply never
+        # matching the "mw" token, not via the qualifier check.
+        cl = classify_csv_column("MWStatus")
+        assert cl.signal_type != "active_power"
+
+
+class TestSubstringCollisionsNoLongerClassify:
+    """Words that merely contain a measurement-word fragment as a raw
+    substring (not a real token) must not classify.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "Occurrence", "Example", "Input", "Index", "Interval", "Info",
+        "Variable", "Pump", "Impulse", "InputFile",
+    ])
+    def test_unrelated_words_stay_unclassified(self, name: str) -> None:
+        cl = classify_csv_column(name)
+        assert cl.signal_type is None
+        assert cl.requires_user_confirmation is True
+
+    def test_output_and_outputfile_keep_pre_existing_low_confidence_result(self) -> None:
+        # "output" is a pre-existing _KEYWORD entry (shared with "demand",
+        # "load", "generation" -- see column_classifier.py), deliberately
+        # left at 0.78/requires-confirmation by an earlier approved task,
+        # not a new collision introduced or fixed here. This phase does not
+        # touch that entry or its confidence (out of scope: "Grid Demand"
+        # authority-policy changes, which use the same _KEYWORD entry).
+        # The observable, effective result is still "not an authoritative
+        # classification" -- requires_user_confirmation is True either way.
+        for name in ["Output", "OutputFile"]:
+            cl = classify_csv_column(name)
+            assert cl.requires_user_confirmation is True
+
+
+class TestLearnedRulesOverrideQualifierSuppression:
+    """An operator-confirmed persistent mapping rule must still win, even
+    for a name this task's qualifier suppression would otherwise leave
+    unclassified -- learned-rule precedence is unchanged by this task.
+    """
+
+    def test_confirmed_rule_overrides_suppressed_name(self, tmp_path: Path) -> None:
+        from app.data.intelligence import IntelligenceManager
+        from app.data.intelligence.mapping_rules import save_mapping_rules
+        from app.data.intelligence.models import MappingRule
+
+        rules_path = tmp_path / "rules.yaml"
+        # An operator has explicitly reviewed and confirmed that, for this
+        # particular source, "Voltage Status" really is a voltage reading
+        # (e.g. a status meter that happens to report a scaled voltage
+        # value) -- an unusual case, but the operator's confirmation must
+        # still be honoured over the generic qualifier suppression.
+        rule = MappingRule(
+            match_pattern="voltage status",
+            match_type="exact",
+            signal_type="voltage_rms",
+            unit="kV",
+            display_group="voltage_rms",
+            confidence=0.99,
+            confirmed_by_operator=True,
+        )
+        save_mapping_rules([rule], rules_path)
+
+        mgr = IntelligenceManager(mapping_rules_path=rules_path)
+        cls, audit = mgr.classify_column("Voltage Status")
+
+        assert cls.signal_type == "voltage_rms"
+        assert cls.unit == "kV"
+        assert cls.requires_user_confirmation is False
+        assert audit is not None
+        assert audit.rule_match_pattern == "voltage status"
