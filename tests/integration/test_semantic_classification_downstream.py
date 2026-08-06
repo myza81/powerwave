@@ -14,6 +14,27 @@ unsafe magnitude-only electrical fallbacks and gated provider unit
 assignment on confirmation status -- these tests exist to prove both changes
 were safe from the downstream panel/axis perspective, not to change
 behaviour there.
+
+A later Phase A safety-fix task DID modify app/sessions/event_session.py
+and app/visualization/engineering_display.py, to fix two problems a
+follow-up architecture assessment found:
+
+  1. _infer_panel_for_type's alias table only recognised the Import
+     Wizard's ParameterType vocabulary (mw, mvar, voltage, current), not
+     the shared classifier vocabulary CSV/Excel providers actually set on
+     AnalogChannel.parameter_type (active_power, reactive_power,
+     voltage_rms, current_rms) -- so a confidently-classified direct
+     provider channel's parameter_type was silently ignored by panel
+     routing, which fell through to the unit/name fallback instead.
+  2. The panel name-fallback and infer_signal_type's role inference both
+     used raw substring/prefix matching (e.g. "in" in "Input", "pu" in
+     "Output", name.startswith("i")), which could misroute or mis-role
+     ordinary non-electrical names.
+
+TestPanelTypeAliases, TestPanelNameFallbackHardening, and
+TestNumericalSafetyAfterHardening below cover that fix. See also
+tests/unit/test_engineering_display.py for the infer_signal_type-specific
+coverage.
 """
 from __future__ import annotations
 
@@ -21,8 +42,10 @@ import tempfile
 import warnings
 from pathlib import Path
 
+from app.analytics.scaling.engineering_scaling import compute_scaling_factor
+from app.analytics.scaling.scaling_models import EngineeringScalingMode, GlobalScalingConfig
 from app.providers.csv.csv_provider import CsvProvider
-from app.sessions.event_session import _infer_panel_for_channel
+from app.sessions.event_session import _infer_panel_for_channel, _infer_panel_for_type
 from app.visualization.axis_management import (
     AxisDisplayMode,
     axis_group_for_signal,
@@ -140,3 +163,116 @@ class TestUnconfirmedMagnitudeNoLongerRoutesToElectricalPanel:
         assert ch.unit == "MW"
         panel_id, _ = _infer_panel_for_channel("System Demand", unit=ch.unit, param_type=ch.parameter_type)
         assert panel_id == "power"
+
+
+class TestPanelTypeAliases:
+    """_TYPE_TO_PANEL must recognise both the shared classifier's
+    parameter_type vocabulary (used by direct CSV/Excel providers) and the
+    Import Wizard's ParameterType vocabulary, mapping both to the same panel
+    for the same physical quantity.
+    """
+
+    def test_shared_classifier_vocabulary_resolves_directly(self) -> None:
+        assert _infer_panel_for_type("active_power") == "power"
+        assert _infer_panel_for_type("reactive_power") == "power"
+        assert _infer_panel_for_type("voltage_rms") == "voltage"
+        assert _infer_panel_for_type("current_rms") == "current"
+        assert _infer_panel_for_type("frequency") == "frequency"
+        assert _infer_panel_for_type("rocof") == "frequency"
+
+    def test_wizard_vocabulary_still_resolves(self) -> None:
+        assert _infer_panel_for_type("mw") == "power"
+        assert _infer_panel_for_type("mvar") == "power"
+        assert _infer_panel_for_type("voltage") == "voltage"
+        assert _infer_panel_for_type("current") == "current"
+        assert _infer_panel_for_type("frequency") == "frequency"
+        assert _infer_panel_for_type("rocof") == "frequency"
+
+    def test_both_vocabularies_agree_on_panel_via_type_alone(self) -> None:
+        # unit intentionally omitted so the panel is decided by parameter_type,
+        # not by falling back to the unit or name.
+        for shared_type, wizard_type, expected_panel in [
+            ("active_power", "mw", "power"),
+            ("reactive_power", "mvar", "power"),
+            ("voltage_rms", "voltage", "voltage"),
+            ("current_rms", "current", "current"),
+        ]:
+            shared_panel, _ = _infer_panel_for_channel("Chan", unit=None, param_type=shared_type)
+            wizard_panel, _ = _infer_panel_for_channel("Chan", unit=None, param_type=wizard_type)
+            assert shared_panel == wizard_panel == expected_panel
+
+    def test_direct_provider_channel_routes_via_type_not_name(self) -> None:
+        # "Chan1" carries no name-based electrical evidence at all; only a
+        # confident parameter_type should route it.
+        panel_id, _ = _infer_panel_for_channel("Chan1", unit="unknown", param_type="active_power")
+        assert panel_id == "power"
+        panel_id, _ = _infer_panel_for_channel("Chan2", unit="unknown", param_type="voltage_rms")
+        assert panel_id == "voltage"
+        panel_id, _ = _infer_panel_for_channel("Chan3", unit="unknown", param_type="current_rms")
+        assert panel_id == "current"
+        panel_id, _ = _infer_panel_for_channel("Chan4", unit="unknown", param_type="reactive_power")
+        assert panel_id == "power"
+
+
+class TestPanelNameFallbackHardening:
+    """The last-resort name-keyword fallback (type and unit both absent/
+    unresolved) must use boundary-aware matching, not raw substring
+    containment.
+    """
+
+    def test_short_fragments_do_not_match_inside_unrelated_words(self) -> None:
+        for name in [
+            "Input", "Index", "Interval", "Info", "Variable",
+            "IndexValue", "IntervalCount", "InputFile", "Information",
+        ]:
+            panel_id, _ = _infer_panel_for_channel(name, unit=None, param_type=None)
+            assert panel_id == "other", f"{name!r} should not collide, got {panel_id!r}"
+
+    def test_plain_electrical_words_still_match(self) -> None:
+        assert _infer_panel_for_channel("Voltage", unit=None, param_type=None)[0] == "voltage"
+        assert _infer_panel_for_channel("Bus Voltage", unit=None, param_type=None)[0] == "voltage"
+        assert _infer_panel_for_channel("Phase Current", unit=None, param_type=None)[0] == "current"
+        assert _infer_panel_for_channel("Frequency", unit=None, param_type=None)[0] == "frequency"
+        assert _infer_panel_for_channel("Active Power", unit=None, param_type=None)[0] == "power"
+        assert _infer_panel_for_channel("Reactive Power", unit=None, param_type=None)[0] == "power"
+
+    def test_exact_relay_style_short_tokens_still_match(self) -> None:
+        assert _infer_panel_for_channel("Va", unit=None, param_type=None)[0] == "voltage"
+        assert _infer_panel_for_channel("Ia", unit=None, param_type=None)[0] == "current"
+        assert _infer_panel_for_channel("Vab", unit=None, param_type=None)[0] == "voltage"
+
+    def test_symmetrical_component_relay_names_are_not_supported_by_fallback(self) -> None:
+        # Documented, pre-existing gap (not broadened or newly introduced by
+        # this hardening): the name-keyword fallback never recognised "I0"
+        # (unlike the shared classifier's own _EXACT table, which does).
+        # Confirmed unchanged before and after the boundary-matching fix.
+        panel_id, _ = _infer_panel_for_channel("I0", unit=None, param_type=None)
+        assert panel_id == "other"
+
+    def test_type_and_unit_still_outrank_name_fallback(self) -> None:
+        # A misleading name must not override confident type/unit evidence.
+        panel_id, _ = _infer_panel_for_channel("Interval", unit="MW", param_type="active_power")
+        assert panel_id == "power"
+        panel_id, _ = _infer_panel_for_channel("Output", unit="kV", param_type=None)
+        assert panel_id == "voltage"
+
+
+class TestNumericalSafetyAfterHardening:
+    """Proves the panel/axis hardening actually removes the pathway to an
+    unsafe PER_UNIT/engineering scaling activation for a name that used to
+    collide -- not just that the label/panel looks right.
+    """
+
+    def test_previously_colliding_name_does_not_activate_scaling(self) -> None:
+        cfg = GlobalScalingConfig(voltage_base_kv=275.0, current_base_ka=1.0)
+        for name in ["Output", "Input", "Pump", "Impulse", "Interval", "Index"]:
+            result = compute_scaling_factor(name, None, EngineeringScalingMode.PER_UNIT, cfg)
+            assert result.factor == 1.0
+            assert result.description == "no_scaling"
+
+    def test_named_electrical_channel_still_activates_scaling(self) -> None:
+        # Contrast case: a genuine voltage channel still gets PER_UNIT math.
+        cfg = GlobalScalingConfig(voltage_base_kv=275.0)
+        result = compute_scaling_factor("Va", "kV", EngineeringScalingMode.PER_UNIT, cfg)
+        assert result.configured is True
+        assert result.display_unit == "pu"

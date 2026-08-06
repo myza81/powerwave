@@ -6,6 +6,7 @@ meaning stable during zoom, pan, and value changes.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -42,24 +43,54 @@ _GROUP_TITLES = {
 }
 
 
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(name: str) -> list[str]:
+    """Split a channel name into lowercase alphanumeric tokens.
+
+    Delimiters (space, underscore, hyphen, slash, brackets, punctuation) act
+    as boundaries; a run of characters with no delimiter (e.g. "IndexValue")
+    stays a single token. This is what keeps a short fragment like "pu" or a
+    single-letter relay code like "i" from matching inside an unrelated word
+    such as "Output" or "Index" the way raw substring/prefix containment did.
+    """
+    return _TOKEN_RE.findall(name.lower())
+
+
+def _has_token(tokens: list[str], exact: set[str], prefixes: tuple[str, ...] = ()) -> bool:
+    for tok in tokens:
+        if tok in exact:
+            return True
+        if prefixes and tok.startswith(prefixes):
+            return True
+    return False
+
+
 def infer_signal_type(channel_name: str, unit: str | None = None) -> str | None:
-    """Infer a coarse engineering signal role from name/unit hints."""
-    name = channel_name.strip().lower()
+    """Infer a coarse engineering signal role from name/unit hints.
+
+    Name evidence requires a boundary-safe match (a whole delimited token, or
+    the leading characters of one) rather than a raw substring/prefix check —
+    see _tokenize. Explicit unit evidence is unaffected by this and is always
+    checked alongside the name evidence for each role.
+    """
+    tokens = _tokenize(channel_name)
     unit_norm = (unit or "").strip().lower().replace(" ", "")
 
-    if "rocof" in name or unit_norm in {"hz/s", "hz/sec", "hzpersecond"}:
+    if _has_token(tokens, {"rocof"}) or unit_norm in {"hz/s", "hz/sec", "hzpersecond"}:
         return "rocof"
-    if "freq" in name or name in {"f", "hz"} or unit_norm in {"hz", "khz", "mhz"}:
+    if _has_token(tokens, {"f", "hz"}, ("freq",)) or unit_norm in {"hz", "khz", "mhz"}:
         return "frequency"
-    if "mvar" in name or "q_" in name or unit_norm in {"mvar", "mvarr"}:
+    if _has_token(tokens, {"mvar", "q"}) or unit_norm in {"mvar", "mvarr"}:
         return "reactive_power"
-    if "mw" in name or "demand" in name or "p_" in name or unit_norm in {"mw", "kmw", "mmw"}:
+    if _has_token(tokens, {"mw", "demand", "p"}) or unit_norm in {"mw", "kmw", "mmw"}:
         return "active_power"
-    if "pu" in name or unit_norm in {"pu", "p.u.", "perunit"}:
+    if _has_token(tokens, {"pu"}) or unit_norm in {"pu", "p.u.", "perunit"}:
         return "per_unit"
-    if name.startswith("v") or "volt" in name or unit_norm in {"v", "kv"}:
+    if _has_token(tokens, {"v", "va", "vb", "vc", "vn", "vab", "vbc", "vca"}, ("volt",)) or unit_norm in {"v", "kv"}:
         return "voltage"
-    if name.startswith("i") or "current" in name or unit_norm in {"a", "ka", "amp", "amps"}:
+    if _has_token(tokens, {"i", "ia", "ib", "ic", "in", "current"}, ("amp",)) or unit_norm in {"a", "ka", "amp", "amps"}:
         return "current"
     return None
 

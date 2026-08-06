@@ -8,6 +8,7 @@ Key invariants:
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -35,11 +36,22 @@ _PANEL_FREQUENCY = "frequency"
 _PANEL_DIGITAL = "digital"
 _PANEL_OTHER = "other"
 
-# Channel-name heuristics for default panel assignment (mirrors channel_grouper logic)
-_VOLTAGE_KEYWORDS = {"va", "vb", "vc", "vn", "vab", "vbc", "vca", "voltage", "volt", "kv"}
-_CURRENT_KEYWORDS = {"ia", "ib", "ic", "in", "current", "amp"}
-_POWER_KEYWORDS = {"mw", "mvar", "power", "p_", "q_", "apparent", "active", "reactive"}
-_FREQ_KEYWORDS = {"freq", "hz", "rocof", "df"}
+# Channel-name heuristics for default panel assignment (mirrors channel_grouper logic).
+#
+# Split into exact-token and prefix-root sets so matching is boundary-aware:
+# a candidate must appear as its own delimiter-separated token (see _tokenize)
+# to satisfy an "exact" entry, or as the leading characters of a token to
+# satisfy a "prefix" root. This prevents short/ambiguous fragments (e.g. "in",
+# "va") from matching inside unrelated words (e.g. "Input", "Interval") the
+# way raw substring containment did.
+_VOLTAGE_EXACT_TOKENS = {"va", "vb", "vc", "vn", "vab", "vbc", "vca", "kv"}
+_VOLTAGE_PREFIX_ROOTS = ("volt",)
+_CURRENT_EXACT_TOKENS = {"ia", "ib", "ic", "in", "current"}
+_CURRENT_PREFIX_ROOTS = ("amp",)
+_POWER_EXACT_TOKENS = {"mw", "mvar", "power", "apparent", "active", "reactive", "p", "q"}
+_POWER_PREFIX_ROOTS: tuple[str, ...] = ()
+_FREQ_EXACT_TOKENS = {"hz", "rocof", "df"}
+_FREQ_PREFIX_ROOTS = ("freq",)
 
 # Unit-based heuristics — exact match after lower+strip (more authoritative than name keywords)
 _VOLTAGE_UNITS = {"v", "kv", "mv", "pu", "p.u.", "volt", "volts"}
@@ -47,19 +59,56 @@ _CURRENT_UNITS = {"a", "ka", "ma", "amp", "amps"}
 _POWER_UNITS   = {"w", "kw", "mw", "gw", "var", "kvar", "mvar", "gvar", "va", "kva", "mva"}
 _FREQ_UNITS    = {"hz", "rad/s", "hz/s", "rad/s2", "rad/s²"}
 
-# ParameterType.value → panel_id (most authoritative — explicit user/import classification)
+# ParameterType.value → panel_id (most authoritative — explicit user/import classification).
+# Recognizes both the Import Wizard's ParameterType vocabulary (mw, mvar,
+# voltage, current, frequency, rocof) and the shared classifier vocabulary
+# used by the direct CSV/Excel providers (active_power, reactive_power,
+# voltage_rms, current_rms, frequency, rocof) — the two taxonomies previously
+# only overlapped by coincidence on "frequency"/"rocof", so direct-provider
+# channels fell through to the unit/name fallback even when confidently typed.
 _TYPE_TO_PANEL: dict[str, str] = {
-    "voltage":   _PANEL_VOLTAGE,
-    "current":   _PANEL_CURRENT,
-    "mw":        _PANEL_POWER,
-    "mvar":      _PANEL_POWER,
-    "frequency": _PANEL_FREQUENCY,
-    "rocof":     _PANEL_FREQUENCY,
+    "voltage":        _PANEL_VOLTAGE,
+    "voltage_rms":    _PANEL_VOLTAGE,
+    "current":        _PANEL_CURRENT,
+    "current_rms":    _PANEL_CURRENT,
+    "mw":             _PANEL_POWER,
+    "active_power":   _PANEL_POWER,
+    "mvar":           _PANEL_POWER,
+    "reactive_power": _PANEL_POWER,
+    "frequency":      _PANEL_FREQUENCY,
+    "rocof":          _PANEL_FREQUENCY,
 }
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(name: str) -> list[str]:
+    """Split a channel name into lowercase alphanumeric tokens.
+
+    Delimiters (space, underscore, hyphen, slash, brackets, punctuation) all
+    act as boundaries, so "P_Total", "P Total", and "P-Total" tokenize
+    identically. Tokens with no delimiter between them (e.g. "IndexValue")
+    remain a single token — this is what keeps a short fragment like "va"
+    from matching inside "IndexValue" or "Interval".
+    """
+    return _TOKEN_RE.findall(name.lower())
+
+
+def _matches_keywords(
+    tokens: list[str],
+    exact: set[str],
+    prefixes: tuple[str, ...] = (),
+) -> bool:
+    for tok in tokens:
+        if tok in exact:
+            return True
+        if prefixes and tok.startswith(prefixes):
+            return True
+    return False
 
 
 def _infer_panel_for_type(param_type: str | None) -> str | None:
-    """Return panel_id from ParameterType string value, or None if not mapped."""
+    """Return panel_id from a parameter-type string, or None if not mapped."""
     if not param_type:
         return None
     return _TYPE_TO_PANEL.get(param_type.lower())
@@ -93,19 +142,15 @@ def _infer_panel_for_channel(
     pid = _infer_panel_for_unit(unit)
     if pid is not None:
         return pid, "analog"
-    lower = channel_name.lower()
-    for kw in _VOLTAGE_KEYWORDS:
-        if kw in lower:
-            return _PANEL_VOLTAGE, "analog"
-    for kw in _CURRENT_KEYWORDS:
-        if kw in lower:
-            return _PANEL_CURRENT, "analog"
-    for kw in _POWER_KEYWORDS:
-        if kw in lower:
-            return _PANEL_POWER, "analog"
-    for kw in _FREQ_KEYWORDS:
-        if kw in lower:
-            return _PANEL_FREQUENCY, "analog"
+    tokens = _tokenize(channel_name)
+    if _matches_keywords(tokens, _VOLTAGE_EXACT_TOKENS, _VOLTAGE_PREFIX_ROOTS):
+        return _PANEL_VOLTAGE, "analog"
+    if _matches_keywords(tokens, _CURRENT_EXACT_TOKENS, _CURRENT_PREFIX_ROOTS):
+        return _PANEL_CURRENT, "analog"
+    if _matches_keywords(tokens, _POWER_EXACT_TOKENS, _POWER_PREFIX_ROOTS):
+        return _PANEL_POWER, "analog"
+    if _matches_keywords(tokens, _FREQ_EXACT_TOKENS, _FREQ_PREFIX_ROOTS):
+        return _PANEL_FREQUENCY, "analog"
     return _PANEL_OTHER, "analog"
 
 
