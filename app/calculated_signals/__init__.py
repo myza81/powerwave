@@ -17,6 +17,13 @@ Neither phase has any dependency on EventAnalysisSession, providers, the
 UI, Session Canvas, or persistence -- those integrations belong to later
 phases. Neither phase accepts or processes digital channels in any form.
 
+Phase 2C-3 adds CalculatedSignalResolutionService, the external service that
+resolves a calculated signal's dependencies against a live
+EventAnalysisSession (never through the display-oriented
+build_aligned_data(), which clips and decimates) and invokes
+calculate_signal() to (re)compute it. EventAnalysisSession itself never
+calls calculate_signal(); this service is the only bridge between the two.
+
 Public API:
   ChannelRef                  -- (source_id, channel_name) reference to one analog channel
   CalculatedSignalDefinition  -- immutable "what the user asked for"
@@ -46,6 +53,11 @@ Public API:
 
   CalculatedSignalEngineError, InputValidationError, AlignmentError,
   UnitCompatibilityError, CalculationError
+
+  CalculatedSignalResolutionService  -- resolves a session's calculated signals and recalculates them
+  ResolutionBatchResult              -- successful results + failures from a batch resolve
+  ResolutionFailure                  -- one calc_id's resolution/calculation failure
+  CalculatedSignalResolutionError    -- raised by the resolution service on an unresolvable/failed signal
 """
 from app.calculated_signals.models import (
     CalculatedSignalDefinition,
@@ -84,6 +96,12 @@ from app.calculated_signals.engine import (
     UnitCompatibilityError,
     calculate_signal,
 )
+from app.calculated_signals.resolver import (
+    CalculatedSignalResolutionError,
+    CalculatedSignalResolutionService,
+    ResolutionBatchResult,
+    ResolutionFailure,
+)
 
 __all__ = [
     "ChannelRef",
@@ -115,4 +133,8 @@ __all__ = [
     "AlignmentError",
     "UnitCompatibilityError",
     "CalculationError",
+    "CalculatedSignalResolutionService",
+    "ResolutionBatchResult",
+    "ResolutionFailure",
+    "CalculatedSignalResolutionError",
 ]
