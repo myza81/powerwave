@@ -6,12 +6,18 @@ DisturbanceRecord objects are held by reference; waveform_data is never mutated.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 if TYPE_CHECKING:
     from app.models.disturbance_record import DisturbanceRecord
+    from app.calculated_signals.models import (
+        CalculatedSignalDefinition,
+        CalculatedSignalResult,
+        ChannelRef,
+    )
 
 # ---------------------------------------------------------------------------
 # Alignment method vocabulary
@@ -128,3 +134,82 @@ class SourceQualityMetrics:
     interpolated_pct: float         # % of output samples that were interpolated
     resampling_ratio: float         # output_rate / input_rate
     time_is_uniform: bool           # mirrors AlignedChannelData.time_is_uniform
+
+
+# ---------------------------------------------------------------------------
+# Calculated Signals — session ownership (Phase 2C-1)
+# ---------------------------------------------------------------------------
+#
+# These models describe session-level lifecycle/dependency state only. The
+# durable definition and the numeric result themselves are Phase 2A/2B
+# models (app.calculated_signals.models.CalculatedSignalDefinition /
+# CalculatedSignalResult) and are held here by reference, never duplicated
+# or re-implemented.
+
+
+class ChannelEligibility(str, Enum):
+    """Why a ChannelRef is, or is not, usable as a Calculated Signals input.
+
+    VALID is the only eligible outcome. Every other value names a specific,
+    distinguishable reason a future UI or Phase 2C-2 recalculation step can
+    surface directly to the user, per the Phase 1 architecture assessment's
+    finding that analog/digital list membership -- not parameter_type, unit,
+    dtype, or channel name -- is the primary type contract for a
+    DisturbanceRecord's channels.
+    """
+
+    VALID = "valid"
+    MISSING_SOURCE = "missing_source"
+    INACTIVE_SOURCE = "inactive_source"
+    MISSING_CHANNEL = "missing_channel"           # not declared analog or digital at all
+    DIGITAL_CHANNEL = "digital_channel"            # declared digital (or both analog and digital)
+    DATA_COLUMN_MISSING = "data_column_missing"    # declared analog, but waveform_data lacks the column
+    NON_NUMERIC_CHANNEL = "non_numeric_channel"    # column present but not a numeric dtype
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelEligibilityResult:
+    """The result of checking one ChannelRef against the live session."""
+
+    ref: "ChannelRef"
+    eligibility: ChannelEligibility
+
+    @property
+    def is_valid(self) -> bool:
+        return self.eligibility == ChannelEligibility.VALID
+
+
+@dataclass(slots=True)
+class DependencyStatus:
+    """A calculated signal's current dependency resolvability, computed on
+    demand by EventAnalysisSession.get_dependency_status() -- never cached,
+    so it always reflects the session's current state (active/inactive
+    sources, source removal, etc.), not the state at creation or last edit.
+    """
+
+    is_resolvable: bool
+    missing_sources: tuple[str, ...] = ()
+    inactive_sources: tuple[str, ...] = ()
+    missing_channels: tuple["ChannelRef", ...] = ()
+    digital_channels: tuple["ChannelRef", ...] = ()
+
+
+@dataclass(slots=True)
+class CalculatedSignalEntry:
+    """Session-lifecycle state for one calculated signal.
+
+    Wraps, without duplicating, the Phase 2A/2B models: `definition` is the
+    durable, immutable CalculatedSignalDefinition; `result` is the latest
+    CalculatedSignalResult, or None when the signal has never been
+    calculated yet (a legitimate, honest state -- see
+    EventAnalysisSession.add_calculated_signal). Dependency state is
+    deliberately NOT stored on this entry (it would be a second, cache-able
+    source of truth that could silently go stale relative to the session's
+    actual current state, e.g. a source becoming inactive) -- see
+    DependencyStatus and EventAnalysisSession.get_dependency_status(),
+    which are always computed fresh from the session's live source/channel
+    state.
+    """
+
+    definition: "CalculatedSignalDefinition"
+    result: "CalculatedSignalResult | None" = None

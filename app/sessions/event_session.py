@@ -11,19 +11,30 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
+import pandas as pd
 
 from app.sessions.session_models import (
     ALIGNMENT_METHODS,
     AlignedChannelData,
+    CalculatedSignalEntry,
+    ChannelEligibility,
+    ChannelEligibilityResult,
+    DependencyStatus,
     PanelConfig,
     SessionChannel,
     SessionSource,
     SourceQualityMetrics,
 )
 from app.sessions import alignment_engine
+from app.calculated_signals.models import (
+    CalculatedSignalDefinition,
+    CalculatedSignalResult,
+    CalculationStatus,
+    ChannelRef,
+)
 
 if TYPE_CHECKING:
     from app.models.disturbance_record import DisturbanceRecord
@@ -187,6 +198,15 @@ class EventAnalysisSession:
         self._quality_cache: dict[str, SourceQualityMetrics] = {}
         # Phase 9C: human-readable alignment notes from the last auto-align result
         self._alignment_notes: dict[str, str] = {}        # source_id → notes
+
+        # Calculated Signals (Phase 2C-1): session-owned definitions/results,
+        # plus forward and reverse dependency indexes derived from each
+        # definition's variable_bindings (never a second, competing source
+        # of truth -- see CalculatedSignalEntry's docstring).
+        self._calc_signals: dict[str, CalculatedSignalEntry] = {}
+        self._calc_dependencies: dict[str, frozenset[ChannelRef]] = {}
+        self._calc_dependents_by_source: dict[str, set[str]] = {}
+        self._calc_dependents_by_channel: dict[ChannelRef, set[str]] = {}
 
     # -------------------------------------------------------------------------
     # Source management
@@ -729,3 +749,353 @@ class EventAnalysisSession:
             unit=unit,
             time_is_uniform=is_uniform,
         )
+
+    # -------------------------------------------------------------------------
+    # Calculated Signals — analog-input eligibility (Phase 2C-1)
+    # -------------------------------------------------------------------------
+    #
+    # This is the ONLY place Calculated Signals eligibility is decided. It
+    # never resolves waveform arrays (that is Phase 2C-2's job, producing
+    # ResolvedAnalogInput) -- it only answers "can this ChannelRef be used
+    # as a Calculated Signals input right now", using analog/digital LIST
+    # MEMBERSHIP as the primary type contract (not parameter_type, not
+    # unit, not DataFrame dtype, not channel name), matching the Phase 1
+    # architecture assessment's finding.
+
+    def check_calculated_input_eligibility(self, ref: ChannelRef) -> ChannelEligibilityResult:
+        """Return whether *ref* is currently usable as a Calculated Signals
+        input, and if not, exactly why.
+
+        A channel declared in BOTH analog_channels and digital_channels
+        (an inconsistent record) is treated as DIGITAL_CHANNEL, not VALID
+        -- the digital check is deliberately evaluated first, so an
+        analog/digital name collision can never be silently accepted as an
+        analog input.
+        """
+        source = self._sources.get(ref.source_id)
+        if source is None:
+            return ChannelEligibilityResult(ref, ChannelEligibility.MISSING_SOURCE)
+        if not source.is_active:
+            return ChannelEligibilityResult(ref, ChannelEligibility.INACTIVE_SOURCE)
+
+        record = source.record
+        is_digital = any(ch.name == ref.channel_name for ch in record.digital_channels)
+        if is_digital:
+            return ChannelEligibilityResult(ref, ChannelEligibility.DIGITAL_CHANNEL)
+
+        is_analog = any(ch.name == ref.channel_name for ch in record.analog_channels)
+        if not is_analog:
+            return ChannelEligibilityResult(ref, ChannelEligibility.MISSING_CHANNEL)
+
+        column = record.waveform_data.get(ref.channel_name)
+        if column is None:
+            return ChannelEligibilityResult(ref, ChannelEligibility.DATA_COLUMN_MISSING)
+        if not pd.api.types.is_numeric_dtype(column):
+            return ChannelEligibilityResult(ref, ChannelEligibility.NON_NUMERIC_CHANNEL)
+
+        return ChannelEligibilityResult(ref, ChannelEligibility.VALID)
+
+    def is_valid_calculated_input(self, ref: ChannelRef) -> bool:
+        """Convenience wrapper around check_calculated_input_eligibility()."""
+        return self.check_calculated_input_eligibility(ref).is_valid
+
+    def get_dependency_status(self, calc_id: str) -> DependencyStatus:
+        """Return the current, freshly-computed resolvability of every
+        dependency of *calc_id* -- never cached, so a source becoming
+        inactive or being removed is reflected immediately on the next call.
+
+        Returns an all-True/empty DependencyStatus for an unknown calc_id
+        (no dependencies to report), matching this module's existing
+        "unknown id → empty/no-op" convention (see get_time_offset).
+        """
+        deps = self.get_calculated_dependencies(calc_id)
+        missing_sources: list[str] = []
+        inactive_sources: list[str] = []
+        missing_channels: list[ChannelRef] = []
+        digital_channels: list[ChannelRef] = []
+
+        for ref in deps:
+            result = self.check_calculated_input_eligibility(ref)
+            if result.eligibility == ChannelEligibility.MISSING_SOURCE:
+                missing_sources.append(ref.source_id)
+            elif result.eligibility == ChannelEligibility.INACTIVE_SOURCE:
+                inactive_sources.append(ref.source_id)
+            elif result.eligibility == ChannelEligibility.DIGITAL_CHANNEL:
+                digital_channels.append(ref)
+            elif result.eligibility in (
+                ChannelEligibility.MISSING_CHANNEL,
+                ChannelEligibility.DATA_COLUMN_MISSING,
+                ChannelEligibility.NON_NUMERIC_CHANNEL,
+            ):
+                missing_channels.append(ref)
+
+        is_resolvable = not (missing_sources or inactive_sources or missing_channels or digital_channels)
+        return DependencyStatus(
+            is_resolvable=is_resolvable,
+            missing_sources=tuple(dict.fromkeys(missing_sources)),
+            inactive_sources=tuple(dict.fromkeys(inactive_sources)),
+            missing_channels=tuple(missing_channels),
+            digital_channels=tuple(digital_channels),
+        )
+
+    def _validate_calculated_dependencies(self, deps: Iterable[ChannelRef]) -> None:
+        """Raise ValueError on the first invalid dependency found.
+
+        Checked separately and first: a ChannelRef whose source_id names a
+        calculated signal (not a real SessionSource) always fails with a
+        specific message -- Calculated Signals V1 does not support
+        calculated-signal-to-calculated-signal dependencies, and this is a
+        clearer diagnostic than letting it fall through to the generic
+        MISSING_SOURCE case (which would also technically reject it, since
+        calculated signals are never stored in self._sources).
+        """
+        for ref in deps:
+            if ref.source_id in self._calc_signals:
+                raise ValueError(
+                    f"calculated signal dependency {ref!r} refers to another "
+                    "calculated signal; Calculated Signals V1 does not support "
+                    "calculated-signal-to-calculated-signal dependencies"
+                )
+            result = self.check_calculated_input_eligibility(ref)
+            if not result.is_valid:
+                raise ValueError(
+                    f"calculated signal dependency {ref!r} is not a valid "
+                    f"analog input: {result.eligibility.value}"
+                )
+
+    def _register_calculated_dependencies(self, calc_id: str, deps: frozenset[ChannelRef]) -> None:
+        self._calc_dependencies[calc_id] = deps
+        for ref in deps:
+            self._calc_dependents_by_source.setdefault(ref.source_id, set()).add(calc_id)
+            self._calc_dependents_by_channel.setdefault(ref, set()).add(calc_id)
+
+    def _unregister_calculated_dependencies(self, calc_id: str, deps: Iterable[ChannelRef]) -> None:
+        for ref in deps:
+            by_source = self._calc_dependents_by_source.get(ref.source_id)
+            if by_source is not None:
+                by_source.discard(calc_id)
+                if not by_source:
+                    del self._calc_dependents_by_source[ref.source_id]
+            by_channel = self._calc_dependents_by_channel.get(ref)
+            if by_channel is not None:
+                by_channel.discard(calc_id)
+                if not by_channel:
+                    del self._calc_dependents_by_channel[ref]
+
+    # -------------------------------------------------------------------------
+    # Calculated Signals — CRUD (Phase 2C-1)
+    # -------------------------------------------------------------------------
+    #
+    # No UI, no Session Canvas rendering, no persistence, no automatic or
+    # lazy recalculation, and no calculated-signal-to-calculated-signal
+    # dependencies exist anywhere in this section — all of that is deferred
+    # to later phases. A calculated signal here is purely session-owned
+    # lifecycle state: it is never a SessionSource and never touches (or is
+    # merged into) any DisturbanceRecord.
+
+    # Fields whose change makes an existing result numerically stale --
+    # name/output metadata that doesn't affect the computation itself
+    # (currently just `name`) is deliberately excluded.
+    _MEANINGFUL_DEFINITION_FIELDS = (
+        "expression", "variable_bindings", "reference_variable",
+        "output_unit", "interpolation",
+    )
+
+    def add_calculated_signal(
+        self,
+        definition: CalculatedSignalDefinition,
+        result: CalculatedSignalResult | None = None,
+    ) -> str:
+        """Register a new calculated signal, owned by this session.
+
+        Validates every dependency (existence, active source, analog-only)
+        before committing anything -- on any validation failure, session
+        state (including the dependency indexes) is left completely
+        unchanged; nothing is registered.
+
+        The definition supplies its own calc_id (Phase 2A's contract: a
+        CalculatedSignalDefinition always already has one) -- this method
+        never generates one, unlike add_source()'s source_id.
+        """
+        calc_id = definition.calc_id
+        if calc_id in self._calc_signals:
+            raise ValueError(f"calc_id {calc_id!r} already exists in this session")
+        if any(entry.definition.name == definition.name for entry in self._calc_signals.values()):
+            raise ValueError(
+                f"a calculated signal named {definition.name!r} already exists in this session"
+            )
+        if result is not None and result.calc_id != calc_id:
+            raise ValueError(
+                f"result.calc_id {result.calc_id!r} does not match definition.calc_id {calc_id!r}"
+            )
+
+        deps = frozenset(definition.variable_bindings.values())
+        self._validate_calculated_dependencies(deps)
+
+        # All validation passed -- commit atomically.
+        self._calc_signals[calc_id] = CalculatedSignalEntry(definition=definition, result=result)
+        self._register_calculated_dependencies(calc_id, deps)
+        return calc_id
+
+    def get_calculated_signal(self, calc_id: str) -> CalculatedSignalEntry | None:
+        return self._calc_signals.get(calc_id)
+
+    def list_calculated_signals(self) -> list[CalculatedSignalEntry]:
+        return list(self._calc_signals.values())
+
+    def get_calculated_signal_definition(self, calc_id: str) -> CalculatedSignalDefinition | None:
+        entry = self._calc_signals.get(calc_id)
+        return entry.definition if entry is not None else None
+
+    def get_calculated_signal_result(self, calc_id: str) -> CalculatedSignalResult | None:
+        entry = self._calc_signals.get(calc_id)
+        return entry.result if entry is not None else None
+
+    def update_calculated_signal_definition(
+        self,
+        calc_id: str,
+        new_definition: CalculatedSignalDefinition,
+    ) -> None:
+        """Replace calc_id's definition, validating first.
+
+        calc_id itself cannot change (new_definition.calc_id must match).
+        The new name must remain unique among calculated signals. New
+        dependencies are validated exactly as in add_calculated_signal().
+        On any failure, the existing definition/result/dependency indexes
+        are left completely unchanged.
+
+        If the change is "meaningful" (expression, variable_bindings,
+        reference_variable, output_unit, or interpolation differs from the
+        current definition) and a result currently exists, that result is
+        marked STALE (its arrays are preserved, not discarded or
+        recomputed) -- see _MEANINGFUL_DEFINITION_FIELDS and
+        mark_calculated_signal_stale(). A name-only edit never staled an
+        existing result.
+        """
+        old_entry = self._calc_signals.get(calc_id)
+        if old_entry is None:
+            raise KeyError(f"Unknown calculated signal calc_id: {calc_id!r}")
+        if new_definition.calc_id != calc_id:
+            raise ValueError(
+                f"new_definition.calc_id {new_definition.calc_id!r} does not match "
+                f"the calc_id being updated {calc_id!r}; calc_id cannot change"
+            )
+
+        old_definition = old_entry.definition
+        for other_id, entry in self._calc_signals.items():
+            if other_id != calc_id and entry.definition.name == new_definition.name:
+                raise ValueError(
+                    f"a calculated signal named {new_definition.name!r} already exists in this session"
+                )
+
+        new_deps = frozenset(new_definition.variable_bindings.values())
+        self._validate_calculated_dependencies(new_deps)
+
+        # All validation passed -- commit atomically.
+        meaningfully_changed = any(
+            getattr(old_definition, field_name) != getattr(new_definition, field_name)
+            for field_name in self._MEANINGFUL_DEFINITION_FIELDS
+        )
+        new_result = old_entry.result
+        if meaningfully_changed and new_result is not None:
+            new_result = self._stale_copy(new_result, reason="Definition changed")
+
+        old_deps = self._calc_dependencies.get(calc_id, frozenset())
+        self._unregister_calculated_dependencies(calc_id, old_deps)
+        self._register_calculated_dependencies(calc_id, new_deps)
+        self._calc_signals[calc_id] = CalculatedSignalEntry(definition=new_definition, result=new_result)
+
+    def set_calculated_signal_result(self, calc_id: str, result: CalculatedSignalResult) -> None:
+        """Store a freshly computed result for calc_id (Phase 2C-2's entry
+        point). No dependency changes, no UI action, no recalculation --
+        purely replaces the stored result.
+        """
+        entry = self._calc_signals.get(calc_id)
+        if entry is None:
+            raise KeyError(f"Unknown calculated signal calc_id: {calc_id!r}")
+        if result.calc_id != calc_id:
+            raise ValueError(f"result.calc_id {result.calc_id!r} does not match {calc_id!r}")
+        entry.result = result
+
+    def mark_calculated_signal_stale(self, calc_id: str, reason: str | None = None) -> None:
+        """Mark calc_id's latest result STALE without discarding its arrays.
+
+        A no-op when calc_id has no result yet (result=None already
+        honestly represents "not yet calculated" -- there is nothing to
+        mark stale, and no placeholder result is fabricated). Raises for an
+        unknown calc_id, matching set_calculated_signal_result().
+        """
+        entry = self._calc_signals.get(calc_id)
+        if entry is None:
+            raise KeyError(f"Unknown calculated signal calc_id: {calc_id!r}")
+        if entry.result is None:
+            return
+        entry.result = self._stale_copy(entry.result, reason)
+
+    def _stale_copy(
+        self, result: CalculatedSignalResult, reason: str | None
+    ) -> CalculatedSignalResult:
+        """Return a new CalculatedSignalResult with status=STALE, reusing
+        (not copying-before-passing) the existing time/values/validity_mask
+        arrays -- CalculatedSignalResult's own constructor already performs
+        exactly one defensive copy of each array, so passing them directly
+        here avoids a redundant second copy.
+
+        error_message is intentionally not carried over: STALE means "these
+        arrays are still meaningful but may no longer reflect current
+        inputs", which is a different claim from ERROR's "the last
+        calculation attempt failed" -- carrying a leftover error_message
+        into a STALE result would conflate the two.
+        """
+        warnings = list(result.warnings)
+        if reason:
+            warnings.append(f"Marked stale: {reason}")
+        return CalculatedSignalResult(
+            calc_id=result.calc_id,
+            time=result.time,
+            values=result.values,
+            validity_mask=result.validity_mask,
+            unit=result.unit,
+            status=CalculationStatus.STALE,
+            error_message=None,
+            computed_at=result.computed_at,
+            warnings=warnings,
+        )
+
+    def remove_calculated_signal(self, calc_id: str) -> None:
+        """Remove calc_id's definition/result and all dependency-index
+        references. A no-op for an unknown calc_id, matching
+        remove_source()'s style. Never touches any SessionSource/
+        DisturbanceRecord.
+        """
+        if calc_id not in self._calc_signals:
+            return
+        deps = self._calc_dependencies.pop(calc_id, frozenset())
+        self._unregister_calculated_dependencies(calc_id, deps)
+        del self._calc_signals[calc_id]
+
+    # -------------------------------------------------------------------------
+    # Calculated Signals — dependency queries (Phase 2C-1)
+    # -------------------------------------------------------------------------
+
+    def get_calculated_dependencies(self, calc_id: str) -> tuple[ChannelRef, ...]:
+        """Return calc_id's dependencies in deterministic (source_id,
+        channel_name) order. Empty tuple for an unknown calc_id.
+        """
+        deps = self._calc_dependencies.get(calc_id)
+        if not deps:
+            return ()
+        return tuple(sorted(deps, key=lambda r: (r.source_id, r.channel_name)))
+
+    def get_calculated_dependents_for_source(self, source_id: str) -> tuple[str, ...]:
+        """Return, in sorted order, the calc_ids of every calculated signal
+        that depends on any channel of *source_id* -- e.g. to discover the
+        impact of removing or deactivating that source.
+        """
+        return tuple(sorted(self._calc_dependents_by_source.get(source_id, ())))
+
+    def get_calculated_dependents_for_channel(self, ref: ChannelRef) -> tuple[str, ...]:
+        """Return, in sorted order, the calc_ids of every calculated signal
+        that depends on this exact (source_id, channel_name).
+        """
+        return tuple(sorted(self._calc_dependents_by_channel.get(ref, ())))
