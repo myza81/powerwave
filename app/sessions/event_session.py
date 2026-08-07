@@ -238,9 +238,21 @@ class EventAnalysisSession:
         return source_id
 
     def remove_source(self, source_id: str) -> None:
-        """Remove a source and all its channels from the session."""
+        """Remove a source and all its channels from the session.
+
+        Calculated Signals (Phase 2C-2): any calculated signal depending on
+        this source has its latest result marked stale BEFORE the source is
+        removed -- its definition, dependency metadata, and (now-stale)
+        result all remain; nothing calculated-signal-related is deleted
+        here. get_calculated_dependents_for_source(source_id) continues to
+        answer "what depended on this source" afterward (Phase 2C-1's
+        existing discoverability-over-deletion design for the reverse
+        index), and get_dependency_status() will report MISSING_SOURCE for
+        those signals from this point on.
+        """
         if source_id not in self._sources:
             return
+        self._mark_calculated_dependents_stale_for_source(source_id, reason="Source removed.")
         del self._sources[source_id]
         self._quality_cache.pop(source_id, None)
         self._alignment_notes.pop(source_id, None)
@@ -261,9 +273,25 @@ class EventAnalysisSession:
         return list(self._sources.values())
 
     def set_source_active(self, source_id: str, active: bool) -> None:
+        """Set a source's active/inactive state.
+
+        Calculated Signals (Phase 2C-2): any dependent calculated signal's
+        latest result is marked stale on EITHER transition direction
+        (active→inactive or inactive→active) -- reactivating a source does
+        not make a previously-computed result fresh again, because that
+        result was computed under an earlier source state; only an actual
+        recalculation (a later phase) can restore OK. No-op (no
+        invalidation) when the active state does not actually change.
+        """
         source = self._sources.get(source_id)
-        if source is not None:
-            source.is_active = active
+        if source is None:
+            return
+        old_active = source.is_active
+        source.is_active = active
+        if old_active == active:
+            return
+        reason = "Source reactivated." if active else "Source deactivated."
+        self._mark_calculated_dependents_stale_for_source(source_id, reason=reason)
 
     # -------------------------------------------------------------------------
     # Time alignment
@@ -280,26 +308,68 @@ class EventAnalysisSession:
 
         method must be one of ALIGNMENT_METHODS.
         confidence is [0.0, 1.0] for auto methods; None for manual/imported.
+
+        Calculated Signals (Phase 2C-2): this is the single canonical
+        mutator for both the offset and the alignment method (there is no
+        separate method-only setter), so both are compared against their
+        prior values and any dependent calculated signal is marked stale
+        AT MOST ONCE per call, with a reason reflecting whichever changed
+        (or both). No invalidation when neither the offset nor the method
+        actually changes (exact float comparison -- no tolerance is
+        introduced here, since none exists elsewhere in this module for
+        offset comparisons). confidence is purely informational/display
+        metadata and is not itself compared for staleness.
         """
         if method not in ALIGNMENT_METHODS:
             raise ValueError(f"Unknown alignment_method {method!r}. "
                              f"Must be one of {sorted(ALIGNMENT_METHODS)}")
         source = self._sources.get(source_id)
-        if source is not None:
-            source.time_offset_s = float(offset_s)
-            source.alignment_method = method
-            source.alignment_confidence = confidence
+        if source is None:
+            return
+        old_offset = source.time_offset_s
+        old_method = source.alignment_method
+        source.time_offset_s = float(offset_s)
+        source.alignment_method = method
+        source.alignment_confidence = confidence
+
+        offset_changed = old_offset != source.time_offset_s
+        method_changed = old_method != method
+        if offset_changed or method_changed:
+            reason = self._offset_or_method_change_reason(offset_changed, method_changed)
+            self._mark_calculated_dependents_stale_for_source(source_id, reason=reason)
 
     def get_time_offset(self, source_id: str) -> float:
         source = self._sources.get(source_id)
         return source.time_offset_s if source is not None else 0.0
 
+    @staticmethod
+    def _offset_or_method_change_reason(offset_changed: bool, method_changed: bool) -> str:
+        if offset_changed and method_changed:
+            return "Source alignment offset and method changed."
+        if offset_changed:
+            return "Source alignment offset changed."
+        return "Source alignment method changed."
+
     def reset_all_offsets(self) -> None:
-        """Reset all source offsets to 0.0 and clear alignment metadata."""
+        """Reset all source offsets to 0.0 and clear alignment metadata.
+
+        Calculated Signals (Phase 2C-2): for each source whose effective
+        offset or method actually changes as a result of the reset,
+        dependent calculated signals are marked stale exactly as
+        set_time_offset() would -- this method changes the same fields via
+        a different call path, so it must trigger the same invalidation.
+        """
         for source in self._sources.values():
+            old_offset = source.time_offset_s
+            old_method = source.alignment_method
             source.time_offset_s = 0.0
             source.alignment_method = "none"
             source.alignment_confidence = None
+            offset_changed = old_offset != 0.0
+            method_changed = old_method != "none"
+            if offset_changed or method_changed:
+                reason = self._offset_or_method_change_reason(offset_changed, method_changed)
+                self._mark_calculated_dependents_stale_for_source(source.source_id, reason=reason)
         self._alignment_notes.clear()
 
     def set_alignment_notes(self, source_id: str, notes: str) -> None:
@@ -1020,15 +1090,32 @@ class EventAnalysisSession:
     def mark_calculated_signal_stale(self, calc_id: str, reason: str | None = None) -> None:
         """Mark calc_id's latest result STALE without discarding its arrays.
 
-        A no-op when calc_id has no result yet (result=None already
-        honestly represents "not yet calculated" -- there is nothing to
-        mark stale, and no placeholder result is fabricated). Raises for an
-        unknown calc_id, matching set_calculated_signal_result().
+        State transitions (Phase 2C-2 correction -- see below):
+          OK    -> STALE
+          STALE -> STALE (reason appended if not already present; see _stale_copy)
+          ERROR -> ERROR, unchanged (a no-op; see note)
+          None  -> None  (a no-op; "not yet calculated" is already honest)
+
+        Raises for an unknown calc_id, matching set_calculated_signal_result().
+
+        Behaviour correction from the initial Phase 2C-1 implementation:
+        that version unconditionally converted ANY existing result
+        (including ERROR) to STALE. This method now leaves an ERROR result
+        untouched instead -- an error result is not a valid numerical
+        result whose "freshness" can meaningfully become stale; it already
+        communicates "the last calculation attempt failed", which is a
+        strictly more specific and more useful fact than "outdated". This
+        correction is covered by dedicated tests (test_calculated_signal_
+        session.py's TestLifecycleInvalidation.test_error_result_stays_
+        error_under_source_mutation and the direct mark_calculated_signal_
+        stale ERROR test) rather than changed silently.
         """
         entry = self._calc_signals.get(calc_id)
         if entry is None:
             raise KeyError(f"Unknown calculated signal calc_id: {calc_id!r}")
         if entry.result is None:
+            return
+        if entry.result.status == CalculationStatus.ERROR:
             return
         entry.result = self._stale_copy(entry.result, reason)
 
@@ -1046,10 +1133,20 @@ class EventAnalysisSession:
         inputs", which is a different claim from ERROR's "the last
         calculation attempt failed" -- carrying a leftover error_message
         into a STALE result would conflate the two.
+
+        Warning deduplication (Phase 2C-2): the exact reason string is
+        appended only if it is not already the last-known occurrence in
+        `warnings` -- this keeps e.g. 20 identical repeated offset-drag
+        events from appending 20 copies of "Marked stale: Source alignment
+        offset changed." while still allowing genuinely different reasons
+        (e.g. a later "Source removed.") to coexist. Pre-existing numerical
+        warnings from the calculation engine are never touched or removed.
         """
         warnings = list(result.warnings)
         if reason:
-            warnings.append(f"Marked stale: {reason}")
+            entry_text = f"Marked stale: {reason}"
+            if entry_text not in warnings:
+                warnings.append(entry_text)
         return CalculatedSignalResult(
             calc_id=result.calc_id,
             time=result.time,
@@ -1099,3 +1196,51 @@ class EventAnalysisSession:
         that depends on this exact (source_id, channel_name).
         """
         return tuple(sorted(self._calc_dependents_by_channel.get(ref, ())))
+
+    def get_stale_calculated_signal_ids(self) -> tuple[str, ...]:
+        """Return, in deterministic (insertion) order, the calc_ids whose
+        latest result currently has status=STALE.
+
+        Convenience for a future recalculation controller so it does not
+        need to iterate list_calculated_signals() and inspect
+        entry.result.status itself. Deliberately narrow: result=None
+        ("never calculated") is a distinct state from STALE and is not
+        included here -- a controller that also wants to compute
+        never-calculated signals should query list_calculated_signals()
+        directly.
+        """
+        return tuple(
+            calc_id for calc_id, entry in self._calc_signals.items()
+            if entry.result is not None and entry.result.status == CalculationStatus.STALE
+        )
+
+    # -------------------------------------------------------------------------
+    # Calculated Signals — lifecycle invalidation (Phase 2C-2)
+    # -------------------------------------------------------------------------
+    #
+    # EventAnalysisSession's responsibility ends at "know that a result is
+    # no longer fresh" -- it never recomputes. Nothing in this section (or
+    # anywhere in this file) calls calculate_signal(), resolves a ChannelRef
+    # into a ResolvedAnalogInput, or touches waveform arrays; the numerical
+    # engine remains fully independent, to be invoked by a separate
+    # controller/service in a later phase.
+
+    def _mark_calculated_dependents_stale_for_source(
+        self,
+        source_id: str,
+        *,
+        reason: str,
+    ) -> tuple[str, ...]:
+        """Mark every calculated signal that depends on any channel of
+        *source_id* STALE, and return the affected calc_ids (deterministic
+        order, from get_calculated_dependents_for_source).
+
+        Reuses the existing reverse-dependency index and
+        mark_calculated_signal_stale()'s own status-transition/dedup rules
+        verbatim -- this helper does not construct or duplicate a
+        CalculatedSignalResult itself, and performs no recalculation.
+        """
+        affected = self.get_calculated_dependents_for_source(source_id)
+        for calc_id in affected:
+            self.mark_calculated_signal_stale(calc_id, reason=reason)
+        return affected

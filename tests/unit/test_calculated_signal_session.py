@@ -711,12 +711,467 @@ class TestExistingSessionRegression:
         assert len(sess.list_panels()) >= 1
 
     def test_remove_source_does_not_touch_calculated_signals_dicts_shape(self) -> None:
-        # Phase 2C-1 deliberately does not wire calculated-signal cleanup
-        # into remove_source() -- confirm it still behaves exactly as before
-        # (no exception, no unexpected side effect) when calculated signals
-        # exist and depend on the removed source.
+        # remove_source() now (Phase 2C-2) invalidates dependents, but must
+        # not raise and must not delete the calculated-signal entry itself
+        # -- see TestLifecycleInvalidation for the invalidation behaviour.
         sess, sid_a, _ = _session_with_two_sources()
         sess.add_calculated_signal(_defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"))
         sess.remove_source(sid_a)  # must not raise
         assert sess.get_source(sid_a) is None
         assert sess.get_calculated_signal("c1") is not None  # not silently deleted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifecycle invalidation (Phase 2C-2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestOffsetInvalidation:
+    def _setup_with_result(self):
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        return sess, sid_a, sid_b
+
+    def test_ok_result_becomes_stale_on_offset_change(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+
+    def test_arrays_preserved_on_offset_invalidation(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        original = sess.get_calculated_signal_result("c1")
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        staled = sess.get_calculated_signal_result("c1")
+        np.testing.assert_array_equal(staled.time, original.time)
+        np.testing.assert_array_equal(staled.values, original.values)
+        np.testing.assert_array_equal(staled.validity_mask, original.validity_mask)
+
+    def test_definition_preserved_on_offset_invalidation(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        definition_before = sess.get_calculated_signal_definition("c1")
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        assert sess.get_calculated_signal_definition("c1") is definition_before
+
+    def test_dependency_indexes_preserved_on_offset_invalidation(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        deps_before = sess.get_calculated_dependencies("c1")
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        assert sess.get_calculated_dependencies("c1") == deps_before
+        assert sess.get_calculated_dependents_for_source(sid_a) == ("c1",)
+
+    def test_reason_added_on_offset_change(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        warnings = sess.get_calculated_signal_result("c1").warnings
+        assert any("offset" in w.lower() for w in warnings)
+
+    def test_unchanged_offset_does_not_stale(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_time_offset(sid_a, 0.0, method="none")  # same as add_source() defaults
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.OK
+
+    def test_repeated_identical_change_does_not_duplicate_reason(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_time_offset(sid_a, 0.0, method="manual")  # prime method to "manual"
+        entry = sess.get_calculated_signal("c1")
+        entry.result = _result("c1")  # reset to OK for a clean measurement
+        for v in (1.0, 2.0, 3.0, 4.0):
+            sess.set_time_offset(sid_a, v, method="manual")  # method never changes again
+        warnings = sess.get_calculated_signal_result("c1").warnings
+        assert warnings.count("Marked stale: Source alignment offset changed.") == 1
+
+    def test_unrelated_calculation_remains_ok(self) -> None:
+        sess, sid_a, sid_b = self._setup_with_result()
+        sess.add_calculated_signal(
+            _defn("c2", "N2", "B", {"B": ChannelRef(sid_b, "Ia")}, "B"), result=_result("c2")
+        )
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+        assert sess.get_calculated_signal_result("c2").status == CalculationStatus.OK
+
+
+class TestAlignmentMethodInvalidation:
+    def _setup_with_result(self):
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        return sess, sid_a, sid_b
+
+    def test_method_only_change_stales(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_time_offset(sid_a, 0.0, method="auto_trigger")  # offset unchanged, method changes
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+        warnings = sess.get_calculated_signal_result("c1").warnings
+        assert any("method" in w.lower() for w in warnings)
+
+    def test_same_method_does_not_stale(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_time_offset(sid_a, 0.0, method="none")  # identical to add_source() defaults
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.OK
+
+    def test_method_and_offset_change_stales_once(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_time_offset(sid_a, 3.0, method="manual")
+        result = sess.get_calculated_signal_result("c1")
+        assert result.status == CalculationStatus.STALE
+        assert len(result.warnings) == 1
+        assert result.warnings[0] == "Marked stale: Source alignment offset and method changed."
+
+    def test_unrelated_calculations_unaffected_by_method_change(self) -> None:
+        sess, sid_a, sid_b = self._setup_with_result()
+        sess.add_calculated_signal(
+            _defn("c2", "N2", "B", {"B": ChannelRef(sid_b, "Ia")}, "B"), result=_result("c2")
+        )
+        sess.set_time_offset(sid_a, 0.0, method="auto_trigger")
+        assert sess.get_calculated_signal_result("c2").status == CalculationStatus.OK
+
+
+class TestDeactivationInvalidation:
+    def _setup_with_result(self):
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        return sess, sid_a, sid_b
+
+    def test_active_to_inactive_stales(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_source_active(sid_a, False)
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+
+    def test_dependency_status_becomes_inactive(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_source_active(sid_a, False)
+        status = sess.get_dependency_status("c1")
+        assert not status.is_resolvable
+        assert status.inactive_sources == (sid_a,)
+
+    def test_definition_remains_after_deactivation(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        definition_before = sess.get_calculated_signal_definition("c1")
+        sess.set_source_active(sid_a, False)
+        assert sess.get_calculated_signal_definition("c1") is definition_before
+
+    def test_inactive_to_inactive_is_a_noop(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.set_source_active(sid_a, False)
+        warnings_after_first = list(sess.get_calculated_signal_result("c1").warnings)
+        sess.set_source_active(sid_a, False)  # already inactive
+        assert sess.get_calculated_signal_result("c1").warnings == warnings_after_first
+
+
+class TestReactivationInvalidation:
+    def _setup_deactivated(self):
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        sess.set_source_active(sid_a, False)
+        return sess, sid_a, sid_b
+
+    def test_reactivation_leaves_result_stale(self) -> None:
+        sess, sid_a, _ = self._setup_deactivated()
+        sess.set_source_active(sid_a, True)
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+
+    def test_dependency_status_becomes_resolvable_again(self) -> None:
+        sess, sid_a, _ = self._setup_deactivated()
+        sess.set_source_active(sid_a, True)
+        assert sess.get_dependency_status("c1").is_resolvable
+
+    def test_no_automatic_ok(self) -> None:
+        sess, sid_a, _ = self._setup_deactivated()
+        sess.set_source_active(sid_a, True)
+        assert sess.get_calculated_signal_result("c1").status != CalculationStatus.OK
+
+    def test_reactivation_does_not_invoke_calculation(self) -> None:
+        # No calculate_signal import/usage anywhere in event_session.py --
+        # structurally confirmed in TestNoRecalculationInSession below. This
+        # test additionally confirms the *values* are untouched (same as
+        # before reactivation), i.e. nothing recomputed them.
+        sess, sid_a, _ = self._setup_deactivated()
+        before = sess.get_calculated_signal_result("c1")
+        sess.set_source_active(sid_a, True)
+        after = sess.get_calculated_signal_result("c1")
+        np.testing.assert_array_equal(before.values, after.values)
+
+
+class TestRemovalInvalidation:
+    def _setup_with_result(self):
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        return sess, sid_a, sid_b
+
+    def test_removal_stales_dependent_result(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.remove_source(sid_a)
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+
+    def test_definition_remains_after_removal(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        definition_before = sess.get_calculated_signal_definition("c1")
+        sess.remove_source(sid_a)
+        assert sess.get_calculated_signal_definition("c1") is definition_before
+
+    def test_result_arrays_retained_after_removal(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        original = sess.get_calculated_signal_result("c1")
+        sess.remove_source(sid_a)
+        staled = sess.get_calculated_signal_result("c1")
+        np.testing.assert_array_equal(staled.time, original.time)
+        np.testing.assert_array_equal(staled.values, original.values)
+
+    def test_dependency_status_becomes_missing_source(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.remove_source(sid_a)
+        status = sess.get_dependency_status("c1")
+        assert not status.is_resolvable
+        assert status.missing_sources == (sid_a,)
+
+    def test_reverse_dependency_lookup_survives_removal(self) -> None:
+        sess, sid_a, _ = self._setup_with_result()
+        sess.remove_source(sid_a)
+        assert sess.get_calculated_dependents_for_source(sid_a) == ("c1",)
+
+    def test_unrelated_calculations_unaffected_by_removal(self) -> None:
+        sess, sid_a, sid_b = self._setup_with_result()
+        sess.add_calculated_signal(
+            _defn("c2", "N2", "B", {"B": ChannelRef(sid_b, "Ia")}, "B"), result=_result("c2")
+        )
+        sess.remove_source(sid_a)
+        assert sess.get_calculated_signal_result("c2").status == CalculationStatus.OK
+
+    def test_source_with_no_dependents_behaves_as_before(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        # No calculated signal exists at all -- removal must behave exactly
+        # like the pre-Phase-2C-2 baseline (no exception, normal cleanup).
+        sess.remove_source(sid_b)
+        assert sess.get_source(sid_b) is None
+        assert sess.list_calculated_signals() == []
+
+
+class TestErrorAndNoneStateInvalidation:
+    def test_error_result_stays_error_under_offset_change(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"),
+            result=_result("c1", status=CalculationStatus.ERROR, error_message="boom"),
+        )
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        result = sess.get_calculated_signal_result("c1")
+        assert result.status == CalculationStatus.ERROR
+        assert result.error_message == "boom"
+
+    def test_error_result_stays_error_under_deactivation(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"),
+            result=_result("c1", status=CalculationStatus.ERROR, error_message="boom"),
+        )
+        sess.set_source_active(sid_a, False)
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.ERROR
+
+    def test_error_result_stays_error_under_removal(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"),
+            result=_result("c1", status=CalculationStatus.ERROR, error_message="boom"),
+        )
+        sess.remove_source(sid_a)
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.ERROR
+
+    def test_none_result_stays_none_under_offset_change(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(_defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"))
+        sess.set_time_offset(sid_a, 2.0, method="manual")
+        assert sess.get_calculated_signal_result("c1") is None
+
+    def test_none_result_stays_none_under_removal(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(_defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"))
+        sess.remove_source(sid_a)
+        assert sess.get_calculated_signal_result("c1") is None
+
+    def test_dependency_status_still_changes_for_error_result(self) -> None:
+        # The ERROR result itself doesn't change, but the dependency status
+        # (a separate, always-fresh query) still reflects reality.
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"),
+            result=_result("c1", status=CalculationStatus.ERROR, error_message="boom"),
+        )
+        sess.remove_source(sid_a)
+        assert sess.get_dependency_status("c1").missing_sources == (sid_a,)
+
+
+class TestMultipleDependencies:
+    def test_calculation_depending_on_two_sources_stales_on_either(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A + B", {
+                "A": ChannelRef(sid_a, "Va"), "B": ChannelRef(sid_b, "Ia"),
+            }, "A"),
+            result=_result("c1"),
+        )
+
+        sess.set_time_offset(sid_a, 1.0, method="manual")
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+
+        # Reset back to OK to isolate the second trigger.
+        entry = sess.get_calculated_signal("c1")
+        entry.result = _result("c1")
+        sess.set_time_offset(sid_b, 1.0, method="manual")
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+
+    def test_unrelated_source_does_not_affect_multi_dependency_calculation(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sid_c = sess.add_source(_make_record({"Vc": "kV"}), "Source C", "csv")
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A + B", {
+                "A": ChannelRef(sid_a, "Va"), "B": ChannelRef(sid_b, "Ia"),
+            }, "A"),
+            result=_result("c1"),
+        )
+        sess.set_time_offset(sid_c, 1.0, method="manual")
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.OK
+
+    def test_multiple_calculations_sharing_source_all_stale_deterministically(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        sess.add_calculated_signal(
+            _defn("c2", "N2", "A", {"A": ChannelRef(sid_a, "MW")}, "A"), result=_result("c2")
+        )
+        affected = sess._mark_calculated_dependents_stale_for_source(sid_a, reason="test trigger")
+        assert affected == ("c1", "c2")  # deterministic, sorted order
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+        assert sess.get_calculated_signal_result("c2").status == CalculationStatus.STALE
+
+
+class TestWarningDeduplication:
+    def test_same_reason_added_once(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        sess.mark_calculated_signal_stale("c1", reason="Same reason")
+        sess.mark_calculated_signal_stale("c1", reason="Same reason")
+        sess.mark_calculated_signal_stale("c1", reason="Same reason")
+        warnings = sess.get_calculated_signal_result("c1").warnings
+        assert warnings.count("Marked stale: Same reason") == 1
+
+    def test_distinct_reasons_coexist(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        sess.mark_calculated_signal_stale("c1", reason="Reason A")
+        sess.mark_calculated_signal_stale("c1", reason="Reason B")
+        warnings = sess.get_calculated_signal_result("c1").warnings
+        assert "Marked stale: Reason A" in warnings
+        assert "Marked stale: Reason B" in warnings
+        assert len(warnings) == 2
+
+    def test_numerical_engine_warnings_remain_intact(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        numerical_warning = "Input 'B' was linearly interpolated onto the reference time base."
+        original = _result("c1")
+        original.warnings.append(numerical_warning)
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=original
+        )
+        sess.mark_calculated_signal_stale("c1", reason="Source alignment offset changed.")
+        warnings = sess.get_calculated_signal_result("c1").warnings
+        assert numerical_warning in warnings
+        assert "Marked stale: Source alignment offset changed." in warnings
+
+
+class TestGetStaleCalculatedSignalIds:
+    def test_returns_only_stale_ids(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        sess.add_calculated_signal(
+            _defn("c2", "N2", "B", {"B": ChannelRef(sid_b, "Ia")}, "B"), result=_result("c2")
+        )
+        sess.add_calculated_signal(_defn("c3", "N3", "B", {"B": ChannelRef(sid_b, "Frequency")}, "B"))  # result=None
+        sess.set_time_offset(sid_a, 1.0, method="manual")
+        assert sess.get_stale_calculated_signal_ids() == ("c1",)
+
+    def test_empty_when_nothing_stale(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        assert sess.get_stale_calculated_signal_ids() == ()
+
+    def test_none_result_not_counted_as_stale(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(_defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"))
+        assert sess.get_stale_calculated_signal_ids() == ()
+
+
+class TestNoRecalculationInSession:
+    def test_calculate_signal_not_imported_in_event_session_module(self) -> None:
+        import app.sessions.event_session as event_session_module
+        assert "calculate_signal" not in dir(event_session_module)
+
+    def test_resolved_analog_input_not_referenced_in_event_session_module(self) -> None:
+        import app.sessions.event_session as event_session_module
+        assert "ResolvedAnalogInput" not in dir(event_session_module)
+
+
+class TestNoCalculatedSignalsSessionBehaviourUnchanged:
+    """A session that never uses Calculated Signals must behave exactly as
+    before Phase 2C-2 -- no new side effects on plain source mutations."""
+
+    def test_offset_change_with_no_calculated_signals(self) -> None:
+        sess = EventAnalysisSession()
+        sid = sess.add_source(_make_record(["Va"]), "Source", "csv")
+        sess.set_time_offset(sid, 1.5, method="manual")  # must not raise
+        assert sess.get_time_offset(sid) == 1.5
+
+    def test_deactivate_with_no_calculated_signals(self) -> None:
+        sess = EventAnalysisSession()
+        sid = sess.add_source(_make_record(["Va"]), "Source", "csv")
+        sess.set_source_active(sid, False)  # must not raise
+        assert sess.get_source(sid).is_active is False
+
+    def test_remove_source_with_no_calculated_signals(self) -> None:
+        sess = EventAnalysisSession()
+        sid = sess.add_source(_make_record(["Va"]), "Source", "csv")
+        sess.remove_source(sid)  # must not raise
+        assert sess.get_source(sid) is None
+
+    def test_reset_all_offsets_with_no_calculated_signals(self) -> None:
+        sess = EventAnalysisSession()
+        sid = sess.add_source(_make_record(["Va"]), "Source", "csv")
+        sess.set_time_offset(sid, 2.0, method="manual")
+        sess.reset_all_offsets()  # must not raise
+        assert sess.get_time_offset(sid) == 0.0
+
+
+class TestResetAllOffsetsInvalidation:
+    def test_reset_stales_sources_with_nonzero_offset(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.set_time_offset(sid_a, 5.0, method="manual")
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        sess.reset_all_offsets()
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.STALE
+
+    def test_reset_does_not_stale_already_zero_offset_source(self) -> None:
+        sess, sid_a, _ = _session_with_two_sources()
+        sess.add_calculated_signal(
+            _defn("c1", "N1", "A", {"A": ChannelRef(sid_a, "Va")}, "A"), result=_result("c1")
+        )
+        sess.reset_all_offsets()  # sid_a was already offset=0.0, method="none"
+        assert sess.get_calculated_signal_result("c1").status == CalculationStatus.OK
