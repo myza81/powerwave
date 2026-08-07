@@ -288,6 +288,38 @@ class TestResolveOne:
         with pytest.raises(CalculatedSignalResolutionError, match="failed to calculate"):
             svc.resolve_one("calc-1")
 
+    def test_expression_syntax_error_wrapped_in_resolution_error(self) -> None:
+        """Regression: Phase 2A's validate_expression() (called inside
+        calculate_signal()) raises CalculatedSignalExpressionError -- a
+        separate exception hierarchy from CalculatedSignalEngineError.
+        resolve_one() must catch both, not only the engine's own errors,
+        or a malformed expression (never checked at definition/add time)
+        would escape as an uncaught exception at resolve time.
+        """
+        sess, sid_a, sid_b = _session_with_two_sources()
+        defn = _defn(
+            "calc-1", "MyCalc", "a ** 2",
+            {"a": ChannelRef(sid_a, "Va")}, "a",
+        )
+        sess.add_calculated_signal(defn)  # expression syntax is not checked at definition time
+        svc = CalculatedSignalResolutionService(sess)
+
+        with pytest.raises(CalculatedSignalResolutionError, match="failed to calculate"):
+            svc.resolve_one("calc-1")
+        assert sess.get_calculated_signal_result("calc-1") is None
+
+    def test_unknown_variable_in_expression_wrapped_in_resolution_error(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        defn = _defn(
+            "calc-1", "MyCalc", "a + c",
+            {"a": ChannelRef(sid_a, "Va")}, "a",
+        )
+        sess.add_calculated_signal(defn)
+        svc = CalculatedSignalResolutionService(sess)
+
+        with pytest.raises(CalculatedSignalResolutionError, match="failed to calculate"):
+            svc.resolve_one("calc-1")
+
     def test_engine_config_is_forwarded(self) -> None:
         sess, sid_a, sid_b = _session_with_two_sources()
         defn = _defn(
@@ -300,6 +332,94 @@ class TestResolveOne:
 
         result = svc.resolve_one("calc-1")
         assert result.status == CalculationStatus.OK
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# preview_definition() (Phase 3A)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestPreviewDefinition:
+    def test_preview_does_not_mutate_session(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        defn = _defn(
+            "calc-preview", "Preview", "a + a",
+            {"a": ChannelRef(sid_a, "Va")}, "a",
+        )
+        svc = CalculatedSignalResolutionService(sess)
+
+        result = svc.preview_definition(defn)
+        assert result.status == CalculationStatus.OK
+        # Never registered, never stored -- session has no knowledge of it.
+        assert sess.get_calculated_signal_definition("calc-preview") is None
+        assert sess.get_calculated_signal_result("calc-preview") is None
+        assert sess.list_calculated_signals() == []
+
+    def test_preview_matches_create_and_resolve_numerically(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        defn = _defn(
+            "calc-1", "C1", "a + a",
+            {"a": ChannelRef(sid_a, "Va")}, "a",
+        )
+        svc = CalculatedSignalResolutionService(sess)
+
+        preview_result = svc.preview_definition(defn)
+
+        sess.add_calculated_signal(defn)
+        created_result = svc.resolve_one("calc-1")
+
+        np.testing.assert_array_equal(preview_result.time, created_result.time)
+        np.testing.assert_array_equal(preview_result.values, created_result.values)
+        np.testing.assert_array_equal(preview_result.validity_mask, created_result.validity_mask)
+        assert preview_result.unit == created_result.unit
+        assert preview_result.status == created_result.status == CalculationStatus.OK
+
+    def test_preview_dependency_failure_matches_resolve_one_failure_reason(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        sess.set_source_active(sid_a, False)
+        defn = _defn(
+            "calc-1", "C1", "a + a",
+            {"a": ChannelRef(sid_a, "Va")}, "a",
+        )
+        svc = CalculatedSignalResolutionService(sess)
+
+        with pytest.raises(CalculatedSignalResolutionError, match="inactive_source"):
+            svc.preview_definition(defn)
+
+    def test_preview_calculation_failure_raises_resolution_error(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        defn = _defn(
+            "calc-1", "C1", "a + b",
+            {"a": ChannelRef(sid_a, "Va"), "b": ChannelRef(sid_b, "Ia")}, "a",
+        )
+        svc = CalculatedSignalResolutionService(sess)
+
+        with pytest.raises(CalculatedSignalResolutionError, match="failed to calculate"):
+            svc.preview_definition(defn)
+
+    def test_preview_expression_error_raises_resolution_error(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        defn = _defn(
+            "calc-1", "C1", "a ** 2",
+            {"a": ChannelRef(sid_a, "Va")}, "a",
+        )
+        svc = CalculatedSignalResolutionService(sess)
+
+        with pytest.raises(CalculatedSignalResolutionError, match="failed to calculate"):
+            svc.preview_definition(defn)
+
+    def test_preview_can_be_called_repeatedly_without_side_effects(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        defn = _defn(
+            "calc-1", "C1", "a + a",
+            {"a": ChannelRef(sid_a, "Va")}, "a",
+        )
+        svc = CalculatedSignalResolutionService(sess)
+
+        for _ in range(3):
+            result = svc.preview_definition(defn)
+            assert result.status == CalculationStatus.OK
+        assert sess.list_calculated_signals() == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

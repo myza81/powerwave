@@ -1181,6 +1181,11 @@ class PowerwaveMainWindow(QMainWindow):
             harmonic_disp_group.addAction(action)
             self._harmonic_display_mode_actions[hmode] = action
 
+        tools_menu.addSeparator()
+        tools_menu.addAction("&Calculated Signals…").triggered.connect(
+            self._on_calculated_signals
+        )
+
     # ─────────────────────────────────────────────────────────────────────────
     # File loading (standard path)
     # ─────────────────────────────────────────────────────────────────────────
@@ -1394,6 +1399,29 @@ class PowerwaveMainWindow(QMainWindow):
         if self._scaling_mode != EngineeringScalingMode.RAW:
             self._apply_scaling_to_all_canvases()
         self.statusBar().showMessage("Scaling configuration updated.")
+
+    def _on_calculated_signals(self) -> None:
+        """Open the Calculated Signals creation/preview dialog for the
+        active session (Phase 3A). Does not render anything on the
+        session canvas -- a created signal exists only in the session's
+        own definition/result store until a later phase adds canvas
+        rendering.
+        """
+        from PyQt6.QtWidgets import QDialog, QMessageBox
+        from app.ui.calculated_signals import CalculatedSignalDialog
+
+        if self._active_session is None or not self._active_session.list_analog_channels(active_only=True):
+            QMessageBox.information(
+                self,
+                "Calculated Signals",
+                "Open a session with at least one active analog channel "
+                "before creating a calculated signal.",
+            )
+            return
+
+        dlg = CalculatedSignalDialog(self._active_session, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage("Calculated signal created.")
 
     def _on_frequency_display_mode_changed(self, mode: FrequencyDisplayMode) -> None:
         """Apply a new frequency/ROCOF panel visibility mode."""

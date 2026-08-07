@@ -26,6 +26,11 @@ a view window and decimates to at most max_points for on-screen rendering.
 A calculated signal's numerical result must reflect every sample in the
 overlap region, not a display-decimated subset.
 
+preview_definition() (Phase 3A) resolves and calculates a definition that is
+not yet, and may never be, registered in the session -- e.g. for a UI
+preview -- reusing the exact same input-resolution and calculation path as
+resolve_one() but never touching session state at all.
+
 Synchronous only: every method in this module runs to completion on the
 calling thread. No QRunnable, QThreadPool, or other worker/thread
 infrastructure is used or assumed here -- a future UI phase that wants a
@@ -45,6 +50,7 @@ from app.calculated_signals.engine import (
     CalculationEngineConfig,
     calculate_signal,
 )
+from app.calculated_signals.expression import CalculatedSignalExpressionError
 from app.calculated_signals.models import (
     CalculatedSignalDefinition,
     CalculatedSignalResult,
@@ -202,12 +208,14 @@ class CalculatedSignalResolutionService:
         On success, stores the new result via
         session.set_calculated_signal_result() and returns it.
 
-        On failure (unresolvable dependency, or calculate_signal() raising),
-        the session's previously stored result -- if any -- is left
-        completely untouched (including an ERROR result from a prior
-        failure), and CalculatedSignalResolutionError is raised. This
-        service never fabricates a placeholder/empty result and never
-        destroys last-known-good data on a failed recalculation.
+        On failure -- unresolvable dependency, an expression error from
+        Phase 2A's validate_expression() (CalculatedSignalExpressionError),
+        or a numerical/unit failure from Phase 2B's calculate_signal()
+        (CalculatedSignalEngineError) -- the session's previously stored
+        result, if any, is left completely untouched (including an ERROR
+        result from a prior failure), and CalculatedSignalResolutionError is
+        raised. This service never fabricates a placeholder/empty result and
+        never destroys last-known-good data on a failed recalculation.
 
         Does not modify the calculated signal's definition or its
         dependency indexes -- both remain the session's sole responsibility.
@@ -230,13 +238,47 @@ class CalculatedSignalResolutionService:
 
         try:
             result = calculate_signal(definition, inputs, config=self._engine_config)
-        except CalculatedSignalEngineError as exc:
+        except (CalculatedSignalEngineError, CalculatedSignalExpressionError) as exc:
             raise CalculatedSignalResolutionError(
                 f"calc_id {calc_id!r} failed to calculate: {exc}"
             ) from exc
 
         self._session.set_calculated_signal_result(calc_id, result)
         return result
+
+    # -------------------------------------------------------------------------
+    # Preview (Phase 3A)
+    # -------------------------------------------------------------------------
+
+    def preview_definition(self, definition: CalculatedSignalDefinition) -> CalculatedSignalResult:
+        """Resolve and calculate *definition* without registering it, or
+        storing anything, in the session -- for UI preview only.
+
+        Reuses exactly the same input-resolution (_resolve_input via
+        _build_inputs) and calculation (calculate_signal) path as
+        resolve_one(), so a preview's numerical result is identical to what
+        creating and resolving the same definition would produce. Two
+        differences from resolve_one(): *definition* is supplied directly
+        rather than looked up by an already-registered calc_id (a preview
+        happens before the user has committed to creating anything), and
+        nothing is ever written back to the session -- not the definition,
+        not a result, not a dependency index entry. Each binding is
+        validated by _resolve_input()'s own eligibility check (the same
+        eligibility contract enforced everywhere else in this module), so a
+        preview failure reports the same reason a resolve_one() failure
+        would for the same inputs.
+
+        Raises CalculatedSignalResolutionError on any resolution or
+        calculation failure, exactly like resolve_one().
+        """
+        inputs = self._build_inputs(definition)
+
+        try:
+            return calculate_signal(definition, inputs, config=self._engine_config)
+        except (CalculatedSignalEngineError, CalculatedSignalExpressionError) as exc:
+            raise CalculatedSignalResolutionError(
+                f"failed to calculate {definition.name!r}: {exc}"
+            ) from exc
 
     # -------------------------------------------------------------------------
     # Batch resolution
