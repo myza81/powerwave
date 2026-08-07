@@ -1,33 +1,58 @@
-"""Calculated Signals -- Phase 2A: core data models and a safe expression engine.
+"""Calculated Signals -- core data models, a safe expression engine (Phase
+2A), and a numerical calculation engine (Phase 2B).
 
-This phase defines the durable "definition" and "result" models for a
+Phase 2A defines the durable "definition" and "result" models for a
 user-created calculated analog signal, and a restricted-AST expression
 parser/evaluator that never calls Python's eval(), exec(), or compile() on
-user input. It has no dependency on EventAnalysisSession, providers,
-alignment, unit conversion, or plotting -- those integrations belong to
-later phases.
+user input.
+
+Phase 2B adds ResolvedAnalogInput (a neutral, session-independent analog
+waveform input), unit-family classification/conversion, and
+calculate_signal() -- a pipeline that aligns inputs on a reference time
+base, interpolates linearly with no extrapolation, blocks interpolation
+across internal data gaps, enforces V1 unit-compatibility rules, and
+produces a CalculatedSignalResult with a validity mask and factual warnings.
+
+Neither phase has any dependency on EventAnalysisSession, providers, the
+UI, Session Canvas, or persistence -- those integrations belong to later
+phases. Neither phase accepts or processes digital channels in any form.
 
 Public API:
   ChannelRef                  -- (source_id, channel_name) reference to one analog channel
   CalculatedSignalDefinition  -- immutable "what the user asked for"
   CalculatedSignalResult      -- mutable "what came out"
   CalculationStatus           -- OK / STALE / ERROR
+  ResolvedAnalogInput         -- an already-aligned analog waveform, ready for calculate_signal()
 
   ValidatedExpression         -- a parsed, restricted-grammar expression
   validate_expression         -- parse + validate an expression string
-  evaluate_expression         -- evaluate a ValidatedExpression against bound values
+  evaluate_expression         -- evaluate a ValidatedExpression against bound values (no units)
 
   CalculatedSignalExpressionError, ExpressionSyntaxError,
   ExpressionValidationError, ExpressionEvaluationError
 
   MAX_EXPRESSION_LENGTH, MAX_AST_NODE_COUNT, MAX_NESTING_DEPTH,
   MAX_VARIABLE_NAME_LENGTH  -- structural limits enforced during validation
+
+  UnitFamily                  -- voltage / current / active_power / reactive_power / frequency / rocof / dimensionless
+  NormalizedUnit               -- a classified unit (family + canonical spelling + scale)
+  normalize_unit               -- classify a unit string
+  are_compatible_units         -- same-family check
+  convert_values                -- same-family value conversion
+  DIMENSIONLESS_UNIT           -- canonical dimensionless unit string ("pu")
+
+  CalculationEngineConfig      -- named V1 heuristic thresholds
+  calculate_signal             -- the Phase 2B calculation pipeline
+
+  CalculatedSignalEngineError, InputValidationError, AlignmentError,
+  UnitCompatibilityError, CalculationError
 """
 from app.calculated_signals.models import (
     CalculatedSignalDefinition,
     CalculatedSignalResult,
     CalculationStatus,
     ChannelRef,
+    ResolvedAnalogInput,
 )
 from app.calculated_signals.expression import (
     MAX_AST_NODE_COUNT,
@@ -42,12 +67,30 @@ from app.calculated_signals.expression import (
     evaluate_expression,
     validate_expression,
 )
+from app.calculated_signals.units import (
+    DIMENSIONLESS_UNIT,
+    NormalizedUnit,
+    UnitFamily,
+    are_compatible_units,
+    convert_values,
+    normalize_unit,
+)
+from app.calculated_signals.engine import (
+    AlignmentError,
+    CalculatedSignalEngineError,
+    CalculationEngineConfig,
+    CalculationError,
+    InputValidationError,
+    UnitCompatibilityError,
+    calculate_signal,
+)
 
 __all__ = [
     "ChannelRef",
     "CalculatedSignalDefinition",
     "CalculatedSignalResult",
     "CalculationStatus",
+    "ResolvedAnalogInput",
     "ValidatedExpression",
     "validate_expression",
     "evaluate_expression",
@@ -59,4 +102,17 @@ __all__ = [
     "MAX_AST_NODE_COUNT",
     "MAX_NESTING_DEPTH",
     "MAX_VARIABLE_NAME_LENGTH",
+    "UnitFamily",
+    "NormalizedUnit",
+    "normalize_unit",
+    "are_compatible_units",
+    "convert_values",
+    "DIMENSIONLESS_UNIT",
+    "CalculationEngineConfig",
+    "calculate_signal",
+    "CalculatedSignalEngineError",
+    "InputValidationError",
+    "AlignmentError",
+    "UnitCompatibilityError",
+    "CalculationError",
 ]

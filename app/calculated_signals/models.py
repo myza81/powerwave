@@ -174,6 +174,50 @@ def _as_1d_numeric_array(value: object, field_name: str) -> np.ndarray:
     return arr.astype(np.float64, copy=True)
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedAnalogInput:
+    """An already-resolved, already-aligned analog waveform, ready for the
+    Phase 2B calculation engine.
+
+    Deliberately neutral: the engine (app.calculated_signals.engine) knows
+    only about numeric arrays and optional descriptive metadata -- never
+    about EventAnalysisSession, SessionSource, or ChannelRef. A future phase
+    is responsible for producing this object from a ChannelRef resolved
+    against a live session, including applying the session source's own
+    time_offset_s to the record's raw time array; Phase 2B receives the
+    result of that work already done, so the engine stays numerically pure
+    and testable without any session fixture.
+
+    source_id/channel_name are optional and purely informational (useful
+    for provenance in warning messages) -- no code in this package branches
+    on their value. No digital/analog flag is stored here either: eligible
+    inputs must already be analog by the time a ResolvedAnalogInput is
+    constructed (enforced upstream, by whichever future phase resolves a
+    ChannelRef), not by this model.
+    """
+
+    variable: str
+    time: np.ndarray
+    values: np.ndarray
+    unit: str | None
+    source_id: str | None = None
+    channel_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _is_valid_binding_name(self.variable):
+            raise ValueError(f"invalid variable name: {self.variable!r}")
+
+        time_arr = _as_1d_numeric_array(self.time, "time")
+        values_arr = _as_1d_numeric_array(self.values, "values")
+        if len(time_arr) != len(values_arr):
+            raise ValueError(
+                "time and values must have identical length "
+                f"(got {len(time_arr)}, {len(values_arr)})"
+            )
+        object.__setattr__(self, "time", time_arr)
+        object.__setattr__(self, "values", values_arr)
+
+
 def _as_1d_bool_array(value: object, field_name: str) -> np.ndarray:
     """Return a defensive bool copy of *value*, or raise ValueError."""
     arr = np.asarray(value)
