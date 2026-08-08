@@ -181,19 +181,38 @@ class MeasurementPanel(QWidget):
             self._lbl_energy_key.setVisible(False)
             self._lbl_energy.setVisible(False)
 
-        # Channel table
+        # Channel table -- every submitted curve gets a row, available or
+        # not (Sprint 1A: never silently omit a visible curve's row).
         channels = result.channels
         self._table.setRowCount(len(channels))
 
         for row, ch in enumerate(channels):
             unit = ch.unit or ""
-            self._table.setItem(row, self._COL_CHANNEL, _item(ch.name, align=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+            name_item = _item(ch.name, align=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            if not ch.available:
+                name_item.setToolTip(ch.unavailable_reason or "Unavailable")
+            self._table.setItem(row, self._COL_CHANNEL, name_item)
             self._table.setItem(row, self._COL_UNIT, _item(unit))
-            self._table.setItem(row, self._COL_DY, _item(_fmt(ch.delta_y)))
-            self._table.setItem(row, self._COL_RMS, _item(_fmt(ch.rms)))
-            self._table.setItem(row, self._COL_MEAN, _item(_fmt(ch.mean)))
-            self._table.setItem(row, self._COL_PEAK, _item(_fmt(ch.peak)))
-            self._table.setItem(row, self._COL_PP, _item(_fmt(ch.peak_to_peak)))
+
+            if ch.available:
+                self._table.setItem(row, self._COL_DY, _item(_fmt(ch.delta_y)))
+                self._table.setItem(row, self._COL_RMS, _item(_fmt(ch.rms)))
+                self._table.setItem(row, self._COL_MEAN, _item(_fmt(ch.mean)))
+                self._table.setItem(row, self._COL_PEAK, _item(_fmt(ch.peak)))
+                self._table.setItem(row, self._COL_PP, _item(_fmt(ch.peak_to_peak)))
+            else:
+                # Explicit, unmissable marker -- distinct from "—" (a
+                # computable-but-empty statistic on an otherwise available
+                # curve, e.g. coincident cursors) so an engineer can never
+                # mistake a genuinely missing measurement for a zero/blank one.
+                for col in (self._COL_DY, self._COL_RMS, self._COL_MEAN, self._COL_PEAK, self._COL_PP):
+                    unavailable_item = _item("Unavailable")
+                    unavailable_item.setForeground(QColor("#CC6666"))
+                    font = unavailable_item.font()
+                    font.setItalic(True)
+                    unavailable_item.setFont(font)
+                    unavailable_item.setToolTip(ch.unavailable_reason or "Unavailable")
+                    self._table.setItem(row, col, unavailable_item)
 
         self._table.resizeColumnToContents(self._COL_CHANNEL)
 

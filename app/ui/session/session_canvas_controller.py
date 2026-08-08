@@ -1250,11 +1250,34 @@ class SessionCanvasController:
     ) -> object | None:
         """Compute cursor measurements for one panel canvas.
 
-        Gathers aligned data for every visible channel in the panel, applies
-        the current scaling, and delegates to the measurement engine.
-        Returns a ``MeasurementResult`` or ``None`` when data is unavailable.
+        Sprint 1A (per-curve measurement architecture): every VISIBLE curve
+        already painted on *canvas* -- real channel or calculated signal,
+        it makes no difference -- contributes its own already-scaled,
+        already-materialized (time, values) arrays directly from the
+        PlotDataItem the user is actually looking at. No curve is required
+        to share a length, sample rate, or time base with any other; no
+        curve is dropped because its length differs from another's. This
+        also means measurement no longer re-fetches or re-scales data via
+        session.build_aligned_data() -- what is measured is guaranteed
+        identical to what is plotted.
+
+        Calculated signals receive no special-case code here: they are
+        already painted via the same SessionCanvasWidget.update_curve()
+        path as real channels (see refresh_calculated_signals()), and this
+        method never distinguishes a curve by type or origin -- it iterates
+        canvas._curves uniformly. The one label-disambiguation step below
+        is driven purely by an actual label collision (two curves that
+        would otherwise render the identical name), not by curve type; a
+        calculated signal's name is already unique within the session, so
+        it is never affected in practice.
+
+        Returns a ``MeasurementResult`` or ``None`` when measurement mode
+        is off, no cursors exist, or no curve is currently visible.
         """
-        from app.visualization.interaction.measurement_engine import compute_measurements
+        from app.visualization.interaction.measurement_engine import (
+            CurveSample,
+            compute_measurements,
+        )
         if not self._measurement_mode:
             return None
         positions = canvas.cursor_positions()
@@ -1262,72 +1285,42 @@ class SessionCanvasController:
             return None
         t_a, t_b = positions
 
-        panels = {p.panel_id: p for p in session.list_panels()}
-        panel = panels.get(canvas.panel_id)
-        if panel is None:
+        visible = [
+            (item, canvas._metadata[key])
+            for key, item in canvas._curves.items()
+            if item.isVisible() and key in canvas._metadata
+        ]
+        if not visible:
             return None
 
-        t_start, t_end = _session_window(session)
-        all_channels = self._channel_lookup(session)
-        sources_by_id = {s.source_id: s for s in session.list_sources()}
-        multi_source = len({ref[0] for ref in panel.channel_refs}) > 1
+        # Disambiguate only labels that actually collide (e.g. two sources
+        # both have a channel named "Va") -- everything else keeps its
+        # plain display name, regardless of how many curves/sources
+        # contribute to the panel.
+        base_labels = [meta.display_name or meta.channel_name for _, meta in visible]
+        label_counts: dict[str, int] = {}
+        for label in base_labels:
+            label_counts[label] = label_counts.get(label, 0) + 1
 
-        data_by_channel: dict[str, tuple] = {}
-        time_arr = None
-
-        for source_id, channel_name in panel.channel_refs:
-            source = sources_by_id.get(source_id)
-            if source is None or not source.is_active:
-                continue
-            ch = all_channels.get((source_id, channel_name))
-            if ch is not None and not ch.is_visible:
-                continue
-            try:
-                aligned = session.build_aligned_data(source_id, channel_name, t_start, t_end)
-                scaled_values, display_unit = self._scale_aligned(
-                    channel_name, aligned.values, aligned.unit
-                )
-                # Disambiguate channel labels when multiple sources share the panel
-                label = f"{source_id}/{channel_name}" if multi_source else channel_name
-                data_by_channel[label] = (scaled_values, display_unit or "")
-                if time_arr is None:
-                    time_arr = aligned.time
-            except Exception:  # noqa: BLE001
-                pass
-
-        # Calculated signals painted into this panel (Phase 3B): sourced
-        # directly from each result's own materialized arrays, never
-        # recalculated and never routed through build_aligned_data(). A
-        # calculated signal's full-resolution result generally has a
-        # different sample count than a real channel's decimated display
-        # grid -- compute_measurements() already skips any channel whose
-        # array length does not match `time_arr`, so this only contributes
-        # a calculated signal when it can share a common time base with
-        # whatever else is in this panel (trivially true for a panel that
-        # contains only calculated signals, which becomes the first, and
-        # therefore defining, time_arr).
-        for calc_id, panel_id in self._calc_panel_by_id.items():
-            if panel_id != canvas.panel_id:
-                continue
-            entry = session.get_calculated_signal(calc_id)
-            if entry is None or entry.result is None:
-                continue
-            if entry.result.status == CalculationStatus.ERROR:
-                continue
-            if not getattr(entry, "is_visible", True):
-                continue
-            label = f"ƒ {entry.definition.name}"
-            if entry.result.status == CalculationStatus.STALE:
-                label += " (stale)"
+        curves: list[CurveSample] = []
+        for (item, meta), base_label in zip(visible, base_labels):
+            time_arr, values_arr = item.getOriginalDataset()
             if time_arr is None:
-                time_arr = entry.result.time
-            data_by_channel[label] = (entry.result.values, entry.result.unit or "")
-
-        if time_arr is None or len(data_by_channel) == 0:
-            return None
+                time_arr = np.array([], dtype=np.float64)
+            if values_arr is None:
+                values_arr = np.array([], dtype=np.float64)
+            label = base_label
+            if label_counts[base_label] > 1 and meta.source_badge:
+                label = f"{meta.source_badge}/{base_label}"
+            curves.append(CurveSample(
+                name=label,
+                unit=meta.unit or "",
+                time=np.asarray(time_arr, dtype=np.float64),
+                values=np.asarray(values_arr, dtype=np.float64),
+            ))
 
         nominal_hz = None
-        for source in sources_by_id.values():
+        for source in session.list_sources():
             if not source.is_active:
                 continue
             try:
@@ -1338,7 +1331,7 @@ class SessionCanvasController:
             if nominal_hz:
                 break
 
-        return compute_measurements(t_a, t_b, time_arr, data_by_channel, nominal_hz=nominal_hz)
+        return compute_measurements(t_a, t_b, curves, nominal_hz=nominal_hz)
 
     def _on_canvas_measurement_moved(
         self, canvas: SessionCanvasWidget, t_a: float, t_b: float
