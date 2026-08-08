@@ -41,7 +41,7 @@ not this module.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
 
@@ -313,6 +313,24 @@ class CalculatedSignalResolutionService:
         every calculated signal's bindings by hand.
         """
         return self._resolve_batch(self._session.get_calculated_dependents_for_source(source_id))
+
+    def resolve_for_sources(self, source_ids: "Iterable[str]") -> ResolutionBatchResult:
+        """Recalculate every calculated signal that depends on ANY of
+        *source_ids*, each exactly once -- even when it depends on more
+        than one of the given sources (e.g. after a single UI action, such
+        as "Set as Reference" or "Align All", that changes several
+        sources' offsets at once). Equivalent to calling
+        resolve_for_source() once per source_id and merging the results,
+        except that a calculated signal depending on multiple changed
+        sources is resolved once, not once per matching source.
+
+        Order is deterministic (sorted calc_id), matching
+        get_calculated_dependents_for_source()'s own ordering convention.
+        """
+        calc_ids: set[str] = set()
+        for source_id in source_ids:
+            calc_ids.update(self._session.get_calculated_dependents_for_source(source_id))
+        return self._resolve_batch(tuple(sorted(calc_ids)))
 
     def resolve_all(self) -> ResolutionBatchResult:
         """Recalculate every calculated signal defined in the session,

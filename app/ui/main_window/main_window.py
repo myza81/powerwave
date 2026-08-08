@@ -2092,6 +2092,11 @@ class PowerwaveMainWindow(QMainWindow):
     def _on_session_offset_reset(self, source_id: str) -> None:
         if self._active_session is None:
             return
+        source = self._active_session.get_source(source_id)
+        if source is None:
+            return
+        old_offset = source.time_offset_s
+        old_method = source.alignment_method
         self._active_session.set_time_offset(source_id, 0.0, method="none")
         self._active_session.set_alignment_notes(source_id, "")
         self._refresh_session_source_row(source_id)
@@ -2101,8 +2106,12 @@ class PowerwaveMainWindow(QMainWindow):
             )
         self.statusBar().showMessage(f"Offset reset to 0.000 s for {source_id}.")
         # Reset is a single committed action (button click), not a
-        # continuous edit -- recalculate immediately, same as editingFinished.
-        self._recalculate_calculated_signals_for_source(source_id)
+        # continuous edit -- recalculate immediately, same as
+        # editingFinished, but only when Reset actually changed anything
+        # (Sprint 1C no-change guard): clicking Reset while already at
+        # 0.000s/method="none" must not trigger a no-op recalculation.
+        if old_offset != 0.0 or old_method != "none":
+            self._recalculate_calculated_signals_for_source(source_id)
         self._refresh_timing_assessment()
 
     def _on_session_set_as_reference(self, source_id: str) -> None:
@@ -2114,7 +2123,10 @@ class PowerwaveMainWindow(QMainWindow):
         if ref_source is None:
             return
         ref_offset = ref_source.time_offset_s
+        changed_source_ids: list[str] = []
         for source in self._active_session.list_sources():
+            old_offset = source.time_offset_s
+            old_method = source.alignment_method
             if source.source_id == source_id:
                 new_offset = 0.0
             else:
@@ -2124,13 +2136,19 @@ class PowerwaveMainWindow(QMainWindow):
             )
             self._active_session.set_alignment_notes(source.source_id, "")
             self._refresh_session_source_row(source.source_id)
+            if old_offset != new_offset or old_method != "manual":
+                changed_source_ids.append(source.source_id)
         if self._session_canvas_active and self._session_canvas_controller is not None:
             self._session_canvas_controller.refresh_all(self._active_session)
         self.statusBar().showMessage(
             f"Set '{ref_source.display_name}' as reference (t=0)."
         )
-        for source in self._active_session.list_sources():
-            self._recalculate_calculated_signals_for_source(source.source_id)
+        # Set-as-Reference can move several sources' offsets in one action
+        # (Sprint 1C no-op + dedup guard): only sources whose offset/method
+        # actually changed are recalculated, and a calculated signal
+        # depending on more than one of them is resolved once, not once
+        # per matching source.
+        self._recalculate_calculated_signals_for_sources(changed_source_ids)
         self._refresh_timing_assessment()
 
     def _on_session_auto_align(self, source_id: str) -> None:
@@ -2149,7 +2167,11 @@ class PowerwaveMainWindow(QMainWindow):
             return
 
         results = suggest_alignment_offsets(targets)
+        changed_source_ids: list[str] = []
         for result in results:
+            source = self._active_session.get_source(result.source_id)
+            old_offset = source.time_offset_s if source is not None else None
+            old_method = source.alignment_method if source is not None else None
             self._active_session.set_time_offset(
                 result.source_id,
                 result.suggested_offset_s,
@@ -2162,14 +2184,19 @@ class PowerwaveMainWindow(QMainWindow):
                 self._session_canvas_controller.on_offset_changed(
                     result.source_id, result.suggested_offset_s, self._active_session
                 )
+            if old_offset != result.suggested_offset_s or old_method != result.alignment_method:
+                changed_source_ids.append(result.source_id)
 
         n = len(results)
         self.statusBar().showMessage(f"Auto-aligned {n} source(s).")
 
         # Auto-align is a single committed action, not a continuous edit --
-        # recalculate dependent calculated signals for every source touched.
-        for result in results:
-            self._recalculate_calculated_signals_for_source(result.source_id)
+        # recalculate dependent calculated signals for every source whose
+        # offset/method actually changed (Sprint 1C no-op guard); "Align
+        # All" can touch several sources at once, so a calculated signal
+        # depending on more than one of them is resolved once (dedup),
+        # not once per matching source.
+        self._recalculate_calculated_signals_for_sources(changed_source_ids)
         self._refresh_timing_assessment()
 
         # Cross-correlation pass (Phase 7) — runs after trigger-based alignment
@@ -2253,24 +2280,36 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _recalculate_calculated_signals_for_source(self, source_id: str) -> None:
         """Recalculate only the calculated signals depending on source_id,
-        after a COMMITTED alignment edit (offset editingFinished, Auto-align,
-        Reset, Set-as-reference, or reactivation) -- never on every spinbox
-        tick. A failed recalculation leaves the previous OK/STALE result
-        completely untouched (CalculatedSignalResolutionService's own
-        contract); the affected curves are repainted from current session
-        state either way, so a failed recalculation's last-known-good/stale
-        curve remains visible rather than disappearing.
+        after a COMMITTED alignment edit (offset editingFinished, a fine
+        nudge, Reset, Auto-align, Set-as-reference, or reactivation) --
+        never on every spinbox tick. A failed recalculation leaves the
+        previous OK/STALE result completely untouched
+        (CalculatedSignalResolutionService's own contract); the affected
+        curves are repainted from current session state either way, so a
+        failed recalculation's last-known-good/stale curve remains visible
+        rather than disappearing.
         """
-        if self._active_session is None:
-            return
-        dependents = self._active_session.get_calculated_dependents_for_source(source_id)
-        if not dependents:
+        self._recalculate_calculated_signals_for_sources([source_id])
+
+    def _recalculate_calculated_signals_for_sources(self, source_ids: list[str]) -> None:
+        """Recalculate the calculated signals depending on ANY of
+        *source_ids*, each exactly once -- even when a signal depends on
+        more than one of the changed sources (e.g. Set-as-Reference or
+        "Align All", which can move several sources' offsets in a single
+        committed action). Callers are expected to have already filtered
+        *source_ids* down to sources whose offset/method actually changed
+        (Sprint 1C no-op guard) -- an empty list is a cheap no-op here.
+        """
+        if self._active_session is None or not source_ids:
             return
         from app.calculated_signals.resolver import CalculatedSignalResolutionService
 
         service = CalculatedSignalResolutionService(self._active_session)
-        service.resolve_for_source(source_id)
-        self._sync_calculated_signals_to_canvas(list(dependents))
+        batch = service.resolve_for_sources(source_ids)
+        calc_ids = [r.calc_id for r in batch.successful] + [f.calc_id for f in batch.failures]
+        if not calc_ids:
+            return
+        self._sync_calculated_signals_to_canvas(calc_ids)
 
     def _on_calc_signal_visibility_changed(self, calc_id: str, visible: bool) -> None:
         if self._active_session is None:

@@ -8,7 +8,13 @@ Phase 9C additions over Phase 9B:
 
 Signal contract (unchanged from Phase 9B except new offset_reset_requested):
   offset_changed(source_id, offset_s)       — spinbox changed by user (every tick)
-  offset_edit_finished(source_id)           — spinbox editing committed (Phase 3B; focus lost/Enter, not every tick)
+  offset_edit_finished(source_id)           — one committed alignment edit is complete
+                                               (Sprint 1C: typed edit committed via
+                                               editingFinished, OR a fine-nudge button click --
+                                               one semantic contract for both, see
+                                               _emit_offset_committed_if_changed()).
+                                               Never emitted when the offset did not actually
+                                               change (Sprint 1C no-change guard).
   offset_reset_requested(source_id)         — Reset button clicked
   auto_align_requested(source_id)           — Auto button clicked
   channel_visibility_changed(...)           — from channel tree
@@ -130,6 +136,23 @@ class SourceRowWidget(QWidget):
         self._source_id = source.source_id
         self._sample_interval_s: float = 0.001   # fallback; updated from metrics
         self._updating = False
+        # Sprint 1C: the last offset value a committed alignment edit was
+        # emitted for. Compared with exact float equality (the same
+        # convention EventAnalysisSession.set_time_offset() already uses)
+        # so a committed event is never emitted -- and no recalculation
+        # ever triggered -- for a no-op edit.
+        self._last_committed_offset: float = source.time_offset_s
+        # True while this row's OWN valueChanged signal is still being
+        # handled upstream (session mutation -> row refresh cascade). A
+        # refresh() call that happens *because of* this row's own
+        # not-yet-committed edit must not update _last_committed_offset --
+        # otherwise the cascade would make the edit look already
+        # "committed" before _emit_offset_committed_if_changed() ever runs,
+        # permanently defeating the no-change guard. An external refresh
+        # (Reset/Auto-align/Set-as-reference, which never goes through this
+        # row's own valueChanged at all) is unaffected and still updates
+        # the tracked value normally -- see refresh()/_on_offset_spin_changed().
+        self._in_own_change_cascade = False
         self._build_ui(source, analog_channels, digital_channels, panels)
         if metrics is not None:
             self._apply_metrics(metrics)
@@ -183,6 +206,17 @@ class SourceRowWidget(QWidget):
             self._offset_spin.setValue(source.time_offset_s)
         finally:
             self._updating = False
+        # Sprint 1C: keep the committed-offset tracking in sync with an
+        # EXTERNAL programmatic change (Reset, Auto-align, Set-as-reference
+        # all push their new offset here via a path that never touches this
+        # row's own valueChanged) so a later user-driven edit is compared
+        # against the true current value, not a stale one. Skipped while
+        # this refresh is itself a side effect of this row's own
+        # not-yet-committed edit cascading back through the session --
+        # otherwise the edit would look already "committed" before it
+        # actually is (see _in_own_change_cascade's docstring in __init__).
+        if not self._in_own_change_cascade:
+            self._last_committed_offset = source.time_offset_s
         self._apply_alignment(source, notes=alignment_notes)
         if metrics is not None:
             self._apply_metrics(metrics)
@@ -412,26 +446,51 @@ class SourceRowWidget(QWidget):
     def _on_offset_spin_changed(self, value: float) -> None:
         if self._updating:
             return
-        self.offset_changed.emit(self._source_id, value)
+        self._in_own_change_cascade = True
+        try:
+            self.offset_changed.emit(self._source_id, value)
+        finally:
+            self._in_own_change_cascade = False
 
     def _on_offset_spin_editing_finished(self) -> None:
         """Fires once when spinbox editing commits (focus lost or Enter),
-        unlike valueChanged which fires on every tick/keystroke. This is the
-        hook a future recalculation trigger should use instead of
-        valueChanged -- see offset_edit_finished's docstring in the class
-        signal contract.
+        unlike valueChanged which fires on every tick/keystroke. This is
+        the hook the recalculation trigger uses instead of valueChanged --
+        see offset_edit_finished's docstring in the class signal contract.
         """
         if self._updating:
             return
+        self._emit_offset_committed_if_changed()
+
+    def _emit_offset_committed_if_changed(self) -> None:
+        """Emit offset_edit_finished exactly once for the current spinbox
+        value, but only if it differs from the last value a committed
+        event was already emitted for (Sprint 1C no-change guard). Shared
+        by typed-edit commits (editingFinished) and fine-nudge button
+        clicks -- one semantic contract: "this source's alignment edit is
+        complete; downstream derived results may now be recalculated,"
+        regardless of which UI control produced it.
+        """
+        current = self._offset_spin.value()
+        if current == self._last_committed_offset:
+            return
+        self._last_committed_offset = current
         self.offset_edit_finished.emit(self._source_id)
 
     def _on_fine_left(self) -> None:
         step = self._sample_interval_s if self._sample_interval_s > 0 else 0.001
+        # setValue() fires valueChanged synchronously (existing session
+        # mutation / stale-marking path, unchanged) but never
+        # editingFinished -- a fine nudge is itself a complete, single
+        # committed adjustment, so explicitly emit the same committed
+        # event a typed edit would produce, exactly once.
         self._offset_spin.setValue(self._offset_spin.value() - step)
+        self._emit_offset_committed_if_changed()
 
     def _on_fine_right(self) -> None:
         step = self._sample_interval_s if self._sample_interval_s > 0 else 0.001
         self._offset_spin.setValue(self._offset_spin.value() + step)
+        self._emit_offset_committed_if_changed()
 
     def _on_expand_toggled(self, checked: bool) -> None:
         self._channel_tree.setVisible(checked)

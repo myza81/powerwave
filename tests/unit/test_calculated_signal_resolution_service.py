@@ -581,6 +581,84 @@ class TestBatchAPIs:
         assert [r.calc_id for r in batch.successful] == [f"calc-{i}" for i in range(5)]
 
 
+class TestResolveForSources:
+    """Sprint 1C: resolve_for_sources() recalculates every calc depending
+    on ANY of several changed sources, each exactly once -- used when one
+    UI action (Set as Reference, Align All) changes multiple sources'
+    offsets together."""
+
+    def test_dedups_calc_depending_on_two_changed_sources(self) -> None:
+        sess = EventAnalysisSession()
+        sid_a = sess.add_source(_make_record({"P": "MW"}), "Source A", "csv")
+        sid_b = sess.add_source(_make_record({"P": "MW"}), "Source B", "csv")
+        shared = _defn(
+            "calc-shared", "Shared", "a + b",
+            {"a": ChannelRef(sid_a, "P"), "b": ChannelRef(sid_b, "P")}, "a",
+        )
+        sess.add_calculated_signal(shared)
+        svc = CalculatedSignalResolutionService(sess)
+        calls: list[str] = []
+        original = CalculatedSignalResolutionService.resolve_one
+
+        def _spy(self, calc_id):
+            calls.append(calc_id)
+            return original(self, calc_id)
+
+        svc.resolve_one = _spy.__get__(svc, CalculatedSignalResolutionService)
+
+        batch = svc.resolve_for_sources([sid_a, sid_b])
+        assert calls == ["calc-shared"]
+        assert len(batch.successful) == 1
+        assert batch.successful[0].calc_id == "calc-shared"
+
+    def test_union_of_dependents_across_sources(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        depends_on_a = _defn("calc-a", "CA", "a + a", {"a": ChannelRef(sid_a, "Va")}, "a")
+        depends_on_b = _defn("calc-b", "CB", "b + b", {"b": ChannelRef(sid_b, "Ia")}, "b")
+        sess.add_calculated_signal(depends_on_a)
+        sess.add_calculated_signal(depends_on_b)
+        svc = CalculatedSignalResolutionService(sess)
+
+        batch = svc.resolve_for_sources([sid_a, sid_b])
+        assert sorted(r.calc_id for r in batch.successful) == ["calc-a", "calc-b"]
+
+    def test_empty_source_ids_resolves_nothing(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        depends_on_a = _defn("calc-a", "CA", "a + a", {"a": ChannelRef(sid_a, "Va")}, "a")
+        sess.add_calculated_signal(depends_on_a)
+        svc = CalculatedSignalResolutionService(sess)
+
+        batch = svc.resolve_for_sources([])
+        assert batch.successful == ()
+        assert batch.failures == ()
+        assert sess.get_calculated_signal_result("calc-a") is None
+
+    def test_single_source_matches_resolve_for_source(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        depends_on_a = _defn("calc-a", "CA", "a + a", {"a": ChannelRef(sid_a, "Va")}, "a")
+        depends_on_b = _defn("calc-b", "CB", "b + b", {"b": ChannelRef(sid_b, "Ia")}, "b")
+        sess.add_calculated_signal(depends_on_a)
+        sess.add_calculated_signal(depends_on_b)
+        svc = CalculatedSignalResolutionService(sess)
+
+        batch = svc.resolve_for_sources([sid_a])
+        assert [r.calc_id for r in batch.successful] == ["calc-a"]
+        assert sess.get_calculated_signal_result("calc-b") is None  # untouched
+
+    def test_failure_in_one_does_not_block_others(self) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        depends_on_a = _defn("calc-a", "CA", "a + a", {"a": ChannelRef(sid_a, "Va")}, "a")
+        depends_on_b = _defn("calc-b", "CB", "b + b", {"b": ChannelRef(sid_b, "Ia")}, "b")
+        sess.add_calculated_signal(depends_on_a)
+        sess.add_calculated_signal(depends_on_b)
+        sess.set_source_active(sid_b, False)
+        svc = CalculatedSignalResolutionService(sess)
+
+        batch = svc.resolve_for_sources([sid_a, sid_b])
+        assert [r.calc_id for r in batch.successful] == ["calc-a"]
+        assert [f.calc_id for f in batch.failures] == ["calc-b"]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Full lifecycle round-trips
 # ─────────────────────────────────────────────────────────────────────────────
