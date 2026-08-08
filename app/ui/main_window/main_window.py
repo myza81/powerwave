@@ -1652,6 +1652,7 @@ class PowerwaveMainWindow(QMainWindow):
         )
         self._session_canvas_controller.refresh_all(self._active_session)
         self._sync_session_panel_colours()
+        self._refresh_timing_assessment()
         # Normalize all panels to the same X range after auto-range settles
         _ctrl = self._session_canvas_controller
         _sess = self._active_session
@@ -2054,6 +2055,7 @@ class PowerwaveMainWindow(QMainWindow):
             self._session_panel.remove_source_row(source_id)
         if self._session_canvas_active and self._session_canvas_controller is not None:
             self._session_canvas_controller.on_source_removed(source_id)
+        self._refresh_timing_assessment()
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(f"Source removed. Session: {n} source(s).")
 
@@ -2075,6 +2077,7 @@ class PowerwaveMainWindow(QMainWindow):
         self._sync_calculated_signals_to_canvas(
             list(self._active_session.get_calculated_dependents_for_source(source_id))
         )
+        self._refresh_timing_assessment()
 
     def _on_session_offset_edit_finished(self, source_id: str) -> None:
         """Offset spinbox editing committed (focus lost / Enter) -- unlike
@@ -2100,6 +2103,7 @@ class PowerwaveMainWindow(QMainWindow):
         # Reset is a single committed action (button click), not a
         # continuous edit -- recalculate immediately, same as editingFinished.
         self._recalculate_calculated_signals_for_source(source_id)
+        self._refresh_timing_assessment()
 
     def _on_session_set_as_reference(self, source_id: str) -> None:
         """Set one source as the time reference: its offset becomes 0.0 and all
@@ -2127,6 +2131,7 @@ class PowerwaveMainWindow(QMainWindow):
         )
         for source in self._active_session.list_sources():
             self._recalculate_calculated_signals_for_source(source.source_id)
+        self._refresh_timing_assessment()
 
     def _on_session_auto_align(self, source_id: str) -> None:
         if self._active_session is None:
@@ -2165,10 +2170,23 @@ class PowerwaveMainWindow(QMainWindow):
         # recalculate dependent calculated signals for every source touched.
         for result in results:
             self._recalculate_calculated_signals_for_source(result.source_id)
+        self._refresh_timing_assessment()
 
         # Cross-correlation pass (Phase 7) — runs after trigger-based alignment
         if source_id == "all" and len(targets) >= 2:
             QTimer.singleShot(0, lambda t=targets: self._run_cross_correlation(t))
+
+    def _refresh_timing_assessment(self) -> None:
+        """Recompute the session-wide timing-reference compatibility banner
+        (Sprint 1B). Read-only -- never mutates the session. Called from
+        every session-refresh path that can change which sources are
+        active or how they're aligned: source add/remove, activation
+        change, offset change, and alignment-method change (Reset,
+        Auto-align, Set-as-reference all change the alignment method).
+        """
+        if self._active_session is None or self._session_panel is None:
+            return
+        self._session_panel.refresh_timing_assessment(self._active_session)
 
     def _refresh_session_source_row(self, source_id: str) -> None:
         """Pull current state from the session and refresh the corresponding panel row."""
@@ -2433,6 +2451,7 @@ class PowerwaveMainWindow(QMainWindow):
             self._deactivate_session_canvas()
         self._session_canvas_action.setEnabled(False)
         self._save_manifest_action.setEnabled(False)
+        self._refresh_timing_assessment()
         self.statusBar().showMessage("Session cleared.")
 
     def _on_save_session_as_manifest(self) -> None:
@@ -2486,6 +2505,7 @@ class PowerwaveMainWindow(QMainWindow):
             self._sync_calculated_signals_to_canvas(
                 list(self._active_session.get_calculated_dependents_for_source(source_id))
             )
+        self._refresh_timing_assessment()
 
     def _load_manifest(self, manifest_path: Path) -> None:
         """Load a YAML manifest, show the data review dialog, then visualize."""

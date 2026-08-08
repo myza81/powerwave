@@ -33,6 +33,7 @@ def _fmt_readout(value: float, unit: str) -> str:
     return f"{value:.3f}{suffix}"
 from PyQt6.QtWidgets import (
     QDockWidget,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -43,8 +44,14 @@ from PyQt6.QtWidgets import (
 )
 
 from app.sessions.session_models import PanelConfig, SessionSource, SourceQualityMetrics
+from app.sessions.timing_compatibility import (
+    SessionTimingAssessment,
+    TimingCompatibilityLevel,
+    assess_session_timing_compatibility,
+)
 from app.ui.session.calculated_signal_row_widget import CalculatedSignalRowWidget
 from app.ui.session.source_row_widget import SourceRowWidget
+from app.ui.session.timing_details_dialog import TimingDetailsDialog
 
 
 class SessionPanel(QDockWidget):
@@ -86,6 +93,7 @@ class SessionPanel(QDockWidget):
         # Expansion state is owned here to survive row removal/re-addition
         self._expansion_state: dict[str, bool] = {}
         self._calc_rows: dict[str, CalculatedSignalRowWidget] = {}
+        self._timing_assessment: SessionTimingAssessment | None = None
         self._build_ui()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -273,6 +281,23 @@ class SessionPanel(QDockWidget):
 
         self._calc_signals_group.setVisible(bool(entries))
 
+    def refresh_timing_assessment(self, session) -> None:
+        """Recompute and display the session-wide timing-reference
+        compatibility banner (Sprint 1B). Read-only: assess_session_timing_
+        compatibility() never mutates the session, any source, or any
+        record -- this method only updates the banner's own display state.
+        """
+        assessment = assess_session_timing_compatibility(session)
+        self._timing_assessment = assessment
+
+        if not assessment.has_warning:
+            self._timing_banner.setVisible(False)
+            return
+
+        icon = "⚠" if assessment.level is not TimingCompatibilityLevel.UNKNOWN else "❔"
+        self._timing_banner_label.setText(f"{icon} {assessment.summary}")
+        self._timing_banner.setVisible(True)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Build
     # ─────────────────────────────────────────────────────────────────────────
@@ -318,6 +343,33 @@ class SessionPanel(QDockWidget):
         toolbar.addWidget(self._time_lbl)
 
         outer.addLayout(toolbar)
+
+        # ── Timing-reference compatibility warning (Sprint 1B) ──
+        # Persistent, not a transient status-bar message or a Python
+        # warnings.warn() -- stays visible for as long as the underlying
+        # condition exists. Hidden by default; refresh_timing_assessment()
+        # shows it only when the session's active sources' timing
+        # references require review.
+        self._timing_banner = QFrame()
+        self._timing_banner.setFrameShape(QFrame.Shape.StyledPanel)
+        self._timing_banner.setStyleSheet(
+            "QFrame { background: #4a3b1a; border: 1px solid #b06000; border-radius: 4px; }"
+        )
+        timing_banner_layout = QHBoxLayout(self._timing_banner)
+        timing_banner_layout.setContentsMargins(8, 4, 8, 4)
+        self._timing_banner_label = QLabel("")
+        self._timing_banner_label.setWordWrap(True)
+        self._timing_banner_label.setStyleSheet("color: #FFD27F; font-size: 11px;")
+        timing_banner_layout.addWidget(self._timing_banner_label, stretch=1)
+        self._timing_details_btn = QPushButton("Details")
+        self._timing_details_btn.setToolTip(
+            "Show each source's timing reference, current session offsets, "
+            "and why this warning appeared"
+        )
+        self._timing_details_btn.clicked.connect(self._on_timing_details_clicked)
+        timing_banner_layout.addWidget(self._timing_details_btn)
+        self._timing_banner.setVisible(False)
+        outer.addWidget(self._timing_banner)
 
         # ── Scroll area containing source rows ──
         self._sources_widget = QWidget()
@@ -389,6 +441,12 @@ class SessionPanel(QDockWidget):
         row.remove_requested.connect(self.source_remove_requested)
         row.active_changed.connect(self.source_active_changed)
         row.set_as_reference_requested.connect(self.set_as_reference_requested)
+
+    def _on_timing_details_clicked(self) -> None:
+        if self._timing_assessment is None:
+            return
+        dlg = TimingDetailsDialog(self._timing_assessment, parent=self)
+        dlg.exec()
 
     def _on_clear_session(self) -> None:
         source_ids = list(self._source_rows.keys())
