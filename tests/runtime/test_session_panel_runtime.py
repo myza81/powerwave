@@ -22,6 +22,7 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -252,7 +253,13 @@ def test_clear_button_removes_all_rows(runtime_qapp) -> None:
     runtime_qapp.processEvents()
 
     assert len(panel._source_rows) == 3
-    panel._clear_btn.click()
+    # Sprint 1D: Clear Session now confirms first -- simulate the user
+    # confirming so this test keeps exercising the clear itself.
+    with patch(
+        "app.ui.session.session_panel.confirm_destructive_action",
+        return_value=True,
+    ):
+        panel._clear_btn.click()
     runtime_qapp.processEvents()
 
     assert len(panel._source_rows) == 0

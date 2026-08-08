@@ -272,6 +272,15 @@ class EventAnalysisSession:
     def list_sources(self) -> list[SessionSource]:
         return list(self._sources.values())
 
+    def has_meaningful_work(self) -> bool:
+        """True if this session has anything a user would not want to lose
+        silently -- at least one loaded source or one calculated signal
+        (Sprint 1D: the minimum generic rule for whether a destructive
+        session action, e.g. Clear Session or starting a new session,
+        needs a confirmation prompt).
+        """
+        return bool(self._sources or self._calc_signals)
+
     def set_source_active(self, source_id: str, active: bool) -> None:
         """Set a source's active/inactive state.
 

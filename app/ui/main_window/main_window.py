@@ -45,6 +45,7 @@ from app.visualization.axis.datetime_axis import TimeDisplayMode
 from app.visualization.managers.synchronization_manager import SynchronizationManager
 from app.visualization.overlays.overlay_colors import sequence_curve_label
 from app.visualization.performance import timed_section
+from app.ui.dialogs import confirm_destructive_action
 from app.ui.import_wizard import ImportWizardWidget
 from app.ui.session import SessionCanvasController, SessionPanel
 from app.ui.widgets.measurement_panel import MeasurementPanel
@@ -1190,6 +1191,24 @@ class PowerwaveMainWindow(QMainWindow):
     # File loading (standard path)
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _confirm_replace_active_session(self) -> bool:
+        """Sprint 1D: gate any workflow that is about to discard the active
+        session (File > Open, "New Session") behind a confirmation, but
+        only when that session actually has something to lose. Returns
+        True immediately (no prompt) for an empty/absent session.
+        """
+        if self._active_session is None or not self._active_session.has_meaningful_work():
+            return True
+        return confirm_destructive_action(
+            self,
+            title="Start a new session?",
+            message=(
+                "The current session contains loaded sources or calculated work.\n\n"
+                "Continuing will discard the current in-memory session.\n\n"
+                "This action cannot be undone."
+            ),
+        )
+
     def _open_unified_file(self) -> None:
         """S9 unified entry point: open any file directly into a fresh session canvas.
 
@@ -1197,6 +1216,8 @@ class PowerwaveMainWindow(QMainWindow):
         which handles the file dialog, Import Wizard auto-fire for CSV/Excel, and
         session canvas activation. The user never needs to know about separate code paths.
         """
+        if not self._confirm_replace_active_session():
+            return
         self._on_new_session()
         self._on_add_to_session()
 
@@ -1675,6 +1696,8 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _on_open_session(self) -> None:
         """Start a fresh session workspace. User adds sources via the Session Panel."""
+        if not self._confirm_replace_active_session():
+            return
         self._on_new_session()
 
     def _on_new_session(self) -> None:
@@ -2050,6 +2073,26 @@ class PowerwaveMainWindow(QMainWindow):
     def _on_session_remove_source(self, source_id: str) -> None:
         if self._active_session is None:
             return
+        source = self._active_session.get_source(source_id)
+        if source is None:
+            return
+        dependents = self._active_session.get_calculated_dependents_for_source(source_id)
+        if dependents:
+            message = (
+                f'"{source.display_name}" will be removed from the current session.\n\n'
+                "Any calculated signals that depend on this source will become "
+                "stale or unavailable.\n\n"
+                "This action cannot be undone."
+            )
+        else:
+            message = (
+                f'"{source.display_name}" will be removed from the current session.\n\n'
+                "This action cannot be undone."
+            )
+        if not confirm_destructive_action(
+            self, title="Remove source?", message=message
+        ):
+            return
         self._active_session.remove_source(source_id)
         if self._session_panel is not None:
             self._session_panel.remove_source_row(source_id)
@@ -2349,6 +2392,18 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _on_calc_signal_delete(self, calc_id: str) -> None:
         if self._active_session is None:
+            return
+        definition = self._active_session.get_calculated_signal_definition(calc_id)
+        if definition is None:
+            return
+        message = (
+            f'"{definition.name}" and its current result will be removed.\n\n'
+            "The original source channels will not be affected.\n\n"
+            "This action cannot be undone."
+        )
+        if not confirm_destructive_action(
+            self, title="Delete calculated signal?", message=message
+        ):
             return
         if self._session_canvas_controller is not None:
             self._session_canvas_controller.remove_calculated_signal_curve(calc_id)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -255,7 +256,13 @@ class TestMainWindowRefreshWiring:
             win._activate_session_canvas()
             assert not win._session_panel._timing_banner.isHidden()
 
-            win._on_session_remove_source(sid_b)
+            # Sprint 1D: Remove Source now confirms first -- simulate the
+            # user confirming so this test keeps exercising the removal.
+            with patch(
+                "app.ui.main_window.main_window.confirm_destructive_action",
+                return_value=True,
+            ):
+                win._on_session_remove_source(sid_b)
             qapp.processEvents()
             assert win._session_panel._timing_banner.isHidden()
         finally:

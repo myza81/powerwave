@@ -49,6 +49,7 @@ from app.sessions.timing_compatibility import (
     TimingCompatibilityLevel,
     assess_session_timing_compatibility,
 )
+from app.ui.dialogs import confirm_destructive_action
 from app.ui.session.calculated_signal_row_widget import CalculatedSignalRowWidget
 from app.ui.session.source_row_widget import SourceRowWidget
 from app.ui.session.timing_details_dialog import TimingDetailsDialog
@@ -449,8 +450,26 @@ class SessionPanel(QDockWidget):
         dlg.exec()
 
     def _on_clear_session(self) -> None:
+        if self._source_rows or self._calc_rows:
+            if not confirm_destructive_action(
+                self,
+                title="Clear current session?",
+                message=(
+                    "All loaded sources, alignment settings, calculated "
+                    "signals, and layout changes in this session will be "
+                    "removed.\n\n"
+                    "This action cannot be undone."
+                ),
+            ):
+                return
         source_ids = list(self._source_rows.keys())
         for sid in source_ids:
             self.remove_source_row(sid)
+        for calc_id in list(self._calc_rows.keys()):
+            row = self._calc_rows.pop(calc_id)
+            self._calc_signals_layout.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+        self._calc_signals_group.setVisible(False)
         self._expansion_state.clear()
         self.session_cleared.emit()

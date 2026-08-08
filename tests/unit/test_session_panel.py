@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -394,7 +394,14 @@ def test_session_cleared_signal(qapp) -> None:
     emitted: list[int] = []
     panel.session_cleared.connect(lambda: emitted.append(1))
 
-    panel._clear_btn.click()
+    # Sprint 1D: Clear Session now confirms first when the panel has
+    # meaningful work (a populated source row here) -- simulate the user
+    # confirming so this test keeps exercising the clear itself.
+    with patch(
+        "app.ui.session.session_panel.confirm_destructive_action",
+        return_value=True,
+    ):
+        panel._clear_btn.click()
 
     assert len(emitted) == 1
     assert len(panel._source_rows) == 0
