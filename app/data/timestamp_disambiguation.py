@@ -143,6 +143,22 @@ def detect_date_order_ambiguity(
     )
 
 
+def format_ambiguous_date_example(sample_value: str) -> str | None:
+    """Render a human-readable day-first interpretation of *sample_value*
+    for UI display, e.g. ``"3/6/2026" -> "3/6/2026 -> 3 June 2026"``.
+
+    Purely a diagnostic rendering of the day-first default already applied
+    by ``parse_ambiguous_dates``/``resolve_component_order`` -- it never
+    drives a parsing decision. Returns None if *sample_value* cannot be
+    parsed (should not normally happen for a sample already identified as
+    an ambiguous date by ``detect_date_order_ambiguity``).
+    """
+    parsed = pd.to_datetime(sample_value, dayfirst=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return f"{sample_value} → {parsed.day} {parsed.strftime('%B %Y')}"
+
+
 def parse_ambiguous_dates(
     series: pd.Series,
     *,

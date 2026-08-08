@@ -14,6 +14,7 @@ from app.data.timestamp_disambiguation import (
     AmbiguousDateDiagnostic,
     DateOrderResult,
     detect_date_order_ambiguity,
+    format_ambiguous_date_example,
     parse_ambiguous_dates,
     resolve_component_order,
 )
@@ -161,3 +162,24 @@ class TestParseAmbiguousDates:
         s = pd.Series(["not a date"])
         parsed, _diag = parse_ambiguous_dates(s)
         assert pd.isna(parsed.iloc[0])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# format_ambiguous_date_example — Sprint 1E UI display helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestFormatAmbiguousDateExample:
+    def test_day_first_reading_of_ambiguous_sample(self):
+        assert format_ambiguous_date_example("3/6/2026") == "3/6/2026 → 3 June 2026"
+
+    def test_includes_original_sample_verbatim(self):
+        example = format_ambiguous_date_example("12/11/2026")
+        assert example.startswith("12/11/2026 →")
+
+    def test_sample_with_time_component(self):
+        example = format_ambiguous_date_example("3/6/2026 17:25")
+        assert example == "3/6/2026 17:25 → 3 June 2026"
+
+    def test_unparseable_sample_returns_none(self):
+        assert format_ambiguous_date_example("not a date") is None

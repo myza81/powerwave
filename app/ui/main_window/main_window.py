@@ -2065,6 +2065,36 @@ class PowerwaveMainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Session: {n} source(s) loaded — {display_name} added."
         )
+        self._notify_if_ambiguous_timestamp(display_name, record)
+
+    def _notify_if_ambiguous_timestamp(self, display_name: str, record) -> None:
+        """Sprint 1E: a source loaded directly through a provider (not the
+        Import Wizard, which shows its own ambiguity banner mid-workflow --
+        see TimestampSelectPage) may have had its date column resolved
+        using Powerwave's DD/MM/YYYY ambiguous-date default. Surface that
+        once, right after load, since a direct load has no other timestamp
+        review step. Never fires for Wizard-produced records: the Import
+        Wizard's own RecordingMetadata construction does not set this
+        field, so this check is a no-op for that path by construction.
+        """
+        sample = getattr(record.metadata, "timestamp_ambiguity_sample", None)
+        if not sample:
+            return
+        from app.data.timestamp_disambiguation import format_ambiguous_date_example
+
+        example = format_ambiguous_date_example(sample)
+        example_line = f"\n\nExample:\n{example}" if example else ""
+        QMessageBox.information(
+            self,
+            "Ambiguous date format detected",
+            (
+                f'"{display_name}" was interpreted using DD/MM/YYYY by default.'
+                f"{example_line}\n\n"
+                "If this source uses a different date order, reopen the file "
+                "through the Import Wizard's Timestamp Settings or Advanced "
+                "Timestamp Repair to review or override the interpretation."
+            ),
+        )
 
     def _on_session_add_source_requested(self) -> None:
         """Handle 'Add Source' button inside the session panel."""

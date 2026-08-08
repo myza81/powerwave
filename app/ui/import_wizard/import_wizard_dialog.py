@@ -395,6 +395,7 @@ class ImportWizardWidget(QWidget):
         self.timestamp_model.set_candidates([])
         self.column_model.set_mappings([])
         self.timestamp_page.override_edit.clear()
+        self.timestamp_page.set_ambiguity_notice(None)
         self._reset_reconstruction_ui()
         self.complete_page.set_result(None)
         self.review_page.refresh(None, None)
@@ -985,6 +986,7 @@ class ImportWizardWidget(QWidget):
         mode = self.timestamp_page.selected_time_axis_mode()
         if mode == "sample_index":
             self.timestamp_page.set_candidate_details(None, None, "Using sample index axis from row order. No time metadata is required.")
+            self.timestamp_page.set_ambiguity_notice(None)
             return
         if mode == "synthetic_elapsed":
             value = self.timestamp_page.synthetic_timing_value()
@@ -993,9 +995,11 @@ class ImportWizardWidget(QWidget):
             else:
                 basis = "sample rate" if self.timestamp_page.synthetic_timing_basis() == "sample_rate" else "sample interval"
                 self.timestamp_page.set_candidate_details(None, None, f"Using synthetic elapsed time from {basis}: {value:g}.")
+            self.timestamp_page.set_ambiguity_notice(None)
             return
         if candidate is None:
             self.timestamp_page.set_candidate_details(None, None, "No timestamp candidate detected.")
+            self.timestamp_page.set_ambiguity_notice(None)
             return
 
         manual_format = self.timestamp_page.override_edit.text().strip()
@@ -1006,6 +1010,11 @@ class ImportWizardWidget(QWidget):
                 affected_column=candidate.column_name,
             )
             message = validation.validation_messages[0].message if validation.validation_messages else ""
+            # Sprint 1E / Step 8: a user-supplied format is authoritative --
+            # the automatic DD/MM/YYYY default no longer applies, so the
+            # ambiguity banner (which only ever describes that default)
+            # must not linger from a previous auto-detected selection.
+            self.timestamp_page.set_ambiguity_notice(None)
         else:
             if candidate.detected_format in {
                 "elapsed_seconds",
@@ -1013,16 +1022,50 @@ class ImportWizardWidget(QWidget):
                 "elapsed_minutes",
             }:
                 message = "Using detected relative elapsed-time axis."
+                self.timestamp_page.set_ambiguity_notice(None)
             else:
                 message = (
                     "Manual override is empty; using detected format."
                     if candidate.detected_format
                     else "Manual override is empty; using automatic timestamp parsing."
                 )
+                self.timestamp_page.set_ambiguity_notice(
+                    self._build_ambiguity_notice(candidate)
+                )
         self.timestamp_page.set_candidate_details(
             candidate.column_name,
             candidate.detected_format,
             message,
+        )
+
+    def _build_ambiguity_notice(self, candidate) -> str | None:
+        """Sprint 1E: banner text for TimestampSelectPage when *candidate*'s
+        sampled values contain a genuinely ambiguous date order (e.g.
+        "3/6/2026") and Powerwave's DD/MM/YYYY default therefore applies.
+        Reuses the existing timestamp-disambiguation detector -- does not
+        duplicate or alter its ambiguity rules. Returns None when not
+        ambiguous.
+        """
+        from app.data.timestamp_disambiguation import (
+            detect_date_order_ambiguity,
+            format_ambiguous_date_example,
+        )
+
+        ambiguity = detect_date_order_ambiguity(candidate.example_values)
+        if not ambiguity.is_ambiguous:
+            return None
+        example = (
+            format_ambiguous_date_example(ambiguity.sample_value)
+            if ambiguity.sample_value
+            else None
+        )
+        example_line = f"\n\nExample:\n{example}" if example else ""
+        return (
+            "Ambiguous date format detected\n\n"
+            "Powerwave interpreted this source using DD/MM/YYYY by default."
+            f"{example_line}\n\n"
+            "Review the timestamp settings above, or use Advanced Timestamp "
+            "Repair, if this source uses a different date order."
         )
 
     def _sync_execution_plan(self) -> PlanBuildResult | None:

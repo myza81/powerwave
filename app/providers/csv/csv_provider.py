@@ -143,17 +143,20 @@ def _build_time_array(
     df: pd.DataFrame,
     time_col: str | None,
     path: Path,
-) -> tuple[np.ndarray, datetime, float]:
+) -> tuple[np.ndarray, datetime, float, str | None]:
     """Build the time array (seconds from start), start_time, and sample rate.
 
     Returns:
-        time_array:  float64 ndarray, seconds elapsed from first sample
-        start_time:  tz-naive datetime for TimingInformation
-        sample_rate: Hz, 0.0 when not determinable
+        time_array:        float64 ndarray, seconds elapsed from first sample
+        start_time:        tz-naive datetime for TimingInformation
+        sample_rate:        Hz, 0.0 when not determinable
+        ambiguity_sample:  a raw date string that triggered the DD/MM/YYYY
+                            default (Sprint 1E diagnostic), or None when the
+                            column had no genuinely ambiguous date order
     """
     if time_col is None:
         n = len(df)
-        return np.arange(n, dtype=np.float64), _EPOCH_FALLBACK, 0.0
+        return np.arange(n, dtype=np.float64), _EPOCH_FALLBACK, 0.0, None
 
     col: pd.Series = df[time_col]
 
@@ -164,7 +167,9 @@ def _build_time_array(
             # unambiguous values are parsed correctly regardless. CsvProvider has
             # no user-override mechanism, so this is always the automatic default.
             dt_series, ambiguity = parse_ambiguous_dates(col)  # type: ignore[assignment]
+            ambiguity_sample = None
             if ambiguity.is_ambiguous:
+                ambiguity_sample = ambiguity.sample_value
                 warnings.warn(
                     f"Column '{time_col}' in '{path}' contains an ambiguous date "
                     f"(e.g. '{ambiguity.sample_value}'); Powerwave assumed "
@@ -175,7 +180,7 @@ def _build_time_array(
                 dtype=np.float64
             )
             start_time = t0_stamp.to_pydatetime().replace(tzinfo=None)
-            return time_array, start_time, _estimate_rate(time_array)
+            return time_array, start_time, _estimate_rate(time_array), ambiguity_sample
         except Exception:
             pass  # fall through to numeric handling
 
@@ -188,7 +193,7 @@ def _build_time_array(
         ) from exc
 
     time_array = num_series.to_numpy(dtype=np.float64)
-    return time_array, _EPOCH_FALLBACK, _estimate_rate(time_array)
+    return time_array, _EPOCH_FALLBACK, _estimate_rate(time_array), None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -255,7 +260,9 @@ class CsvProvider(BaseProvider):
 
         if time_col is not None:
             try:
-                time_array, start_time, sample_rate = _build_time_array(df, time_col, path)
+                time_array, start_time, sample_rate, ambiguity_sample = _build_time_array(
+                    df, time_col, path
+                )
             except ProviderLoadError:
                 raise
             except Exception as exc:
@@ -263,7 +270,9 @@ class CsvProvider(BaseProvider):
                     f"Failed to build time array from '{path}': {exc}"
                 ) from exc
         else:
-            time_array, start_time, sample_rate = _build_time_array(df, None, path)
+            time_array, start_time, sample_rate, ambiguity_sample = _build_time_array(
+                df, None, path
+            )
 
         waveform_cols = [c for c in df.columns if c != time_col]
 
@@ -354,6 +363,7 @@ class CsvProvider(BaseProvider):
                 source_file=str(path),
                 provider_type="csv",
                 nominal_frequency=50.0,
+                timestamp_ambiguity_sample=ambiguity_sample,
             ),
             waveform_data=waveform_data,
             analog_channels=analog_channels,

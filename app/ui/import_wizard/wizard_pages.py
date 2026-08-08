@@ -270,6 +270,27 @@ class TimestampSelectPage(QWidget):
         override_layout.addWidget(details)
         layout.addWidget(self.override_group)
 
+        # ── Ambiguous date notice (Sprint 1E) ──────────────────────────────
+        # Persistent, always-visible (never collapsed) banner shown whenever
+        # the detected column has a genuinely ambiguous date order (e.g.
+        # "3/6/2026") and no manual format override is in effect -- see
+        # set_ambiguity_notice(). Sits directly below the detected-format
+        # details and above Advanced Timestamp Repair, so the override route
+        # is immediately visible alongside the notice.
+        self.ambiguity_banner = QFrame()
+        self.ambiguity_banner.setFrameShape(QFrame.Shape.StyledPanel)
+        self.ambiguity_banner.setStyleSheet(
+            "QFrame { background: #4a3b1a; border: 1px solid #b06000; border-radius: 4px; }"
+        )
+        ambiguity_layout = QVBoxLayout(self.ambiguity_banner)
+        ambiguity_layout.setContentsMargins(10, 8, 10, 8)
+        self.ambiguity_banner_label = QLabel("")
+        self.ambiguity_banner_label.setWordWrap(True)
+        self.ambiguity_banner_label.setStyleSheet("color: #FFD27F; font-size: 11px;")
+        ambiguity_layout.addWidget(self.ambiguity_banner_label)
+        self.ambiguity_banner.setVisible(False)
+        layout.addWidget(self.ambiguity_banner)
+
         # ── Timestamp Reconstruction ──────────────────────────────────────
         self._recon_group = QGroupBox("Advanced Timestamp Repair")
         recon_root_layout = QVBoxLayout(self._recon_group)
@@ -474,6 +495,17 @@ class TimestampSelectPage(QWidget):
         self._refresh_time_axis_details(column_name, detected_format)
         if feedback:
             self.message_label.setText(feedback)
+
+    def set_ambiguity_notice(self, message: str | None) -> None:
+        """Show/hide the persistent ambiguous-date banner (Sprint 1E).
+
+        Pass None to hide it -- e.g. when the column isn't ambiguous, or a
+        manual format override makes the automatic DD/MM/YYYY default no
+        longer apply.
+        """
+        if message:
+            self.ambiguity_banner_label.setText(message)
+        self.ambiguity_banner.setVisible(bool(message))
 
     def selected_time_axis_mode(self) -> str:
         return str(self.time_axis_mode_combo.currentData() or "auto")

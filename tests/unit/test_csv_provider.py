@@ -471,6 +471,57 @@ class TestAmbiguousDateOrder:
         assert "ambiguous date" not in text.lower()
 
 
+class TestAmbiguousDateMetadata:
+    """Sprint 1E: the ambiguity sample must be preserved on the returned
+    record's metadata so the UI can surface it -- not just warnings.warn(),
+    which the GUI never sees."""
+
+    def test_ambiguous_date_sets_metadata_sample(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            3/6/2026 17:25,1.0
+            3/6/2026 17:26,1.1
+        """)
+        record = CsvProvider().load(p)
+        assert record.metadata.timestamp_ambiguity_sample == "3/6/2026 17:25"
+
+    def test_unambiguous_day_over_twelve_no_metadata_sample(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            13/6/2026 17:25,1.0
+            13/6/2026 17:26,1.1
+        """)
+        record = CsvProvider().load(p)
+        assert record.metadata.timestamp_ambiguity_sample is None
+
+    def test_unambiguous_month_first_no_metadata_sample(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            6/13/2026 17:25,1.0
+            6/13/2026 17:26,1.1
+        """)
+        record = CsvProvider().load(p)
+        assert record.metadata.timestamp_ambiguity_sample is None
+
+    def test_iso_timestamp_no_metadata_sample(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            time,VA
+            2026-06-03 17:25:00,1.0
+            2026-06-03 17:25:01,1.1
+        """)
+        record = CsvProvider().load(p)
+        assert record.metadata.timestamp_ambiguity_sample is None
+
+    def test_no_time_column_no_metadata_sample(self, tmp_path: Path) -> None:
+        p = _write_csv(tmp_path, "test.csv", """\
+            VA,VB
+            1.0,2.0
+            1.1,2.1
+        """)
+        record = CsvProvider().load(p)
+        assert record.metadata.timestamp_ambiguity_sample is None
+
+
 # ---------------------------------------------------------------------------
 # load() — no time column
 # ---------------------------------------------------------------------------
