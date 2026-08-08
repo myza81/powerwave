@@ -20,7 +20,7 @@ Colour strategy (Phase 9E)
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -34,6 +34,7 @@ from app.analytics.phasors.phasor_models import PhasorConfig, PhasorDisplayMode
 from app.analytics.rms.rms_models import RMSConfig, RMSDisplayMode
 from app.analytics.scaling.scaling_models import EngineeringScalingMode
 from app.analytics.scaling.scaling_registry import ScalingRegistry
+from app.calculated_signals.models import CalculationStatus
 from app.visualization.widgets.session_canvas import SessionCanvasWidget
 from app.ui.session.legend_widget import generate_source_variant_colour
 from app.visualization.axis_management import AxisDisplayMode, axis_group_for_signal
@@ -101,6 +102,34 @@ def _session_time_display_mode(session) -> TimeDisplayMode:
     return TimeDisplayMode.ABSOLUTE
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Calculated signal canvas identity (Phase 3B)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# SessionCanvasWidget keys every curve by a (source_id, channel_name) tuple.
+# A calculated signal is never a SessionSource, so it has no real source_id
+# -- but it still needs a curve key. Real source_ids are always bare
+# str(uuid.uuid4()) values (EventAnalysisSession.add_source), which can
+# never contain a ':' character, so prefixing calc_id with "calc:" is
+# structurally guaranteed to never collide with a real source_id, for any
+# calc_id. calc_id (never the user-editable display name) is the
+# permanent, stable component of this key; the display name is only the
+# tuple's second element, exactly as a real channel_name is -- so a future
+# rename only needs to remove the old curve and repaint under the new key,
+# the same way any channel display-name-driven curve identity would.
+
+_CALC_SOURCE_PREFIX = "calc:"
+
+
+def _calc_curve_key(calc_id: str, definition_name: str) -> tuple[str, str]:
+    """Return the SessionCanvasWidget curve key for one calculated signal."""
+    return (_CALC_SOURCE_PREFIX + calc_id, definition_name)
+
+
+def _is_calc_curve_key(key: tuple[str, str]) -> bool:
+    return key[0].startswith(_CALC_SOURCE_PREFIX)
+
+
 _RIGHT_AXIS_TYPES = frozenset({"current", "mw", "mvar", "frequency"})
 _RIGHT_AXIS_KEYWORDS = frozenset({"_i", "ia", "ib", "ic", "in_", "3i0", "current", "mw", "mvar", "kw", "kvar"})
 _FREQ_KEYWORDS = frozenset({"freq", "hz", "rocof", "df_dt"})
@@ -157,6 +186,10 @@ class SessionCanvasController:
         self._navigator = None                           # WaveformNavigatorStrip | None
         self._channel_panel_changed_cb: object = None   # callable(source_id, ch_name, panel_id)
         self._layout_rebuilt_callback: object = None
+        # Phase 3B: calculated-signal curves, tracked separately from real
+        # (source_id, channel_name) curves -- see _calc_curve_key().
+        self._calc_curve_keys: dict[str, tuple[str, str]] = {}   # calc_id -> curve key
+        self._calc_panel_by_id: dict[str, str] = {}              # calc_id -> panel_id
 
     def set_layout_rebuilt_callback(self, callback) -> None:
         """Notify the owner when panel merge/split produces a new splitter."""
@@ -247,10 +280,13 @@ class SessionCanvasController:
             panel = panels.get(panel_id)
             if panel is None:
                 continue
-            # Remove curves that are no longer assigned to this panel
+            # Remove curves that are no longer assigned to this panel.
+            # Calculated-signal curves are never in panel.channel_refs (see
+            # module docstring on _calc_curve_key) -- refresh_calculated_signals()
+            # owns their lifecycle, so this sweep must not remove them.
             expected = {(sid, cname) for sid, cname in panel.channel_refs}
             for key in list(canvas._curves.keys()):
-                if key not in expected:
+                if key not in expected and not _is_calc_curve_key(key):
                     canvas.remove_curve(key[0], key[1])
             self._paint_panel(
                 canvas, panel, session, all_channels, active_sids,
@@ -285,6 +321,112 @@ class SessionCanvasController:
         )
         canvas.set_canvas_theme(self._canvas_theme)
         self._refresh_zero_lines(session)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Calculated signals (Phase 3B)
+    # ─────────────────────────────────────────────────────────────────────────
+    #
+    # A small parallel path to refresh_all()/_paint_panel(): calculated
+    # signals are session-owned derived curves, never a SessionSource or
+    # DisturbanceRecord, so they never go through
+    # EventAnalysisSession.build_aligned_data() (which clips/decimates for
+    # display and requires a real source). Each CalculatedSignalResult is
+    # already the correct, complete, aligned array at its own reference time
+    # base -- result.time/result.values are painted directly.
+
+    def refresh_calculated_signals(self, session, calc_ids: "Iterable[str] | None" = None) -> None:
+        """Paint/update/remove calculated-signal curves.
+
+        calc_ids=None (default) syncs every calculated signal in the
+        session -- new ones are painted, existing ones are updated in
+        place (no duplicate curve creation, see SessionCanvasWidget.
+        update_curve()'s key-reuse), and ones that were deleted or no
+        longer have a usable result are removed. Passing an explicit
+        calc_ids restricts the sync to just those signals (e.g. after
+        resolve_for_source() recalculates only the signals depending on one
+        source) -- other calculated signals' curves are left untouched, so
+        this never rebuilds every original source curve or every other
+        calculated signal.
+
+        OK and STALE results both render (a stale result's last-known-good
+        arrays remain visible, labelled "(stale)"); ERROR results and
+        never-calculated entries (result is None) are removed rather than
+        fabricating placeholder data.
+        """
+        self._session_ref = session
+        entries = session.list_calculated_signals()
+        if calc_ids is not None:
+            wanted = set(calc_ids)
+            entries = [e for e in entries if e.definition.calc_id in wanted]
+
+        live_ids: set[str] = set()
+        for entry in entries:
+            calc_id = entry.definition.calc_id
+            result = entry.result
+            if result is None or result.status == CalculationStatus.ERROR:
+                self.remove_calculated_signal_curve(calc_id)
+                continue
+
+            placement = session.ensure_calculated_signal_panel(calc_id)
+            if placement is None:
+                continue
+            panel_id, _created = placement
+            canvas = self._canvases.get(panel_id)
+            if canvas is None:
+                # Panel exists in the session but no SessionCanvasWidget has
+                # been built for it yet -- the caller must call
+                # rebuild_layout() first when a brand-new panel is needed
+                # (see EventAnalysisSession.ensure_calculated_signal_panel's
+                # `created` flag).
+                continue
+
+            live_ids.add(calc_id)
+            key = _calc_curve_key(calc_id, entry.definition.name)
+            old_key = self._calc_curve_keys.get(calc_id)
+            old_panel_id = self._calc_panel_by_id.get(calc_id)
+            if old_key is not None and (old_key != key or old_panel_id != panel_id):
+                old_canvas = self._canvases.get(old_panel_id) if old_panel_id else None
+                if old_canvas is not None:
+                    old_canvas.remove_curve(old_key[0], old_key[1])
+
+            display_name = f"ƒ {entry.definition.name}"
+            if result.status == CalculationStatus.STALE:
+                display_name += " (stale)"
+
+            canvas.update_curve(
+                key[0], key[1], result.time, result.values,
+                color=self._auto_colour(key[0], key[1]),
+                visible=getattr(entry, "is_visible", True),
+                display_name=display_name,
+                source_badge="calc",
+                unit=result.unit,
+                line_style="solid",
+                line_width=1.5,
+                y_axis_side="left",
+                signal_type=None,
+            )
+            self._calc_curve_keys[calc_id] = key
+            self._calc_panel_by_id[calc_id] = panel_id
+
+        if calc_ids is None:
+            # Full sync: anything no longer present/usable gets removed.
+            for calc_id in set(self._calc_curve_keys) - live_ids:
+                self.remove_calculated_signal_curve(calc_id)
+
+    def remove_calculated_signal_curve(self, calc_id: str) -> None:
+        """Remove one calculated signal's curve from canvas, if present.
+
+        Does not touch the session -- callers that also want to delete the
+        definition/result call EventAnalysisSession.remove_calculated_signal()
+        separately (see Phase 3B deletion flow).
+        """
+        key = self._calc_curve_keys.pop(calc_id, None)
+        panel_id = self._calc_panel_by_id.pop(calc_id, None)
+        if key is None or panel_id is None:
+            return
+        canvas = self._canvases.get(panel_id)
+        if canvas is not None:
+            canvas.remove_curve(key[0], key[1])
 
     # ─────────────────────────────────────────────────────────────────────────
     # Incremental updates
@@ -1152,6 +1294,34 @@ class SessionCanvasController:
                     time_arr = aligned.time
             except Exception:  # noqa: BLE001
                 pass
+
+        # Calculated signals painted into this panel (Phase 3B): sourced
+        # directly from each result's own materialized arrays, never
+        # recalculated and never routed through build_aligned_data(). A
+        # calculated signal's full-resolution result generally has a
+        # different sample count than a real channel's decimated display
+        # grid -- compute_measurements() already skips any channel whose
+        # array length does not match `time_arr`, so this only contributes
+        # a calculated signal when it can share a common time base with
+        # whatever else is in this panel (trivially true for a panel that
+        # contains only calculated signals, which becomes the first, and
+        # therefore defining, time_arr).
+        for calc_id, panel_id in self._calc_panel_by_id.items():
+            if panel_id != canvas.panel_id:
+                continue
+            entry = session.get_calculated_signal(calc_id)
+            if entry is None or entry.result is None:
+                continue
+            if entry.result.status == CalculationStatus.ERROR:
+                continue
+            if not getattr(entry, "is_visible", True):
+                continue
+            label = f"ƒ {entry.definition.name}"
+            if entry.result.status == CalculationStatus.STALE:
+                label += " (stale)"
+            if time_arr is None:
+                time_arr = entry.result.time
+            data_by_channel[label] = (entry.result.values, entry.result.unit or "")
 
         if time_arr is None or len(data_by_channel) == 0:
             return None

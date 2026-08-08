@@ -1402,10 +1402,11 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _on_calculated_signals(self) -> None:
         """Open the Calculated Signals creation/preview dialog for the
-        active session (Phase 3A). Does not render anything on the
-        session canvas -- a created signal exists only in the session's
-        own definition/result store until a later phase adds canvas
-        rendering.
+        active session. On successful creation, the new signal is synced
+        onto the session canvas (Phase 3B) -- the dialog itself never
+        renders anything; it only creates and resolves the definition in
+        the session (Phase 3A), and this handler wires that completion
+        back to the canvas/session panel.
         """
         from PyQt6.QtWidgets import QDialog, QMessageBox
         from app.ui.calculated_signals import CalculatedSignalDialog
@@ -1422,6 +1423,7 @@ class PowerwaveMainWindow(QMainWindow):
         dlg = CalculatedSignalDialog(self._active_session, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.statusBar().showMessage("Calculated signal created.")
+            self._sync_calculated_signals_to_canvas()
 
     def _on_frequency_display_mode_changed(self, mode: FrequencyDisplayMode) -> None:
         """Apply a new frequency/ROCOF panel visibility mode."""
@@ -1558,6 +1560,7 @@ class PowerwaveMainWindow(QMainWindow):
         panel.source_add_requested.connect(self._on_session_add_source_requested)
         panel.source_remove_requested.connect(self._on_session_remove_source)
         panel.offset_changed.connect(self._on_session_offset_changed)
+        panel.offset_edit_finished.connect(self._on_session_offset_edit_finished)
         panel.offset_reset_requested.connect(self._on_session_offset_reset)
         panel.auto_align_requested.connect(self._on_session_auto_align)
         panel.channel_visibility_changed.connect(
@@ -1571,6 +1574,18 @@ class PowerwaveMainWindow(QMainWindow):
         panel.session_cleared.connect(self._on_session_cleared)
         panel.source_active_changed.connect(self._on_session_source_active)
         panel.set_as_reference_requested.connect(self._on_session_set_as_reference)
+        panel.calculated_signal_visibility_changed.connect(
+            self._on_calc_signal_visibility_changed
+        )
+        panel.calculated_signal_recalculate_requested.connect(
+            self._on_calc_signal_recalculate
+        )
+        panel.calculated_signal_recalculate_all_requested.connect(
+            self._on_calc_signal_recalculate_all
+        )
+        panel.calculated_signal_delete_requested.connect(
+            self._on_calc_signal_delete
+        )
 
     def _on_toggle_session_panel(self, checked: bool) -> None:
         panel = self._ensure_session_panel()
@@ -2016,6 +2031,12 @@ class PowerwaveMainWindow(QMainWindow):
         panel = self._ensure_session_panel()
         panel.refresh_all(self._active_session)
         self._activate_session_canvas()
+        # default_layout() rebuilds real-channel panels from scratch and can
+        # transiently drop a panel that only existed for a calculated
+        # signal (e.g. a Power panel created solely by a calc result, with
+        # no real Power channel) -- resync so any existing calculated
+        # signals get their panel and curve back immediately.
+        self._sync_calculated_signals_to_canvas()
         n = len(self._active_session.list_sources())
         self.statusBar().showMessage(
             f"Session: {n} source(s) loaded — {display_name} added."
@@ -2046,6 +2067,24 @@ class PowerwaveMainWindow(QMainWindow):
             self._session_canvas_controller.on_offset_changed(
                 source_id, offset_s, self._active_session
             )
+        # Calculated signals depending on source_id are marked STALE by
+        # set_time_offset() itself (Phase 2C-2) -- repaint their (now-stale)
+        # curves so the "(stale)" label appears immediately. This is display
+        # only: no recalculation happens on every tick, see
+        # _on_session_offset_edit_finished for the committed-edit trigger.
+        self._sync_calculated_signals_to_canvas(
+            list(self._active_session.get_calculated_dependents_for_source(source_id))
+        )
+
+    def _on_session_offset_edit_finished(self, source_id: str) -> None:
+        """Offset spinbox editing committed (focus lost / Enter) -- unlike
+        _on_session_offset_changed (every valueChanged tick), this fires
+        once per edit and is the appropriate place to recalculate
+        dependent calculated signals.
+        """
+        if self._active_session is None:
+            return
+        self._recalculate_calculated_signals_for_source(source_id)
 
     def _on_session_offset_reset(self, source_id: str) -> None:
         if self._active_session is None:
@@ -2058,6 +2097,9 @@ class PowerwaveMainWindow(QMainWindow):
                 source_id, 0.0, self._active_session
             )
         self.statusBar().showMessage(f"Offset reset to 0.000 s for {source_id}.")
+        # Reset is a single committed action (button click), not a
+        # continuous edit -- recalculate immediately, same as editingFinished.
+        self._recalculate_calculated_signals_for_source(source_id)
 
     def _on_session_set_as_reference(self, source_id: str) -> None:
         """Set one source as the time reference: its offset becomes 0.0 and all
@@ -2083,6 +2125,8 @@ class PowerwaveMainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Set '{ref_source.display_name}' as reference (t=0)."
         )
+        for source in self._active_session.list_sources():
+            self._recalculate_calculated_signals_for_source(source.source_id)
 
     def _on_session_auto_align(self, source_id: str) -> None:
         if self._active_session is None:
@@ -2117,6 +2161,11 @@ class PowerwaveMainWindow(QMainWindow):
         n = len(results)
         self.statusBar().showMessage(f"Auto-aligned {n} source(s).")
 
+        # Auto-align is a single committed action, not a continuous edit --
+        # recalculate dependent calculated signals for every source touched.
+        for result in results:
+            self._recalculate_calculated_signals_for_source(result.source_id)
+
         # Cross-correlation pass (Phase 7) — runs after trigger-based alignment
         if source_id == "all" and len(targets) >= 2:
             QTimer.singleShot(0, lambda t=targets: self._run_cross_correlation(t))
@@ -2141,6 +2190,115 @@ class PowerwaveMainWindow(QMainWindow):
         self._session_panel.refresh_source_row(
             source_id, source, metrics, panels, alignment_notes=notes
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Calculated Signals — canvas/session-panel integration (Phase 3B)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _sync_calculated_signals_to_canvas(self, calc_ids: list[str] | None = None) -> None:
+        """Refresh calculated-signal curves on canvas and in the Session
+        Panel's Calculated Signals section, after create/recalculate/
+        visibility/delete.
+
+        calc_ids=None syncs every calculated signal; passing a specific
+        list scopes the canvas repaint to just those signals (e.g. after
+        resolve_for_source() recalculates only the ones depending on one
+        source) -- unrelated calculated signals and every original source
+        curve are left untouched.
+        """
+        if self._active_session is None:
+            return
+        if self._session_panel is not None:
+            self._session_panel.refresh_calculated_signals(self._active_session)
+        if not self._session_canvas_active or self._session_canvas_controller is None:
+            return
+
+        target_ids = (
+            calc_ids if calc_ids is not None
+            else [e.definition.calc_id for e in self._active_session.list_calculated_signals()]
+        )
+        needs_new_panel = False
+        for calc_id in target_ids:
+            placement = self._active_session.ensure_calculated_signal_panel(calc_id)
+            if placement is not None and placement[1]:
+                needs_new_panel = True
+        if needs_new_panel:
+            # Rare path: a calculated signal's inferred panel (e.g. its
+            # first-ever Power result) does not exist yet -- a full
+            # rebuild is required to create the SessionCanvasWidget for it.
+            # Ordinary recalculation/visibility/delete never takes this path.
+            self._activate_session_canvas()
+
+        self._session_canvas_controller.refresh_calculated_signals(
+            self._active_session, calc_ids
+        )
+
+    def _recalculate_calculated_signals_for_source(self, source_id: str) -> None:
+        """Recalculate only the calculated signals depending on source_id,
+        after a COMMITTED alignment edit (offset editingFinished, Auto-align,
+        Reset, Set-as-reference, or reactivation) -- never on every spinbox
+        tick. A failed recalculation leaves the previous OK/STALE result
+        completely untouched (CalculatedSignalResolutionService's own
+        contract); the affected curves are repainted from current session
+        state either way, so a failed recalculation's last-known-good/stale
+        curve remains visible rather than disappearing.
+        """
+        if self._active_session is None:
+            return
+        dependents = self._active_session.get_calculated_dependents_for_source(source_id)
+        if not dependents:
+            return
+        from app.calculated_signals.resolver import CalculatedSignalResolutionService
+
+        service = CalculatedSignalResolutionService(self._active_session)
+        service.resolve_for_source(source_id)
+        self._sync_calculated_signals_to_canvas(list(dependents))
+
+    def _on_calc_signal_visibility_changed(self, calc_id: str, visible: bool) -> None:
+        if self._active_session is None:
+            return
+        self._active_session.set_calculated_signal_visible(calc_id, visible)
+        self._sync_calculated_signals_to_canvas([calc_id])
+
+    def _on_calc_signal_recalculate(self, calc_id: str) -> None:
+        if self._active_session is None:
+            return
+        from app.calculated_signals.resolver import (
+            CalculatedSignalResolutionError,
+            CalculatedSignalResolutionService,
+        )
+
+        service = CalculatedSignalResolutionService(self._active_session)
+        try:
+            service.resolve_one(calc_id)
+        except CalculatedSignalResolutionError as exc:
+            self.statusBar().showMessage(f"Recalculation failed: {exc}")
+        else:
+            self.statusBar().showMessage("Calculated signal recalculated.")
+        self._sync_calculated_signals_to_canvas([calc_id])
+
+    def _on_calc_signal_recalculate_all(self) -> None:
+        if self._active_session is None:
+            return
+        from app.calculated_signals.resolver import CalculatedSignalResolutionService
+
+        service = CalculatedSignalResolutionService(self._active_session)
+        batch = service.resolve_all()
+        self._sync_calculated_signals_to_canvas()
+        self.statusBar().showMessage(
+            f"Recalculated {len(batch.successful)} calculated signal(s); "
+            f"{len(batch.failures)} failed."
+        )
+
+    def _on_calc_signal_delete(self, calc_id: str) -> None:
+        if self._active_session is None:
+            return
+        if self._session_canvas_controller is not None:
+            self._session_canvas_controller.remove_calculated_signal_curve(calc_id)
+        self._active_session.remove_calculated_signal(calc_id)
+        if self._session_panel is not None:
+            self._session_panel.refresh_calculated_signals(self._active_session)
+        self.statusBar().showMessage("Calculated signal deleted.")
 
     def _on_session_channel_visibility(
         self, source_id: str, channel_name: str, visible: bool
@@ -2319,6 +2477,15 @@ class PowerwaveMainWindow(QMainWindow):
         self._active_session.set_source_active(source_id, is_active)
         if self._session_canvas_active and self._session_canvas_controller is not None:
             self._session_canvas_controller.refresh_all(self._active_session)
+        if is_active:
+            # Reactivation is a sensible existing boundary to attempt
+            # recalculation (Phase 3B step 17); deactivation leaves
+            # dependents stale without an automatic (doomed) retry.
+            self._recalculate_calculated_signals_for_source(source_id)
+        else:
+            self._sync_calculated_signals_to_canvas(
+                list(self._active_session.get_calculated_dependents_for_source(source_id))
+            )
 
     def _load_manifest(self, manifest_path: Path) -> None:
         """Load a YAML manifest, show the data review dialog, then visualize."""

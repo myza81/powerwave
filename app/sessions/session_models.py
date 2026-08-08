@@ -209,7 +209,13 @@ class CalculatedSignalEntry:
     DependencyStatus and EventAnalysisSession.get_dependency_status(),
     which are always computed fresh from the session's live source/channel
     state.
+
+    is_visible (Phase 3B) is pure session/UI display state, mirroring
+    SessionChannel.is_visible for real channels -- hiding a calculated
+    signal never touches its definition or result; it only controls whether
+    a later render step (SessionCanvasController) paints its curve.
     """
 
     definition: "CalculatedSignalDefinition"
     result: "CalculatedSignalResult | None" = None
+    is_visible: bool = True

@@ -1087,6 +1087,20 @@ class EventAnalysisSession:
             raise ValueError(f"result.calc_id {result.calc_id!r} does not match {calc_id!r}")
         entry.result = result
 
+    def set_calculated_signal_visible(self, calc_id: str, visible: bool) -> None:
+        """Set a calculated signal's session/UI display visibility (Phase 3B).
+
+        Pure display state, mirroring set_channel_visibility() for real
+        channels: never touches the definition, the result, or dependency
+        indexes. Hiding does not delete anything; showing again restores
+        the existing result without recalculation. A no-op for an unknown
+        calc_id, matching this module's existing "unknown id -> no-op"
+        convention (see set_channel_visibility).
+        """
+        entry = self._calc_signals.get(calc_id)
+        if entry is not None:
+            entry.is_visible = visible
+
     def mark_calculated_signal_stale(self, calc_id: str, reason: str | None = None) -> None:
         """Mark calc_id's latest result STALE without discarding its arrays.
 
@@ -1213,6 +1227,47 @@ class EventAnalysisSession:
             calc_id for calc_id, entry in self._calc_signals.items()
             if entry.result is not None and entry.result.status == CalculationStatus.STALE
         )
+
+    # -------------------------------------------------------------------------
+    # Calculated Signals — canvas panel routing (Phase 3B)
+    # -------------------------------------------------------------------------
+    #
+    # A calculated signal is never a SessionChannel and is never added to any
+    # PanelConfig.channel_refs -- that list is real-channel identity that
+    # other panel operations (default_layout, merge/split, drag-and-drop
+    # channel moves) assume resolves through session._channels. Instead, a
+    # calculated signal's panel is looked up on demand from its own result,
+    # reusing the exact same type/unit/name taxonomy _infer_panel_for_channel
+    # already applies to real channels -- no second taxonomy is introduced.
+
+    def ensure_calculated_signal_panel(self, calc_id: str) -> tuple[str, bool] | None:
+        """Return (panel_id, created) for calc_id's current result, creating
+        the canonical panel (Voltage/Current/Power/Frequency/Other Analog)
+        if it does not already exist.
+
+        Returns None when calc_id is unknown or has never been calculated
+        (result is None) -- there is nothing to place yet. Uses only the
+        calculated signal's display name and result.unit, exactly as
+        directed for calculated-signal panel inference -- parameter_type is
+        left unknown, and no engineering meaning is inferred from the
+        expression text.
+        """
+        entry = self._calc_signals.get(calc_id)
+        if entry is None or entry.result is None:
+            return None
+        panel_id, panel_type = _infer_panel_for_channel(
+            entry.definition.name, entry.result.unit, None
+        )
+        if panel_id in self._panels:
+            return panel_id, False
+        self._panels[panel_id] = PanelConfig(
+            panel_id=panel_id,
+            title=_DEFAULT_PANEL_TITLES.get(panel_id, panel_id.title()),
+            channel_refs=[],
+            panel_type=panel_type,
+            is_visible=True,
+        )
+        return panel_id, True
 
     # -------------------------------------------------------------------------
     # Calculated Signals — lifecycle invalidation (Phase 2C-2)

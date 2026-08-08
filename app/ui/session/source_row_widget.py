@@ -7,7 +7,8 @@ Phase 9C additions over Phase 9B:
   - auto-align tooltip no longer says "Phase 9C".
 
 Signal contract (unchanged from Phase 9B except new offset_reset_requested):
-  offset_changed(source_id, offset_s)       — spinbox changed by user
+  offset_changed(source_id, offset_s)       — spinbox changed by user (every tick)
+  offset_edit_finished(source_id)           — spinbox editing committed (Phase 3B; focus lost/Enter, not every tick)
   offset_reset_requested(source_id)         — Reset button clicked
   auto_align_requested(source_id)           — Auto button clicked
   channel_visibility_changed(...)           — from channel tree
@@ -105,6 +106,7 @@ class SourceRowWidget(QWidget):
     """
 
     offset_changed = pyqtSignal(str, float)              # source_id, offset_s
+    offset_edit_finished = pyqtSignal(str)               # source_id -- offset spinbox editing committed
     offset_reset_requested = pyqtSignal(str)             # source_id
     auto_align_requested = pyqtSignal(str)               # source_id
     set_as_reference_requested = pyqtSignal(str)         # source_id
@@ -325,6 +327,7 @@ class SourceRowWidget(QWidget):
         self._offset_spin.setKeyboardTracking(True)
         self._offset_spin.setValue(source.time_offset_s)
         self._offset_spin.valueChanged.connect(self._on_offset_spin_changed)
+        self._offset_spin.editingFinished.connect(self._on_offset_spin_editing_finished)
         row.addWidget(self._offset_spin)
 
         self._fine_right_btn = QPushButton("→")
@@ -410,6 +413,17 @@ class SourceRowWidget(QWidget):
         if self._updating:
             return
         self.offset_changed.emit(self._source_id, value)
+
+    def _on_offset_spin_editing_finished(self) -> None:
+        """Fires once when spinbox editing commits (focus lost or Enter),
+        unlike valueChanged which fires on every tick/keystroke. This is the
+        hook a future recalculation trigger should use instead of
+        valueChanged -- see offset_edit_finished's docstring in the class
+        signal contract.
+        """
+        if self._updating:
+            return
+        self.offset_edit_finished.emit(self._source_id)
 
     def _on_fine_left(self) -> None:
         step = self._sample_interval_s if self._sample_interval_s > 0 else 0.001

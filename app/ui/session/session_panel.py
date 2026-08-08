@@ -33,6 +33,7 @@ def _fmt_readout(value: float, unit: str) -> str:
     return f"{value:.3f}{suffix}"
 from PyQt6.QtWidgets import (
     QDockWidget,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -42,6 +43,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.sessions.session_models import PanelConfig, SessionSource, SourceQualityMetrics
+from app.ui.session.calculated_signal_row_widget import CalculatedSignalRowWidget
 from app.ui.session.source_row_widget import SourceRowWidget
 
 
@@ -57,6 +59,7 @@ class SessionPanel(QDockWidget):
     source_add_requested = pyqtSignal()
     source_remove_requested = pyqtSignal(str)              # source_id
     offset_changed = pyqtSignal(str, float)                # source_id, offset_s
+    offset_edit_finished = pyqtSignal(str)                  # source_id (Phase 3B)
     auto_align_requested = pyqtSignal(str)                 # source_id or 'all'
     channel_visibility_changed = pyqtSignal(str, str, bool)
     channel_colour_change_requested = pyqtSignal(str, str)
@@ -71,11 +74,18 @@ class SessionPanel(QDockWidget):
     # Phase 9E addition
     set_as_reference_requested = pyqtSignal(str)           # source_id
 
+    # Phase 3B additions — Calculated Signals section
+    calculated_signal_visibility_changed = pyqtSignal(str, bool)     # calc_id, visible
+    calculated_signal_recalculate_requested = pyqtSignal(str)        # calc_id
+    calculated_signal_recalculate_all_requested = pyqtSignal()
+    calculated_signal_delete_requested = pyqtSignal(str)              # calc_id
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Event Analysis Session", parent)
         self._source_rows: dict[str, SourceRowWidget] = {}
         # Expansion state is owned here to survive row removal/re-addition
         self._expansion_state: dict[str, bool] = {}
+        self._calc_rows: dict[str, CalculatedSignalRowWidget] = {}
         self._build_ui()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -234,6 +244,35 @@ class SessionPanel(QDockWidget):
                     alignment_notes=notes,
                 )
 
+    def refresh_calculated_signals(self, session) -> None:
+        """Full sync of the Calculated Signals section from EventAnalysisSession.
+
+        Session-owned display state only -- never triggers a calculation.
+        Adds rows for new entries, refreshes existing ones in place, and
+        removes rows for calc_ids no longer in the session (deleted).
+        """
+        entries = {e.definition.calc_id: e for e in session.list_calculated_signals()}
+
+        stale_ids = [cid for cid in self._calc_rows if cid not in entries]
+        for cid in stale_ids:
+            row = self._calc_rows.pop(cid)
+            self._calc_signals_layout.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+
+        for calc_id, entry in entries.items():
+            if calc_id not in self._calc_rows:
+                row = CalculatedSignalRowWidget(calc_id, parent=self._calc_signals_widget)
+                self._wire_calc_row(row)
+                insert_pos = max(0, self._calc_signals_layout.count() - 1)
+                self._calc_signals_layout.insertWidget(insert_pos, row)
+                self._calc_rows[calc_id] = row
+            self._calc_rows[calc_id].refresh(
+                entry.definition.name, entry.result, entry.is_visible
+            )
+
+        self._calc_signals_group.setVisible(bool(entries))
+
     # ─────────────────────────────────────────────────────────────────────────
     # Build
     # ─────────────────────────────────────────────────────────────────────────
@@ -295,6 +334,34 @@ class SessionPanel(QDockWidget):
         )
         outer.addWidget(scroll)
 
+        # ── Calculated Signals section (Phase 3B) ──
+        # A dedicated section, not a fake SourceRowWidget: calculated
+        # signals are session-owned derived curves, never SessionSources.
+        self._calc_signals_group = QGroupBox("Calculated Signals")
+        calc_outer = QVBoxLayout(self._calc_signals_group)
+        calc_outer.setContentsMargins(4, 4, 4, 4)
+        calc_outer.setSpacing(4)
+
+        calc_toolbar = QHBoxLayout()
+        calc_toolbar.addStretch()
+        self._recalc_all_btn = QPushButton("Recalculate All")
+        self._recalc_all_btn.setToolTip("Recalculate every calculated signal in this session")
+        self._recalc_all_btn.clicked.connect(
+            self.calculated_signal_recalculate_all_requested
+        )
+        calc_toolbar.addWidget(self._recalc_all_btn)
+        calc_outer.addLayout(calc_toolbar)
+
+        self._calc_signals_widget = QWidget()
+        self._calc_signals_layout = QVBoxLayout(self._calc_signals_widget)
+        self._calc_signals_layout.setContentsMargins(0, 0, 0, 0)
+        self._calc_signals_layout.setSpacing(2)
+        self._calc_signals_layout.addStretch()
+        calc_outer.addWidget(self._calc_signals_widget)
+
+        self._calc_signals_group.setVisible(False)  # hidden until a signal exists
+        outer.addWidget(self._calc_signals_group)
+
         self.setWidget(container)
         self.setMinimumWidth(340)
 
@@ -302,9 +369,15 @@ class SessionPanel(QDockWidget):
     # Internal
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _wire_calc_row(self, row: CalculatedSignalRowWidget) -> None:
+        row.visibility_changed.connect(self.calculated_signal_visibility_changed)
+        row.recalculate_requested.connect(self.calculated_signal_recalculate_requested)
+        row.delete_requested.connect(self.calculated_signal_delete_requested)
+
     def _wire_row(self, row: SourceRowWidget) -> None:
         """Connect a source row's signals to this panel's re-emission signals."""
         row.offset_changed.connect(self.offset_changed)
+        row.offset_edit_finished.connect(self.offset_edit_finished)
         row.offset_reset_requested.connect(self.offset_reset_requested)
         row.auto_align_requested.connect(self.auto_align_requested)
         row.channel_visibility_changed.connect(self.channel_visibility_changed)
