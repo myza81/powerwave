@@ -46,3 +46,9 @@ If you need to run the file path directly, set the project root on
 ```bash
 PYTHONPATH=. python app/main.py
 ```
+
+OpenGL rendering is disabled by default; enable it with:
+
+```bash
+POWERWAVE_USE_OPENGL=1 python -m app.main
+```
