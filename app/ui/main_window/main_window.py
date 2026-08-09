@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QInputDialog,
+    QProgressDialog,
 )
 
 from app.analytics.frequency import FrequencyDisplayMode, FrequencyRegistry
@@ -304,6 +305,47 @@ class _IntelligentLoadWorker(QRunnable):
             self.signals.error.emit(str(exc))
 
 
+class _ComtradeLoadSignals(QObject):
+    """Cross-thread signals for _ComtradeLoadWorker.
+
+    Both signals carry the request_id the worker was constructed with, so
+    the receiving slot can tell a stale/abandoned result (cancelled,
+    superseded by session replacement, or the window closing) from the
+    currently active one -- see
+    PowerwaveMainWindow._on_comtrade_worker_finished/_on_comtrade_worker_error.
+    """
+
+    finished: pyqtSignal = pyqtSignal(object, int)  # DisturbanceRecord, request_id
+    error: pyqtSignal = pyqtSignal(str, int)         # message, request_id
+
+
+class _ComtradeLoadWorker(QRunnable):
+    """Loads one COMTRADE source off the main Qt thread (Sprint 1F).
+
+    Deliberately narrow: wraps ProviderManager.load() exactly as the old
+    synchronous _on_add_to_session() path did -- no parsing, classification,
+    or session logic lives here. This intentionally does not reuse
+    _IntelligentLoadWorker, which is unused dead code coupled to CSV/Excel
+    D4.3 intelligence fields (signal_metadata/ts_ambiguous/ts_matrices) that
+    are irrelevant here and have no bearing on COMTRADE loading.
+    """
+
+    def __init__(self, provider_manager: ProviderManager, path: Path, request_id: int) -> None:
+        super().__init__()
+        self._manager = provider_manager
+        self._path = path
+        self._request_id = request_id
+        self.signals = _ComtradeLoadSignals()
+
+    def run(self) -> None:
+        try:
+            record = self._manager.load(self._path)
+        except Exception as exc:  # noqa: BLE001
+            self.signals.error.emit(str(exc), self._request_id)
+            return
+        self.signals.finished.emit(record, self._request_id)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main window
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,11 +354,17 @@ class _IntelligentLoadWorker(QRunnable):
 class PowerwaveMainWindow(QMainWindow):
     """Powerwave viewer — session canvas workspace."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, comtrade_thread_pool=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Powerwave")
         self.resize(1400, 900)
 
+        # Sprint 1F: accepts any object with a .start(runnable) interface so
+        # tests can inject a synchronous stand-in, matching the Import
+        # Wizard's existing thread_pool injection convention.
+        self._comtrade_thread_pool = (
+            comtrade_thread_pool if comtrade_thread_pool is not None else QThreadPool.globalInstance()
+        )
         self._provider_manager = _build_provider_manager()
         self._rule_manager = RuleManager()
         self._intelligence_manager = self._rule_manager.intelligence_manager
@@ -356,6 +404,11 @@ class PowerwaveMainWindow(QMainWindow):
         self._embedded_import_wizard: ImportWizardWidget | None = None
         self._canvas_theme: str = "dark"
         self._crosshair_snap_enabled: bool = False
+
+        # Background COMTRADE loading (Sprint 1F)
+        self._comtrade_request_seq: int = 0
+        self._active_comtrade_request_id: int | None = None
+        self._comtrade_progress_dialog: QProgressDialog | None = None
 
         # Measurement panel (Phase 1 Enhancement)
         self._measurement_dock = self._build_measurement_dock()
@@ -407,6 +460,7 @@ class PowerwaveMainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
+        self._abandon_active_comtrade_load()
         self._sync_manager.clear()
         super().closeEvent(event)
 
@@ -1704,6 +1758,7 @@ class PowerwaveMainWindow(QMainWindow):
         """Start a fresh EventAnalysisSession and show the session panel."""
         from app.sessions import EventAnalysisSession
 
+        self._abandon_active_comtrade_load()
         self._active_session = EventAnalysisSession()
         panel = self._ensure_session_panel()
         panel.refresh_all(self._active_session)
@@ -1732,12 +1787,95 @@ class PowerwaveMainWindow(QMainWindow):
         if path.suffix.lower() in _CSV_EXCEL_SUFFIXES:
             self._show_embedded_import_wizard(path_str)
         else:
-            self.statusBar().showMessage(f"Loading {path.name}…")
-            try:
-                record = self._provider_manager.load(path)
-                self._on_session_import_record_ready(record)
-            except Exception as exc:  # noqa: BLE001
-                self._on_load_error(str(exc))
+            self._start_comtrade_load(path)
+
+    def _start_comtrade_load(self, path: Path) -> None:
+        """Sprint 1F: load a non-CSV/Excel (COMTRADE) source off the main Qt
+        thread so the UI stays responsive on large files, showing a busy
+        progress dialog with Cancel instead of freezing synchronously.
+
+        One background COMTRADE load at a time: a second request while one
+        is active is rejected with a status message rather than queued.
+        """
+        if self._active_comtrade_request_id is not None:
+            self.statusBar().showMessage(
+                "A source is already loading — please wait for it to finish."
+            )
+            return
+
+        self._comtrade_request_seq += 1
+        request_id = self._comtrade_request_seq
+        self._active_comtrade_request_id = request_id
+
+        dialog = QProgressDialog("Loading COMTRADE source…\n\n" + path.name, "Cancel", 0, 0, self)
+        dialog.setWindowTitle("Loading")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.canceled.connect(lambda rid=request_id: self._on_comtrade_load_cancelled(rid))
+        self._comtrade_progress_dialog = dialog
+        dialog.show()
+
+        worker = _ComtradeLoadWorker(self._provider_manager, path, request_id)
+        worker.signals.finished.connect(self._on_comtrade_worker_finished)
+        worker.signals.error.connect(self._on_comtrade_worker_error)
+        self._comtrade_thread_pool.start(worker)
+
+    def _is_comtrade_request_active(self, request_id: int) -> bool:
+        return (
+            self._active_comtrade_request_id is not None
+            and self._active_comtrade_request_id == request_id
+        )
+
+    def _finish_comtrade_load(self, request_id: int) -> None:
+        """Common teardown for a COMTRADE load reaching a terminal state
+        (success, error, or cancel) -- closes the dialog and clears the
+        active-request marker so a later result can no longer match.
+        """
+        if self._active_comtrade_request_id == request_id:
+            self._active_comtrade_request_id = None
+        if self._comtrade_progress_dialog is not None:
+            self._comtrade_progress_dialog.close()
+            self._comtrade_progress_dialog = None
+
+    def _abandon_active_comtrade_load(self) -> None:
+        """Sprint 1F: invalidate any in-flight COMTRADE load and close its
+        dialog because the destination session is about to be replaced or
+        cleared, or the window is closing. The worker (if still running)
+        will finish naturally, but _is_comtrade_request_active() will no
+        longer match its request_id, so the result is discarded on arrival.
+        """
+        if self._active_comtrade_request_id is not None:
+            self._finish_comtrade_load(self._active_comtrade_request_id)
+
+    def _on_comtrade_load_cancelled(self, request_id: int) -> None:
+        """Cancel policy (Sprint 1F): the parser has no cooperative
+        cancellation points, so this does not stop the worker mid-parse --
+        it abandons the request. The worker may still finish in the
+        background; _on_comtrade_worker_finished/_error will find
+        request_id no longer active and discard the result silently.
+        """
+        if not self._is_comtrade_request_active(request_id):
+            return
+        self._finish_comtrade_load(request_id)
+        self.statusBar().showMessage("COMTRADE load cancelled.")
+
+    def _on_comtrade_worker_finished(self, record: object, request_id: int) -> None:
+        if not self._is_comtrade_request_active(request_id):
+            return  # cancelled, superseded by a new session, or window closed
+        self._finish_comtrade_load(request_id)
+        from app.models import DisturbanceRecord
+
+        if not isinstance(record, DisturbanceRecord):
+            return
+        self._on_session_import_record_ready(record)
+
+    def _on_comtrade_worker_error(self, message: str, request_id: int) -> None:
+        if not self._is_comtrade_request_active(request_id):
+            return  # abandoned request; do not surface a late error either
+        self._finish_comtrade_load(request_id)
+        self._on_load_error(message)
 
     def _show_embedded_import_wizard(self, path_str: str) -> None:
         """Host the CSV/Excel Import Wizard in the main workspace.
@@ -2570,6 +2708,7 @@ class PowerwaveMainWindow(QMainWindow):
     def _on_session_cleared(self) -> None:
         from app.sessions import EventAnalysisSession
 
+        self._abandon_active_comtrade_load()
         self._active_session = EventAnalysisSession()
         if self._session_canvas_active:
             self._deactivate_session_canvas()
