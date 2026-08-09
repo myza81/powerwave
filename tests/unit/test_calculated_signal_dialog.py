@@ -694,3 +694,414 @@ class TestIdentity:
         entry = sess.list_calculated_signals()[0]
         assert entry.definition.calc_id != "Human Friendly Name"
         assert sess.get_calculated_signal(entry.definition.calc_id) is entry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Expression Builder (UX experiment)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _session_with_three_mw_sources() -> tuple[EventAnalysisSession, str, str, str]:
+    """Three sources, each exposing one MW-unit channel -- for testing
+    3+-signal arithmetic where unit compatibility must hold."""
+    sess = EventAnalysisSession()
+    sid_a = sess.add_source(_make_record({"MW_A": "MW"}), "Relay A", "csv")
+    sid_b = sess.add_source(_make_record({"MW_B": "MW"}), "SCADA Tie-Line", "csv")
+    sid_c = sess.add_source(_make_record({"MW_C": "MW"}), "PMU", "csv")
+    return sess, sid_a, sid_b, sid_c
+
+
+def _session_with_duplicate_channel_names() -> tuple[EventAnalysisSession, str, str, str]:
+    """Three sources that all expose a channel literally named 'Ia' -- the
+    Signal menu must disambiguate via source display name, not show three
+    identical 'Ia' entries."""
+    sess = EventAnalysisSession()
+    sid_1 = sess.add_source(_make_record({"Ia": "A"}), "Relay 1", "csv")
+    sid_2 = sess.add_source(_make_record({"Ia": "A"}), "Relay 2", "csv")
+    sid_3 = sess.add_source(_make_record({"Ia": "A"}), "PMU", "csv")
+    return sess, sid_1, sid_2, sid_3
+
+
+class TestExpressionBuilderLayout:
+    def test_dialog_minimum_size_unchanged(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        assert dlg.minimumSize().width() == 600
+        assert dlg.minimumSize().height() == 700
+
+    def test_dialog_does_not_exceed_prior_footprint(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg.adjustSize()
+        # The dialog must render at (at most) its documented minimum
+        # footprint -- the builder toolbar must not force the window larger.
+        assert dlg.width() <= 600
+        assert dlg.height() <= 700
+
+    def test_fits_1366x768(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg.show()
+        assert dlg.width() <= 1366
+        assert dlg.height() <= 768
+        dlg.close()
+
+    def test_fits_1280x720(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg.show()
+        assert dlg.width() <= 1280
+        assert dlg.height() <= 720
+        dlg.close()
+
+    def test_create_and_cancel_remain_within_dialog_bounds(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg.show()
+        create_bottom = dlg._create_btn.geometry().y() + dlg._create_btn.geometry().height()
+        cancel_bottom = dlg._cancel_btn.geometry().y() + dlg._cancel_btn.geometry().height()
+        assert create_bottom <= dlg.height()
+        assert cancel_bottom <= dlg.height()
+        dlg.close()
+
+    def test_builder_row_present_and_visible(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg.show()
+        assert not dlg._signal_menu_button.isHidden()
+        assert not dlg._function_menu_button.isHidden()
+        dlg.close()
+
+
+class TestSignalInsertion:
+    def test_menu_reflects_current_bindings(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        assert dlg._signal_menu.actions() == []
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        labels = [a.text() for a in dlg._signal_menu.actions()]
+        assert labels == ["A — Source A / Va [kV]"]
+
+    def test_menu_disabled_with_no_bindings(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        assert not dlg._signal_menu_button.isEnabled()
+
+    def test_menu_enabled_after_binding(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        assert dlg._signal_menu_button.isEnabled()
+
+    def test_inserts_correct_alias_at_cursor(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        _add_binding(dlg, monkeypatch, sess, sid_b, "Ia")
+        dlg._expression_edit.setText("A+B")
+        dlg._expression_edit.setCursorPosition(2)  # A+|B
+        dlg._insert_text_at_cursor("A")
+        assert dlg._expression_edit.text() == "A+AB"
+
+    def test_inserted_alias_replaces_selection(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        _add_binding(dlg, monkeypatch, sess, sid_b, "Ia")
+        dlg._expression_edit.setText("A+B")
+        dlg._expression_edit.selectAll()
+        dlg._insert_text_at_cursor("A")
+        assert dlg._expression_edit.text() == "A"
+
+    def test_duplicate_channel_names_show_source_context(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_1, sid_2, sid_3 = _session_with_duplicate_channel_names()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_1, "Ia")
+        _add_binding(dlg, monkeypatch, sess, sid_2, "Ia")
+        _add_binding(dlg, monkeypatch, sess, sid_3, "Ia")
+        labels = [a.text() for a in dlg._signal_menu.actions()]
+        assert labels == [
+            "A — Relay 1 / Ia [A]",
+            "B — Relay 2 / Ia [A]",
+            "C — PMU / Ia [A]",
+        ]
+        assert len(set(labels)) == 3  # never three indistinguishable "Ia" entries
+
+    def test_menu_refreshes_after_remove_input(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        _add_binding(dlg, monkeypatch, sess, sid_b, "Ia")
+        assert len(dlg._signal_menu.actions()) == 2
+        dlg._bindings_table.selectRow(0)  # select the "A" row
+        dlg._on_remove_input()
+        labels = [a.text() for a in dlg._signal_menu.actions()]
+        assert labels == ["B — Source B / Ia [A]"]
+
+
+class TestOperatorInsertion:
+    @pytest.mark.parametrize(
+        "glyph, expected_token",
+        [("+", "+"), ("−", "-"), ("×", "*"), ("÷", "/"), ("(", "("), (")", ")")],
+    )
+    def test_operator_button_maps_to_parser_token(
+        self, qapp, glyph: str, expected_token: str
+    ) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        token = next(t for g, t, _tip in cs_dialog_module._OPERATOR_BUTTONS if g == glyph)
+        assert token == expected_token
+        dlg._expression_edit.clear()
+        dlg._insert_text_at_cursor(token)
+        assert dlg._expression_edit.text() == expected_token
+
+    def test_operators_insert_at_cursor_in_sequence(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg._insert_text_at_cursor("(")
+        dlg._insert_text_at_cursor(")")
+        assert dlg._expression_edit.text() == "()"
+        dlg._expression_edit.setCursorPosition(1)
+        dlg._insert_text_at_cursor("+")
+        assert dlg._expression_edit.text() == "(+)"
+
+
+class TestFunctionInsertion:
+    def test_only_backend_supported_functions_offered(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        offered = [a.text() for a in dlg._function_menu_button.menu().actions()]
+        assert offered == ["abs()"]
+        assert not any("sqrt" in f for f in offered)
+
+    def test_abs_inserts_with_cursor_inside_parens_when_nothing_selected(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg._expression_edit.clear()
+        dlg._insert_function("abs")
+        assert dlg._expression_edit.text() == "abs()"
+        assert dlg._expression_edit.cursorPosition() == 4
+
+    def test_abs_wraps_selected_expression(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg._expression_edit.setText("A-B")
+        dlg._expression_edit.selectAll()
+        dlg._insert_function("abs")
+        assert dlg._expression_edit.text() == "abs(A-B)"
+
+    def test_abs_wraps_partial_selection(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        dlg._expression_edit.setText("A+B")
+        dlg._expression_edit.setSelection(0, 1)  # select "A"
+        dlg._insert_function("abs")
+        assert dlg._expression_edit.text() == "abs(A)+B"
+
+    def test_sqrt_not_offered_and_rejected_if_typed_manually(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The builder must reflect real backend capability exactly (no
+        capability silently expanded): sqrt() is absent from the Function
+        menu, and manually typing it is still rejected by the unmodified
+        parser -- this is a regression guard, not a builder feature."""
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        offered = [a.text() for a in dlg._function_menu_button.menu().actions()]
+        assert "sqrt()" not in offered
+
+        dlg._name_edit.setText("Test")
+        dlg._expression_edit.setText("sqrt(A)")
+        dlg._on_preview_clicked()
+        assert dlg._preview_current is False
+        assert not dlg._preview_error_label.isHidden()
+        assert "sqrt" in dlg._preview_error_label.text()
+
+
+class TestLiveSyntaxFeedback:
+    def test_empty_expression_shows_supported_hint(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        assert "abs()" in dlg._expression_edit.toolTip()
+        assert dlg._expression_edit.styleSheet() == ""
+
+    def test_incomplete_expression_shows_subtle_feedback_not_a_dialog(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        # If this ever tried to show a modal dialog, exec() would block the
+        # test indefinitely -- reaching the assertion below already proves
+        # no popup occurred.
+        dlg._expression_edit.setText("A+")
+        assert "border" in dlg._expression_edit.styleSheet()
+        assert dlg._expression_edit.toolTip() != ""
+
+    def test_unknown_variable_reported_inline(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        dlg._expression_edit.setText("A+Z")
+        assert "Z" in dlg._expression_edit.toolTip()
+
+    def test_valid_expression_clears_feedback(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        dlg._expression_edit.setText("A+")
+        dlg._expression_edit.setText("A+A")
+        assert dlg._expression_edit.toolTip() == "Valid expression"
+        assert dlg._expression_edit.styleSheet() == ""
+
+    def test_live_feedback_never_touches_preview_state(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Syntax feedback must be independent of (and never substitute
+        for) the numerical Preview -- typing alone must not mark the
+        preview current."""
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        dlg._expression_edit.setText("A+A")
+        assert dlg._expression_edit.toolTip() == "Valid expression"
+        assert dlg._preview_current is False
+        assert dlg._preview_result is None
+
+
+class TestManualEditingPreserved:
+    def test_field_remains_directly_editable(self, qapp) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        assert not dlg._expression_edit.isReadOnly()
+
+    def test_manually_typed_valid_expression_previews(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        _add_binding(dlg, monkeypatch, sess, sid_b, "Ia")
+        dlg._name_edit.setText("Manual")
+        dlg._expression_edit.setText("(A+A-A)/2")
+        dlg._on_preview_clicked()
+        assert dlg._preview_current is True
+        assert dlg._preview_result.status.value == "ok"
+
+    def test_manually_typed_invalid_expression_rejected_by_existing_validation(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        dlg._name_edit.setText("Manual")
+        dlg._expression_edit.setText("A ** 2")  # exponent not in the grammar
+        dlg._on_preview_clicked()
+        assert dlg._preview_current is False
+        assert not dlg._preview_error_label.isHidden()
+
+
+class TestComplexFormulas:
+    def test_three_signal_sum_scaled_by_constant(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b, sid_c = _session_with_three_mw_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "MW_A")
+        _add_binding(dlg, monkeypatch, sess, sid_b, "MW_B")
+        _add_binding(dlg, monkeypatch, sess, sid_c, "MW_C")
+        dlg._name_edit.setText("Scaled Sum")
+
+        dlg._expression_edit.clear()
+        dlg._insert_text_at_cursor("(")
+        dlg._insert_text_at_cursor("A")
+        dlg._insert_text_at_cursor("+")
+        dlg._insert_text_at_cursor("B")
+        dlg._insert_text_at_cursor("+")
+        dlg._insert_text_at_cursor("C")
+        dlg._insert_text_at_cursor(")")
+        dlg._insert_text_at_cursor("*")
+        dlg._expression_edit.insert("1.732")
+
+        assert dlg._expression_edit.text() == "(A+B+C)*1.732"
+        dlg._on_preview_clicked()
+        assert dlg._preview_current is True
+        assert dlg._preview_result.status.value == "ok"
+        assert dlg._preview_result.unit == "MW"
+
+    def test_abs_of_half_difference(self, qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+        sess, sid_a, sid_b, sid_c = _session_with_three_mw_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "MW_A")
+        _add_binding(dlg, monkeypatch, sess, sid_b, "MW_B")
+        dlg._name_edit.setText("Abs Half Diff")
+
+        dlg._expression_edit.setText("(A-B)/2")
+        dlg._expression_edit.selectAll()
+        dlg._insert_function("abs")
+        assert dlg._expression_edit.text() == "abs((A-B)/2)"
+
+        dlg._on_preview_clicked()
+        assert dlg._preview_current is True
+        assert dlg._preview_result.status.value == "ok"
+
+    def test_more_than_two_bound_channels_all_selectable_from_menu(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b, sid_c = _session_with_three_mw_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "MW_A")
+        _add_binding(dlg, monkeypatch, sess, sid_b, "MW_B")
+        _add_binding(dlg, monkeypatch, sess, sid_c, "MW_C")
+        assert len(dlg._signal_menu.actions()) == 3
+        assert [b.variable for b in dlg._bindings] == ["A", "B", "C"]
+
+
+class TestBuilderPreviewAndCreateRegression:
+    def test_builder_modification_invalidates_preview_like_manual_edit(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        dlg._name_edit.setText("Test")
+        dlg._expression_edit.setText("A+A")
+        dlg._on_preview_clicked()
+        assert dlg._preview_current is True
+
+        dlg._insert_text_at_cursor("-A")  # builder-driven edit, not typing
+        assert dlg._preview_current is False
+
+    def test_create_disabled_until_builder_generated_expression_previewed(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        dlg._name_edit.setText("Test")
+        dlg._insert_text_at_cursor("A")
+        dlg._insert_text_at_cursor("+")
+        dlg._insert_text_at_cursor("A")
+        dlg._on_create_clicked()  # no preview run yet
+        assert not dlg._preview_error_label.isHidden()
+        assert sess.list_calculated_signals() == []
+
+    def test_create_succeeds_after_builder_generated_expression_previewed(
+        self, qapp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sess, sid_a, sid_b = _session_with_two_sources()
+        dlg = CalculatedSignalDialog(sess)
+        _add_binding(dlg, monkeypatch, sess, sid_a, "Va")
+        dlg._name_edit.setText("Test")
+        dlg._insert_text_at_cursor("A")
+        dlg._insert_text_at_cursor("+")
+        dlg._insert_text_at_cursor("A")
+        dlg._on_preview_clicked()
+        assert dlg._preview_current is True
+        dlg._on_create_clicked()
+        entries = sess.list_calculated_signals()
+        assert len(entries) == 1
+        assert entries[0].definition.expression == "A+A"
+        assert entries[0].result is not None
+        assert entries[0].result.status.value == "ok"

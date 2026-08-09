@@ -44,15 +44,22 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from app.calculated_signals.expression import (
+    ExpressionSyntaxError,
+    ExpressionValidationError,
+    validate_expression,
+)
 from app.calculated_signals.models import CalculatedSignalDefinition, CalculatedSignalResult, ChannelRef
 from app.calculated_signals.resolver import (
     CalculatedSignalResolutionError,
@@ -62,6 +69,27 @@ from app.sessions.event_session import EventAnalysisSession
 from app.ui.calculated_signals.analog_input_selector import AnalogInputSelectorDialog
 
 _ALIASES = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# Expression Builder toolbar (UX experiment): functions offered here must
+# match app.calculated_signals.expression.validate_expression()'s actual
+# supported set exactly -- currently only abs(). This mirrors, rather than
+# imports, that module's internal function allow-list (which is private):
+# adding a name here without the parser also accepting it would let the
+# builder offer something Create then rejects, which is worse than not
+# offering it at all.
+_SUPPORTED_FUNCTIONS: tuple[str, ...] = ("abs",)
+
+# Operator buttons: (display glyph, parser-compatible text, tooltip).
+# Display may use × / ÷ for readability; only the parser-compatible text is
+# ever inserted into the expression.
+_OPERATOR_BUTTONS: tuple[tuple[str, str, str], ...] = (
+    ("+", "+", "Add"),
+    ("−", "-", "Subtract"),
+    ("×", "*", "Multiply"),
+    ("÷", "/", "Divide"),
+    ("(", "(", "Open parenthesis"),
+    (")", ")", "Close parenthesis"),
+)
 
 
 @dataclass(slots=True)
@@ -102,6 +130,7 @@ class CalculatedSignalDialog(QDialog):
         self._refresh_reference_choices()
         self._update_create_enabled()
         self._update_preview_status_label()
+        self._update_expression_feedback()
 
     # ─────────────────────────────────────────────────────────────────────────
     # UI construction
@@ -165,10 +194,120 @@ class CalculatedSignalDialog(QDialog):
         self._expression_edit.setPlaceholderText("e.g. A - B")
         self._expression_edit.textChanged.connect(self._on_expression_changed)
         vbox.addWidget(self._expression_edit)
-        helper = QLabel("Supported: +  -  *  /  ( )  abs()")
-        helper.setStyleSheet("color: gray; font-size: 10px;")
-        vbox.addWidget(helper)
+        vbox.addLayout(self._build_expression_builder_row())
         return group
+
+    def _build_expression_builder_row(self) -> QHBoxLayout:
+        """Compact Expression Builder toolbar (UX experiment): Signal and
+        Function dropdowns plus operator/parenthesis buttons, all inserting
+        at the expression field's current cursor/selection. Replaces the
+        former static "Supported: ..." helper line in the same row -- see
+        _update_expression_feedback() for where that hint text now lives
+        (the field's own tooltip, so this row costs no extra height).
+        """
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        self._signal_menu_button = QToolButton()
+        self._signal_menu_button.setText("Signal ▾")
+        self._signal_menu_button.setToolTip("Insert a bound input signal")
+        self._signal_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._signal_menu = QMenu(self._signal_menu_button)
+        self._signal_menu_button.setMenu(self._signal_menu)
+        row.addWidget(self._signal_menu_button)
+
+        self._function_menu_button = QToolButton()
+        self._function_menu_button.setText("Function ▾")
+        self._function_menu_button.setToolTip("Wrap the selection, or insert, a supported function")
+        self._function_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        function_menu = QMenu(self._function_menu_button)
+        for func_name in _SUPPORTED_FUNCTIONS:
+            action = function_menu.addAction(f"{func_name}()")
+            action.triggered.connect(
+                lambda checked=False, f=func_name: self._insert_function(f)
+            )
+        self._function_menu_button.setMenu(function_menu)
+        row.addWidget(self._function_menu_button)
+
+        for glyph, token, tooltip in _OPERATOR_BUTTONS:
+            btn = QToolButton()
+            btn.setText(glyph)
+            btn.setToolTip(tooltip)
+            btn.setMaximumWidth(28)
+            btn.clicked.connect(lambda checked=False, t=token: self._insert_text_at_cursor(t))
+            row.addWidget(btn)
+
+        row.addStretch(1)
+        self._refresh_signal_menu()
+        return row
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Expression Builder: cursor-position insertion helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _refresh_signal_menu(self) -> None:
+        """Rebuild the Signal dropdown from current bindings only (Step 12:
+        the menu must always reflect exactly what is bound right now, never
+        a stale or renumbered list)."""
+        self._signal_menu.clear()
+        for b in self._bindings:
+            unit_text = b.unit if b.unit else "Unknown"
+            label = f"{b.variable} — {b.source_display_name} / {b.channel_display_name} [{unit_text}]"
+            action = self._signal_menu.addAction(label)
+            action.triggered.connect(
+                lambda checked=False, v=b.variable: self._insert_text_at_cursor(v)
+            )
+        self._signal_menu_button.setEnabled(bool(self._bindings))
+
+    def _insert_text_at_cursor(self, text: str) -> None:
+        """Insert *text* at the expression field's current cursor position,
+        replacing the current selection if any (QLineEdit.insert()'s own
+        behaviour) -- shared by Signal and operator/parenthesis buttons so
+        insertion logic is not duplicated per button."""
+        edit = self._expression_edit
+        edit.insert(text)
+        edit.setFocus()
+
+    def _insert_function(self, func_name: str) -> None:
+        """Insert a supported function call at the cursor. Wraps the current
+        selection, e.g. selecting "A-B" and choosing abs() produces
+        "abs(A-B)"; with nothing selected, inserts "func()" with the cursor
+        left positioned between the parentheses so the user can keep typing
+        immediately."""
+        edit = self._expression_edit
+        selected = edit.selectedText()
+        if selected:
+            edit.insert(f"{func_name}({selected})")
+        else:
+            pos = edit.cursorPosition()
+            edit.insert(f"{func_name}()")
+            edit.setCursorPosition(pos + len(func_name) + 1)
+        edit.setFocus()
+
+    def _update_expression_feedback(self) -> None:
+        """Lightweight syntax-only feedback (Step 9): reuses the field's own
+        tooltip and a subtle border tint instead of a dedicated status row,
+        so this costs no extra dialog height. Never runs the numerical
+        preview, never touches session data, never pops up a dialog --
+        Preview remains the sole authority for numerical/unit/alignment
+        validation. An incomplete expression (e.g. "A+") is expected while
+        typing and is shown the same subtle way as any other syntax error.
+        """
+        edit = self._expression_edit
+        text = edit.text().strip()
+        if not text:
+            edit.setStyleSheet("")
+            edit.setToolTip("Supported: +  -  *  /  ( )  abs()")
+            return
+        allowed_variables = {b.variable for b in self._bindings}
+        try:
+            validate_expression(text, allowed_variables)
+        except (ExpressionSyntaxError, ExpressionValidationError) as exc:
+            edit.setStyleSheet("border: 1px solid #b06000;")
+            edit.setToolTip(str(exc))
+        else:
+            edit.setStyleSheet("")
+            edit.setToolTip("Valid expression")
 
     def _build_reference_group(self) -> QGroupBox:
         group = QGroupBox("Reference Signal")
@@ -243,6 +382,7 @@ class CalculatedSignalDialog(QDialog):
         if self._suspend_signals:
             return
         self._mark_preview_outdated()
+        self._update_expression_feedback()
 
     def _on_reference_changed(self, _index: int) -> None:
         if self._suspend_signals:
@@ -323,6 +463,7 @@ class CalculatedSignalDialog(QDialog):
                     table.setItem(row, col, item)
         finally:
             self._suspend_signals = False
+        self._refresh_signal_menu()
         self._update_create_enabled()
 
     def _refresh_reference_choices(self) -> None:
