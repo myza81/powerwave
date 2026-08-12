@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from app.data.manifest_loader import physical_source_type
+
 if TYPE_CHECKING:
     from app.sessions import EventAnalysisSession
 
@@ -45,14 +47,18 @@ def generate_manifest(
         rel = _rel_path(source.origin_path, manifest_dir)
         provider = source.provider_type.lower()
 
-        # Build paths block
-        if provider == "comtrade" and rel:
+        # Build paths block, keyed by the source's PHYSICAL format. An
+        # Import-Wizard source keeps its own 'normalized_csv'/'normalized_excel'
+        # type (that is its reload recipe -- see manifest_loader), but its file
+        # still lives under the 'csv'/'excel' key so every reader locates it the
+        # same way.
+        physical = physical_source_type(provider)
+        if physical == "comtrade" and rel:
             cfg_path = Path(rel)
             dat_path = cfg_path.with_suffix(".dat")
             paths_block = {"cfg": str(cfg_path), "dat": str(dat_path)}
-        elif provider in ("csv", "excel") and rel:
-            key = "csv" if provider == "csv" else "excel"
-            paths_block = {key: str(rel)}
+        elif physical in ("csv", "excel") and rel:
+            paths_block = {physical: str(rel)}
         else:
             paths_block = {"path": rel} if rel else {}
 
@@ -102,18 +108,62 @@ def generate_manifest(
 
         sources_out.append(src_dict)
 
-    # Alignment block
+    # ── Alignment block ───────────────────────────────────────────────────────
+    # Stage 3: the session's coordinate geometry is persisted explicitly so a
+    # reload reproduces it exactly instead of re-deriving it.
+    #
+    # 'absolute_time_origin' is the authoritative reference: it is the
+    # wall-clock instant session x = 0 denotes, so restored offsets keep their
+    # absolute meaning. 'reference_source' is retained for compatibility with
+    # readers that already consume it (app.data.review_summary), but it is NOT
+    # the origin and is no longer what defines the coordinate reference —
+    # inferring the reference from "whichever source has offset 0.0" is
+    # ambiguous (several sources can be at zero, and Set-as-Reference can
+    # rebase onto a source of any method).
+    #
+    # 'offsets_seconds' is now written whenever the session has sources, not
+    # only when some offset is non-zero: an all-zero geometry is still a real,
+    # deliberate geometry that must survive reload rather than be re-derived.
+    #
+    # 'methods' / 'confidences' / 'notes' preserve alignment provenance, so a
+    # manually corrected or trigger-aligned source is not silently re-derived
+    # as absolute-timestamp on reload, and so the UI never claims a method
+    # whose supporting metadata was lost.
     sources = session.list_sources()
-    offsets = {s.source_id: round(s.time_offset_s, 9) for s in sources}
-    ref = next(
-        (s.source_id for s in sources if s.time_offset_s == 0.0),
-        sources[0].source_id if sources else None,
-    )
     alignment_block: dict = {}
-    if ref:
+    if sources:
+        offsets = {s.source_id: round(s.time_offset_s, 9) for s in sources}
+        methods = {s.source_id: s.alignment_method for s in sources}
+        confidences = {
+            s.source_id: float(s.alignment_confidence)
+            for s in sources
+            if s.alignment_confidence is not None
+        }
+        notes = {}
+        for s in sources:
+            note = session.get_alignment_notes(s.source_id)
+            if note:
+                notes[s.source_id] = note
+
+        origin = getattr(session, "absolute_time_origin", None)
+        if origin is not None:
+            # Same convention as the per-source start_time above: an ISO 8601
+            # string, microseconds intact, no timezone invented for a naive
+            # origin. isoformat() omits ".000000" for a whole second, which the
+            # loader's format list also accepts.
+            alignment_block["absolute_time_origin"] = origin.isoformat()
+
+        ref = next(
+            (s.source_id for s in sources if s.time_offset_s == 0.0),
+            sources[0].source_id,
+        )
         alignment_block["reference_source"] = ref
-    if any(v != 0.0 for v in offsets.values()):
         alignment_block["offsets_seconds"] = offsets
+        alignment_block["methods"] = methods
+        if confidences:
+            alignment_block["confidences"] = confidences
+        if notes:
+            alignment_block["notes"] = notes
 
     manifest: dict = {
         "event_id": event_id,

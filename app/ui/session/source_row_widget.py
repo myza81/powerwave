@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.sessions.alignment_summary import method_label
 from app.sessions.session_models import PanelConfig, SessionSource, SourceQualityMetrics
 from app.ui.session.channel_tree_widget import ChannelTreeWidget
 
@@ -82,7 +83,10 @@ def _alignment_badge_text(source: SessionSource) -> str:
     if conf is not None:
         level = "High" if conf >= 0.75 else ("Medium" if conf >= 0.40 else "Low")
         return f"● {level} ({conf:.2f})"
-    return f"● {method}"
+    # Stage 3: show the human-readable label rather than the internal
+    # identifier, so a timestamp-aligned source reads "Absolute timestamp"
+    # instead of "absolute_timestamp".
+    return f"● {method_label(method)}"
 
 
 def _alignment_badge_style(source: SessionSource) -> str:
@@ -353,11 +357,21 @@ class SourceRowWidget(QWidget):
         row.addWidget(self._fine_left_btn)
 
         self._offset_spin = QDoubleSpinBox()
-        self._offset_spin.setRange(-9999.999, 9999.999)
+        # Stage 1: absolute-timestamp alignment can legitimately produce large
+        # offsets — the GPTH event's COMTRADE record sits +4183.806 s after the
+        # SCADA trend's first sample, and records from the same event captured
+        # hours apart go further. The previous ±9999.999 s (2.78 h) limit made
+        # QDoubleSpinBox silently clamp the DISPLAYED value while the session
+        # held the true one, so the analyst would read a wrong number and any
+        # later nudge would commit the clamped value back. ±366 days covers any
+        # realistic single-event source set. This is a display bound only:
+        # SessionSource.time_offset_s and app.sessions.absolute_alignment
+        # impose no limit of their own.
+        self._offset_spin.setRange(-31_622_400.0, 31_622_400.0)
         self._offset_spin.setDecimals(3)
         self._offset_spin.setSingleStep(0.001)
         self._offset_spin.setSuffix(" s")
-        self._offset_spin.setFixedWidth(115)
+        self._offset_spin.setFixedWidth(150)
         self._offset_spin.setKeyboardTracking(True)
         self._offset_spin.setValue(source.time_offset_s)
         self._offset_spin.valueChanged.connect(self._on_offset_spin_changed)

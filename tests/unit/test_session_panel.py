@@ -685,14 +685,25 @@ def test_refresh_does_not_fire_active_changed(qapp) -> None:
 
 
 def test_offset_spinbox_range_and_precision(qapp) -> None:
+    """Millisecond precision, and a range wide enough for absolute alignment.
+
+    Stage 1 raised the bound from ±9999.999 s (2.78 h) to ±366 days: an
+    absolute-timestamp offset can legitimately exceed the old limit (the GPTH
+    event's COMTRADE record is +4183.806 s from the SCADA trend, and records
+    hours apart go further), and a too-narrow spinbox silently clamped the
+    displayed value away from the true SessionSource.time_offset_s.
+    """
     source = _make_session_source()
     panels = _make_panels()
     analog, digital = _make_channels()
     row = SourceRowWidget(source, analog, digital, panels)
     spin = row._offset_spin
-    assert spin.minimum() == pytest.approx(-9999.999, abs=1e-6)
-    assert spin.maximum() == pytest.approx(9999.999, abs=1e-6)
+    assert spin.minimum() == pytest.approx(-31_622_400.0, abs=1e-6)
+    assert spin.maximum() == pytest.approx(31_622_400.0, abs=1e-6)
     assert spin.decimals() == 3
+    # A real absolute-alignment offset must survive a round trip unclamped.
+    spin.setValue(4183.805733)
+    assert spin.value() == pytest.approx(4183.806, abs=1e-6)
     row.close()
 
 
@@ -783,7 +794,12 @@ def test_alignment_badge_default_tooltip_when_no_notes(qapp) -> None:
 
 
 def test_alignment_badge_manual_method(qapp) -> None:
-    """34. Manual method with no confidence shows method name in grey."""
+    """34. Manual method with no confidence shows the method label in grey.
+
+    Stage 3 renders the human-readable label ("Manual") rather than the
+    internal identifier ("manual"), so an absolute-timestamp source reads
+    "Absolute timestamp" instead of "absolute_timestamp".
+    """
     source = _make_session_source(
         source_id="src-manual",
         alignment_method="manual",
@@ -792,8 +808,24 @@ def test_alignment_badge_manual_method(qapp) -> None:
     panels = _make_panels()
     analog, digital = _make_channels("src-manual")
     row = SourceRowWidget(source, analog, digital, panels)
-    assert "manual" in row._alignment_badge.text()
+    assert "Manual" in row._alignment_badge.text()
     assert "#888888" in row._alignment_badge.styleSheet()
+    row.close()
+
+
+def test_alignment_badge_absolute_timestamp_method(qapp) -> None:
+    """Stage 3: the internal identifier never reaches the engineer."""
+    source = _make_session_source(
+        source_id="src-abs",
+        alignment_method="absolute_timestamp",
+        alignment_confidence=None,
+    )
+    panels = _make_panels()
+    analog, digital = _make_channels("src-abs")
+    row = SourceRowWidget(source, analog, digital, panels)
+    text = row._alignment_badge.text()
+    assert "Absolute timestamp" in text
+    assert "absolute_timestamp" not in text
     row.close()
 
 

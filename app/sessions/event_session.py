@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
@@ -28,7 +28,8 @@ from app.sessions.session_models import (
     SessionSource,
     SourceQualityMetrics,
 )
-from app.sessions import alignment_engine
+from app.sessions import absolute_alignment, alignment_engine
+from app.sessions.absolute_alignment import AbsoluteAlignmentPlan
 from app.calculated_signals.models import (
     CalculatedSignalDefinition,
     CalculatedSignalResult,
@@ -190,6 +191,14 @@ class EventAnalysisSession:
     def __init__(self) -> None:
         self.session_version: int = self.SESSION_VERSION
         self.created_at: datetime = datetime.now(tz=timezone.utc)
+
+        # Stage 1: wall-clock instant that session coordinate x = 0 denotes.
+        # None until absolute alignment first becomes possible (two eligible
+        # absolute sources). Once set it is STABLE: adding a source never moves
+        # it, so already-placed waveforms — including manually, trigger- and
+        # correlation-aligned ones — never shift underneath the analyst. Only
+        # rebase_absolute_time_origin() (Set as Reference) may move it.
+        self._absolute_time_origin: datetime | None = None
 
         self._sources: dict[str, SessionSource] = {}      # source_id → SessionSource
         self._channels: dict[tuple[str, str], SessionChannel] = {}
@@ -380,6 +389,94 @@ class EventAnalysisSession:
                 reason = self._offset_or_method_change_reason(offset_changed, method_changed)
                 self._mark_calculated_dependents_stale_for_source(source.source_id, reason=reason)
         self._alignment_notes.clear()
+
+    # -------------------------------------------------------------------------
+    # Absolute-time alignment (Stage 1)
+    # -------------------------------------------------------------------------
+    #
+    # Placement only. Nothing here reads or writes waveform_data, resamples,
+    # interpolates, or builds a grid — an offset is one float per source, and
+    # build_aligned_data() applies it lazily at render time exactly as it
+    # already did for manual offsets.
+
+    @property
+    def absolute_time_origin(self) -> datetime | None:
+        """Wall-clock instant that session coordinate x = 0 denotes.
+
+        None until absolute alignment first becomes possible. Stable
+        thereafter — see apply_absolute_alignment() and
+        rebase_absolute_time_origin().
+        """
+        return self._absolute_time_origin
+
+    def apply_absolute_alignment(self) -> AbsoluteAlignmentPlan:
+        """Derive time offsets from recorded absolute start timestamps.
+
+        Establishes the session's stable origin on the first call at which two
+        eligible absolute sources exist, then writes offsets for every eligible
+        source whose alignment the analyst does not own (see
+        absolute_alignment.DERIVABLE_METHODS).
+
+        Idempotent: re-running against an unchanged source set recomputes the
+        same offsets, so set_time_offset()'s existing no-change guard fires and
+        no calculated signal is marked stale. A source added later that starts
+        BEFORE the origin gets a negative offset; the origin does not move and
+        no already-placed source changes coordinates.
+
+        Returns the plan that was applied, including which sources were skipped
+        and why, so a caller can surface that without recomputing it.
+        """
+        plan = absolute_alignment.plan_absolute_alignment(
+            self.list_sources(), self._absolute_time_origin
+        )
+        self._absolute_time_origin = plan.origin
+        for source_id, offset_s in plan.offsets.items():
+            self.set_time_offset(
+                source_id,
+                offset_s,
+                method=absolute_alignment.ABSOLUTE_TIMESTAMP,
+                confidence=None,
+            )
+        return plan
+
+    def restore_absolute_time_origin(self, origin: datetime | None) -> None:
+        """Set the session origin from persisted state (Stage 3 reload only).
+
+        Deserialisation entry point, not an alignment operation: it writes the
+        origin directly instead of deriving it, so a geometry saved after a
+        Set-as-Reference rebase reloads as itself rather than being recomputed
+        from the earliest start time. No offset is touched — callers restore
+        those separately, before calling this.
+
+        A None *origin* leaves the session with no origin, which is the correct
+        state for a manifest that recorded offsets without recording what x = 0
+        meant (see SessionAlignmentState.has_trustworthy_origin).
+        """
+        self._absolute_time_origin = origin
+
+    def rebase_absolute_time_origin(self, offset_s: float) -> None:
+        """Move the origin forward by *offset_s* seconds of session time.
+
+        This is the origin half of a Set-as-Reference coordinate rebase: when
+        every source's offset is uniformly reduced by ``offset_s``, session
+        x = 0 comes to denote the instant that was previously at x = offset_s,
+        so the origin must advance by the same amount for absolute labels to
+        stay physically correct.
+
+        Deliberately expressed as a translation rather than as "adopt the
+        selected source's start_time" so it is also correct when the selected
+        source is manually aligned or has no absolute anchor at all. For an
+        absolute-aligned selection the two are identical:
+        origin + (start_k − origin) == start_k.
+
+        A no-op while no origin exists — a session with nothing absolutely
+        aligned has no absolute meaning to preserve.
+        """
+        if self._absolute_time_origin is None or offset_s == 0.0:
+            return
+        self._absolute_time_origin = self._absolute_time_origin + timedelta(
+            seconds=offset_s
+        )
 
     def set_alignment_notes(self, source_id: str, notes: str) -> None:
         """Store human-readable notes from the latest alignment operation."""

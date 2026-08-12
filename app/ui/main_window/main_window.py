@@ -760,12 +760,18 @@ class PowerwaveMainWindow(QMainWindow):
         dock.setMinimumHeight(150)
         return dock
 
-    def _run_cross_correlation(self, sources: list) -> None:
+    def _run_cross_correlation(self, sources: list, *, auto_apply: bool = True) -> None:
         """Compute pairwise cross-correlations for a multi-source set.
 
         Args:
-            sources: list of SourceRecord or SessionSource objects.
-                     Each must have .source_id and .record attributes.
+            sources:    list of SourceRecord or SessionSource objects.
+                        Each must have .source_id and .record attributes.
+            auto_apply: when False, high-confidence results are still computed
+                        and shown in the correlation dock but are NOT written
+                        back as session offsets. Stage 3 passes False after
+                        restoring persisted alignment geometry from a manifest,
+                        so a reload reproduces the saved geometry instead of
+                        silently re-deriving it (see _restore_manifest_alignment).
         """
         import numpy as np
         from app.analytics.events.event_detector import _infer_role  # noqa: PLC0415
@@ -835,7 +841,7 @@ class PowerwaveMainWindow(QMainWindow):
                 self._correlation_dock.show()
 
                 # Auto-apply high-confidence offsets to EventAnalysisSession
-                if self._active_session is not None:
+                if auto_apply and self._active_session is not None:
                     self._apply_correlation_offsets(results)
             else:
                 self._last_suggestion_correlation = []
@@ -1285,14 +1291,40 @@ class PowerwaveMainWindow(QMainWindow):
         from app.sessions.event_session import EventAnalysisSession
 
         event_session = EventAnalysisSession()
+        # Stage 3: the manifest source_id is the stable identity across
+        # save/reload; the live SessionSource id is a fresh uuid4 minted here.
+        # Keep the mapping so persisted alignment can be applied to the right
+        # source without ever matching on list position, channel order, or
+        # filename.
+        manifest_id_to_live_id: dict[str, str] = {}
         for src in session.sources:
             origin = str(getattr(src, "origin_path", None) or "")
-            event_session.add_source(
+            live_id = event_session.add_source(
                 src.record,
                 src.source_id,
                 getattr(src, "provider_type", "unknown"),
                 origin or None,
             )
+            manifest_id_to_live_id[str(src.source_id)] = live_id
+
+        alignment_state = getattr(session, "alignment", None)
+        missing = self._restore_manifest_alignment(
+            event_session, alignment_state, manifest_id_to_live_id
+        )
+        # Stage 1 runs unless the manifest restored offsets WITHOUT recording
+        # the origin they were measured from (a pre-Stage-3 or hand-written
+        # manifest). In that case the geometry is opaque: the numbers are
+        # honoured verbatim, but no origin is invented for them, because
+        # nothing proves they were derived from absolute timestamps. Otherwise
+        # this is a no-op for every restored non-derivable method and simply
+        # fills in any source the manifest had no geometry for.
+        opaque_legacy_geometry = (
+            alignment_state is not None
+            and getattr(alignment_state, "has_offsets", False)
+            and not getattr(alignment_state, "has_trustworthy_origin", False)
+        )
+        if not opaque_legacy_geometry:
+            event_session.apply_absolute_alignment()
         event_session.default_layout()
 
         self._active_session = event_session
@@ -1310,9 +1342,82 @@ class PowerwaveMainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Session: {session.source_count()} source(s) loaded."
         )
+        if missing:
+            self.statusBar().showMessage(
+                f"Session: {session.source_count()} source(s) loaded — "
+                f"{len(missing)} manifest source(s) with saved alignment not present."
+            )
+        # Cross-correlation still runs for the correlation dock, but must not
+        # auto-apply offsets over geometry the manifest explicitly recorded.
+        restored = bool(getattr(getattr(session, "alignment", None), "offsets_seconds", None))
         QTimer.singleShot(
-            0, lambda s=event_session: self._run_cross_correlation(s.list_sources())
+            0,
+            lambda s=event_session, a=not restored: self._run_cross_correlation(
+                s.list_sources(), auto_apply=a
+            ),
         )
+
+    def _restore_manifest_alignment(
+        self,
+        event_session,
+        alignment,
+        manifest_id_to_live_id: dict[str, str],
+    ) -> list[str]:
+        """Apply a manifest's persisted alignment geometry to a fresh session.
+
+        Returns the manifest source_ids that carried saved alignment but are
+        not present in this load (a source file that could not be resolved, or
+        was removed from the manifest's source list). Those are reported, not
+        raised on, and the remaining sources keep their restored geometry —
+        nothing is recomputed just because one source is absent.
+
+        Precedence (Stage 3):
+
+        - An explicitly saved offset always wins. It is restored verbatim and
+          is never re-derived from start_time.
+        - The saved alignment_method is restored when the manifest recorded one
+          AND recorded the session origin, so provenance survives: a 'manual'
+          correction stays manual, 'auto_trigger'/'correlation' stay themselves,
+          and 'absolute_timestamp' stays derivable (re-deriving it against the
+          restored origin reproduces the identical value, so the round trip is
+          idempotent rather than lossy).
+        - A method the running build does not recognise (a newer manifest) is
+          downgraded to 'imported' rather than rejected.
+        - A manifest with offsets but no origin (pre-Stage-3, or hand-written)
+          has no recoverable provenance: every restored offset becomes
+          'imported', which is not derivable, so the saved numbers are honoured
+          and nothing is silently re-anchored to an origin nobody saved.
+        """
+        from app.sessions.session_models import ALIGNMENT_METHODS
+
+        if alignment is None or not getattr(alignment, "has_offsets", False):
+            return []
+
+        trustworthy_origin = alignment.has_trustworthy_origin
+        missing: list[str] = []
+
+        for manifest_id, offset_s in alignment.offsets_seconds.items():
+            live_id = manifest_id_to_live_id.get(manifest_id)
+            if live_id is None:
+                missing.append(manifest_id)
+                continue
+
+            method = alignment.methods.get(manifest_id) if trustworthy_origin else None
+            if method not in ALIGNMENT_METHODS:
+                method = "imported"
+            confidence = alignment.confidences.get(manifest_id)
+
+            event_session.set_time_offset(
+                live_id, float(offset_s), method=method, confidence=confidence
+            )
+            note = alignment.notes.get(manifest_id)
+            if note:
+                event_session.set_alignment_notes(live_id, note)
+
+        # Restored last: apply_absolute_alignment() runs after this and must see
+        # the saved origin, not derive a fresh one from the earliest start time.
+        event_session.restore_absolute_time_origin(alignment.absolute_time_origin)
+        return missing
 
     # ─────────────────────────────────────────────────────────────────────────
     # ─────────────────────────────────────────────────────────────────────────
@@ -1728,11 +1833,17 @@ class PowerwaveMainWindow(QMainWindow):
         self._session_canvas_controller.refresh_all(self._active_session)
         self._sync_session_panel_colours()
         self._refresh_timing_assessment()
-        # Normalize all panels to the same X range after auto-range settles
+        # Stage 2: choose this session's initial visible X range once, after
+        # pyqtgraph's auto-range events have settled. On the first activation
+        # with two or more active sources this may be an event-focused window;
+        # otherwise it falls back to fitting the full session domain, exactly
+        # as this call site did before. Later activations leave the visible
+        # range alone so an analyst's zoom or pan is never discarded — see
+        # SessionCanvasController.apply_initial_viewport().
         _ctrl = self._session_canvas_controller
         _sess = self._active_session
         QTimer.singleShot(
-            0, lambda c=_ctrl, s=_sess: c.normalize_all_to_session_window(s)
+            0, lambda c=_ctrl, s=_sess: c.apply_initial_viewport(s)
         )
 
         n = len(self._active_session.list_sources())
@@ -2187,6 +2298,11 @@ class PowerwaveMainWindow(QMainWindow):
         self._active_session.add_source(
             record, display_name, provider_type, origin_path
         )
+        # Stage 1: place the new source on the session's physical time
+        # coordinate using its recorded absolute start_time. A no-op until two
+        # sources with trustworthy absolute anchors exist, and it never moves
+        # an already-established origin or an analyst-owned offset.
+        self._active_session.apply_absolute_alignment()
         self._active_session.default_layout()
         self._session_canvas_action.setEnabled(True)
         self._save_manifest_action.setEnabled(True)
@@ -2327,27 +2443,44 @@ class PowerwaveMainWindow(QMainWindow):
 
     def _on_session_set_as_reference(self, source_id: str) -> None:
         """Set one source as the time reference: its offset becomes 0.0 and all
-        other sources are shifted to maintain their relative positions."""
+        other sources are shifted to maintain their relative positions.
+
+        Stage 1: this is a COORDINATE REBASE, not an alignment method. The
+        uniform translation is unchanged — every source keeps its physical
+        separation from every other — but each source now keeps the
+        alignment_method it already had, instead of every source being
+        restamped 'manual'. Restamping was wrong on two counts: it claimed the
+        analyst had manually aligned sources they never touched, and it
+        permanently excluded them from absolute-timestamp derivation (see
+        absolute_alignment.DERIVABLE_METHODS), so a source added afterwards
+        would have been placed against a stale origin.
+
+        The session's absolute_time_origin advances by the same translation, so
+        absolute axis labels stay physically correct across the rebase and a
+        source added later is derived against the REBASED origin.
+        """
         if self._active_session is None:
             return
         ref_source = self._active_session.get_source(source_id)
         if ref_source is None:
             return
         ref_offset = ref_source.time_offset_s
+        self._active_session.rebase_absolute_time_origin(ref_offset)
         changed_source_ids: list[str] = []
         for source in self._active_session.list_sources():
             old_offset = source.time_offset_s
-            old_method = source.alignment_method
             if source.source_id == source_id:
                 new_offset = 0.0
             else:
                 new_offset = source.time_offset_s - ref_offset
             self._active_session.set_time_offset(
-                source.source_id, new_offset, method="manual"
+                source.source_id,
+                new_offset,
+                method=source.alignment_method,
+                confidence=source.alignment_confidence,
             )
-            self._active_session.set_alignment_notes(source.source_id, "")
             self._refresh_session_source_row(source.source_id)
-            if old_offset != new_offset or old_method != "manual":
+            if old_offset != new_offset:
                 changed_source_ids.append(source.source_id)
         if self._session_canvas_active and self._session_canvas_controller is not None:
             self._session_canvas_controller.refresh_all(self._active_session)

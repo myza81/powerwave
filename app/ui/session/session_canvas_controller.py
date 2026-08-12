@@ -39,6 +39,10 @@ from app.visualization.widgets.session_canvas import SessionCanvasWidget
 from app.ui.session.legend_widget import generate_source_variant_colour
 from app.visualization.axis_management import AxisDisplayMode, axis_group_for_signal
 from app.visualization.axis.datetime_axis import TimeDisplayMode
+from app.visualization.viewport_policy import (
+    MIN_SOURCES_FOR_EVENT_FOCUS,
+    select_initial_viewport,
+)
 
 # Flat source palette (matplotlib default) — used for zero lines and non-phase channels
 _SOURCE_COLORS: list[str] = [
@@ -190,6 +194,15 @@ class SessionCanvasController:
         # (source_id, channel_name) curves -- see _calc_curve_key().
         self._calc_curve_keys: dict[str, tuple[str, str]] = {}   # calc_id -> curve key
         self._calc_panel_by_id: dict[str, str] = {}              # calc_id -> panel_id
+        # Stage 2 initial-viewport lifecycle. _viewport_initialized_session
+        # holds the session object (strong reference, compared with `is`) whose
+        # initial visible range has already been chosen, so a later source add
+        # never re-snaps a range the analyst may have zoomed or panned.
+        # _x_range_before_rebuild is the shared X range captured at the top of
+        # rebuild_layout(), used to pull freshly created canvases into the
+        # range the session is already showing.
+        self._viewport_initialized_session: object | None = None
+        self._x_range_before_rebuild: tuple[float, float] | None = None
 
     def set_layout_rebuilt_callback(self, callback) -> None:
         """Notify the owner when panel merge/split produces a new splitter."""
@@ -206,6 +219,12 @@ class SessionCanvasController:
     def rebuild_layout(self, session) -> QWidget:
         """Return a QScrollArea containing a QSplitter with one SessionCanvasWidget per panel."""
         self._session_ref = session
+        # Stage 2: remember what the session is currently showing BEFORE any
+        # canvas is added or removed, so canvases created by this rebuild can
+        # be brought into that same range instead of auto-ranging to their own
+        # data and dragging every other panel with them through
+        # SynchronizationManager.
+        self._x_range_before_rebuild = self._current_shared_x_range()
         visible_panels = [p for p in session.list_panels() if p.is_visible]
         new_ids = [p.panel_id for p in visible_panels]
 
@@ -661,14 +680,84 @@ class SessionCanvasController:
         sync_manager.register_many(canvases, master_canvas=canvases[0])
 
     def normalize_all_to_session_window(self, session) -> None:
-        """Set all canvas X ranges to the global session window.
+        """Set all canvas X ranges to the global session window ("Fit All").
 
         Call this after refresh_all() via QTimer.singleShot(0) so pyqtgraph's
         auto-range events have settled before we force a common viewport.
+
+        Stage 2 leaves this untouched: it remains the one operation that fits
+        the complete session DATA DOMAIN, and is what restores the full range
+        after an event-focused initial view.
         """
         t_start, t_end = _session_window(session)
         for canvas in self._canvases.values():
             canvas.normalize_viewport(t_start, t_end)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Initial viewport (Stage 2)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _live_canvases(self) -> list[SessionCanvasWidget]:
+        return [c for c in self._canvases.values() if not sip.isdeleted(c)]
+
+    def _current_shared_x_range(self) -> tuple[float, float] | None:
+        """X range the session is currently showing, read from any live canvas.
+
+        All panels are held to one range by SynchronizationManager and per-panel
+        setXLink, so any live canvas reports it.
+        """
+        for canvas in self._live_canvases():
+            try:
+                x_range = canvas.getViewBox().viewRange()[0]
+                return float(x_range[0]), float(x_range[1])
+            except (RuntimeError, IndexError, TypeError, ValueError):  # noqa: PERF203
+                continue
+        return None
+
+    def _set_all_x_range(self, t_start: float, t_end: float) -> None:
+        for canvas in self._live_canvases():
+            canvas.normalize_viewport(t_start, t_end)
+
+    def apply_initial_viewport(self, session) -> tuple[float, float] | None:
+        """Choose and apply this session's INITIAL visible X range, once.
+
+        Replaces the unconditional normalize_all_to_session_window() that used
+        to run on every session-canvas activation. Semantics:
+
+        - First activation with at least two active sources: ask
+          viewport_policy.select_initial_viewport(). If it returns a window,
+          every panel is set to it; if it returns None, the previous behaviour
+          (fit the full session domain) is used unchanged. Either way the
+          session is then marked initialised.
+        - A session that has never had two active sources (an ordinary
+          single-source session) is never marked initialised, so it keeps
+          fitting the full domain exactly as before — and a second source
+          arriving later still gets a proper initial decision.
+        - Every later activation: the visible range is left alone, because by
+          then it may be a range the analyst deliberately zoomed or panned to.
+          Only canvases created by the latest rebuild are pulled into the
+          range already on screen, so a new panel cannot auto-range to its own
+          data and drag the others with it.
+
+        Returns the event-focused window when one was applied, else None.
+        Never mutates the session, its offsets, or any record.
+        """
+        self._session_ref = session
+        if self._viewport_initialized_session is session:
+            if self._x_range_before_rebuild is not None:
+                self._set_all_x_range(*self._x_range_before_rebuild)
+            return None
+
+        window = select_initial_viewport(session)
+        if window is None:
+            self.normalize_all_to_session_window(session)
+        else:
+            self._set_all_x_range(*window)
+
+        active = sum(1 for s in session.list_sources() if s.is_active)
+        if active >= MIN_SOURCES_FOR_EVENT_FOCUS:
+            self._viewport_initialized_session = session
+        return window
 
     # ─────────────────────────────────────────────────────────────────────────
     # Time axis mode (mirrors FlexiblePlotCanvas.set_time_axis_mode)
@@ -1443,12 +1532,20 @@ class SessionCanvasController:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _compute_session_reference_time(self, session) -> datetime | None:
-        """Return the wall-clock time that corresponds to session t=0.
+    @staticmethod
+    def _derive_reference_time_from_sources(session) -> datetime | None:
+        """Legacy axis origin: earliest ``start_time − time_offset_s``.
 
-        For each active source: session_origin = start_time − time_offset_s.
-        All properly aligned sources converge to the same origin; we return the
-        earliest one so the axis is never in the future relative to any source.
+        Retained as the fallback for sessions that never establish an explicit
+        absolute origin — single-source sessions, relative/synthetic/
+        sample-index sources, and legacy manifests whose saved offsets have no
+        recorded origin (Stage 3 treats those as opaque geometry and
+        deliberately invents no origin for them).
+
+        Returning None also answers a second question the caller depends on:
+        whether an absolute axis is meaningful at all. None means no active
+        source carries a real wall-clock anchor, so the axis stays in elapsed
+        seconds.
         """
         origin: datetime | None = None
         for source in session.list_sources():
@@ -1466,6 +1563,38 @@ class SessionCanvasController:
             except Exception:  # noqa: BLE001
                 continue
         return origin
+
+    def _compute_session_reference_time(self, session) -> datetime | None:
+        """Return the wall-clock time that corresponds to session x = 0.
+
+        Stage 3.1: when the session has an explicit ``absolute_time_origin``,
+        that IS the answer — it is the Stage 1 definition of what x = 0 means,
+        and it is stable under alignment edits.
+
+        The previous implementation always re-derived the origin as
+        ``min(start_time − time_offset_s)``. That is equal to the session
+        origin only while every offset is exactly timestamp-derived, and it
+        breaks the moment an analyst adjusts one source: because it takes the
+        MINIMUM, moving a single source 250 ms later dragged the whole axis
+        250 ms earlier, which both relabelled every unrelated source and
+        cancelled out the adjustment so the analyst could not see it. An
+        alignment edit must move that source against a stable session clock,
+        not redefine the clock.
+
+        The legacy derivation is still used when no explicit origin exists,
+        and is still what decides whether an absolute axis applies at all: if
+        it finds no wall-clock-anchored active source, None is returned and the
+        axis stays in elapsed seconds even though a stale origin may linger
+        from sources that have since been removed or deactivated.
+
+        Affects X-axis tick labels only — the sole consumer is
+        SessionCanvasWidget.set_time_reference() → DatetimeAxisItem.
+        """
+        derived = self._derive_reference_time_from_sources(session)
+        if derived is None:
+            return None
+        origin = getattr(session, "absolute_time_origin", None)
+        return origin if origin is not None else derived
 
     def _apply_time_reference(self, session) -> None:
         """Push the session wall-clock origin to all canvas axes."""

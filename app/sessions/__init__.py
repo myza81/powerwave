@@ -15,6 +15,7 @@ Session:
 
 Engine:
     alignment_engine     Pure-function module; import directly for engine functions.
+    absolute_alignment   Absolute-time alignment policy (stable session origin).
 """
 from __future__ import annotations
 
@@ -28,7 +29,11 @@ from app.sessions.session_models import (
     SourceQualityMetrics,
 )
 from app.sessions.event_session import EventAnalysisSession
-from app.sessions import alignment_engine
+from app.sessions import absolute_alignment, alignment_engine
+from app.sessions.absolute_alignment import (
+    ABSOLUTE_TIMESTAMP,
+    AbsoluteAlignmentPlan,
+)
 
 __all__ = [
     # Models
@@ -41,6 +46,10 @@ __all__ = [
     "SourceQualityMetrics",
     # Session
     "EventAnalysisSession",
-    # Engine module
+    # Absolute alignment (Stage 1)
+    "ABSOLUTE_TIMESTAMP",
+    "AbsoluteAlignmentPlan",
+    # Engine modules
+    "absolute_alignment",
     "alignment_engine",
 ]

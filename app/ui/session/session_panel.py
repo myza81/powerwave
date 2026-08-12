@@ -44,6 +44,11 @@ from PyQt6.QtWidgets import (
 )
 
 from app.sessions.session_models import PanelConfig, SessionSource, SourceQualityMetrics
+from app.sessions.alignment_summary import (
+    AlignmentSummary,
+    ClockVerification,
+    summarize_alignment,
+)
 from app.sessions.timing_compatibility import (
     SessionTimingAssessment,
     TimingCompatibilityLevel,
@@ -95,6 +100,7 @@ class SessionPanel(QDockWidget):
         self._expansion_state: dict[str, bool] = {}
         self._calc_rows: dict[str, CalculatedSignalRowWidget] = {}
         self._timing_assessment: SessionTimingAssessment | None = None
+        self._alignment_summary: AlignmentSummary | None = None
         self._build_ui()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -291,6 +297,8 @@ class SessionPanel(QDockWidget):
         assessment = assess_session_timing_compatibility(session)
         self._timing_assessment = assessment
 
+        self.refresh_alignment_status(session)
+
         if not assessment.has_warning:
             self._timing_banner.setVisible(False)
             return
@@ -298,6 +306,32 @@ class SessionPanel(QDockWidget):
         icon = "⚠" if assessment.level is not TimingCompatibilityLevel.UNKNOWN else "❔"
         self._timing_banner_label.setText(f"{icon} {assessment.summary}")
         self._timing_banner.setVisible(True)
+
+    def refresh_alignment_status(self, session) -> None:
+        """Update the Stage 3 alignment / clock-verification lines.
+
+        Read-only. Never suppresses the timing-compatibility banner above it:
+        aligning records by their recorded timestamps does not make the
+        timezone/clock evidence any stronger, so a 'requires_review' session
+        stays flagged even when every source is correctly positioned.
+        """
+        summary = summarize_alignment(session)
+        self._alignment_summary = summary
+
+        if not session.list_sources():
+            self._alignment_status.setVisible(False)
+            self._alignment_status.setText("")
+            return
+
+        lines = [f"Alignment: {summary.headline}"]
+        if summary.clock_verification is ClockVerification.NOT_APPLICABLE:
+            if summary.clock_line:
+                lines.append(summary.clock_line)
+        else:
+            lines.append(f"Clock verification: {summary.clock_line}")
+        self._alignment_status.setText("\n".join(lines))
+        self._alignment_status.setToolTip(summary.detail_text())
+        self._alignment_status.setVisible(True)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Build
@@ -371,6 +405,17 @@ class SessionPanel(QDockWidget):
         timing_banner_layout.addWidget(self._timing_details_btn)
         self._timing_banner.setVisible(False)
         outer.addWidget(self._timing_banner)
+
+        # ── Alignment / clock-verification status (Stage 3) ──
+        # Two short lines, always visible once the session has a source. They
+        # answer two DIFFERENT questions and are deliberately not merged:
+        # how the records were positioned, and whether the device clocks are
+        # known to have agreed. The second never claims verification.
+        self._alignment_status = QLabel("")
+        self._alignment_status.setWordWrap(True)
+        self._alignment_status.setStyleSheet("color: #9CA3AF; font-size: 11px;")
+        self._alignment_status.setVisible(False)
+        outer.addWidget(self._alignment_status)
 
         # ── Scroll area containing source rows ──
         self._sources_widget = QWidget()

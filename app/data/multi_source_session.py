@@ -29,6 +29,45 @@ class SourceRecord:
 
 
 @dataclass(slots=True)
+class SessionAlignmentState:
+    """Alignment geometry restored from a manifest's ``alignment`` block.
+
+    Keyed throughout by the MANIFEST source_id (``SourceRecord.source_id``),
+    which is the stable identity across save/reload — a live
+    ``SessionSource.source_id`` is a fresh uuid4 minted on every load and can
+    never be used to look up persisted state.
+
+    Every field is optional so a manifest written before Stage 3 (or by hand)
+    still loads. ``absolute_time_origin is None`` means the manifest did not
+    record a session origin, which is the signal that restored offsets have no
+    provable wall-clock meaning and must be treated as opaque — see
+    ``has_trustworthy_origin``.
+    """
+
+    absolute_time_origin: datetime | None = None
+    reference_source: str | None = None
+    offsets_seconds: dict[str, float] = field(default_factory=dict)
+    methods: dict[str, str] = field(default_factory=dict)
+    confidences: dict[str, float] = field(default_factory=dict)
+    notes: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def has_offsets(self) -> bool:
+        return bool(self.offsets_seconds)
+
+    @property
+    def has_trustworthy_origin(self) -> bool:
+        """True when the manifest recorded the session coordinate origin.
+
+        When False, restored offsets are still applied verbatim but their
+        provenance cannot be reconstructed, so the loader downgrades every
+        restored method to 'imported' rather than letting a claimed
+        'absolute_timestamp' be re-derived against an origin nobody saved.
+        """
+        return self.absolute_time_origin is not None
+
+
+@dataclass(slots=True)
 class MultiSourceSession:
     """Container for multiple co-loaded DisturbanceRecords.
 
@@ -38,6 +77,9 @@ class MultiSourceSession:
     """
 
     sources: list[SourceRecord] = field(default_factory=list)
+    alignment: SessionAlignmentState = field(default_factory=lambda: SessionAlignmentState())
+    """Stage 3: alignment geometry parsed from the manifest, empty when the
+    manifest carried no alignment block."""
 
     def add_source(self, source: SourceRecord) -> None:
         self.sources.append(source)

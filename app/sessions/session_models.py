@@ -22,13 +22,23 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Alignment method vocabulary
 # ---------------------------------------------------------------------------
-# 'none'         — no offset applied (default, time_offset_s == 0.0)
-# 'manual'       — analyst typed or dragged the offset
-# 'auto_trigger' — detect_trigger_time() heuristic
-# 'correlation'  — cross-correlation against reference (future)
-# 'imported'     — offset loaded from a saved session or manifest
+# 'none'               — no alignment method has been applied to this source.
+#                        Normally time_offset_s == 0.0, but a source can still
+#                        carry a non-zero offset with method 'none' after a
+#                        Set-as-Reference coordinate rebase, which translates
+#                        every source uniformly without claiming to have
+#                        aligned any of them.
+# 'manual'             — analyst typed or dragged the offset
+# 'auto_trigger'       — detect_trigger_time() heuristic
+# 'correlation'        — cross-correlation against reference (future)
+# 'imported'           — offset loaded from a saved session or manifest
+# 'absolute_timestamp' — derived from the source's recorded absolute start_time
+#                        against the session's stable absolute_time_origin
+#                        (app.sessions.absolute_alignment). Asserts only that
+#                        the recorded timestamps were used — NOT that the two
+#                        device clocks were verified to agree.
 ALIGNMENT_METHODS = frozenset(
-    {"none", "manual", "auto_trigger", "correlation", "imported"}
+    {"none", "manual", "auto_trigger", "correlation", "imported", "absolute_timestamp"}
 )
 
 
